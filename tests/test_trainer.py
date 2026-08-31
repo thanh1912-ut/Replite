@@ -1,0 +1,336 @@
+"""CPU smoke and invariant tests for the generic training engine."""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+from torch import nn
+
+from replite.multitask.config import RepLiteConfig, TaskConfig
+from replite.multitask.model import RepLiteMultiTaskModel
+from replite.training.checkpoint import CheckpointManager
+from replite.training.losses import MultiTaskCriterion
+from replite.training.trainer import Trainer, TrainerConfig, move_to_device
+
+
+class ScalarModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(0.0))
+
+    @property
+    def model_metadata(self):
+        return {"model": "scalar", "config": {"pretrained": False}}
+
+    def forward(self, inputs):
+        return inputs.reshape(inputs.shape[0]) * self.weight
+
+
+class MSECriterion(nn.Module):
+    def forward(self, prediction, target):
+        loss = (prediction - target).square().mean()
+        return {"total": loss, "mse": loss}
+
+
+class CountingScheduler:
+    def __init__(self):
+        self.steps = 0
+
+    def step(self):
+        self.steps += 1
+
+    def state_dict(self):
+        return {"steps": self.steps}
+
+    def load_state_dict(self, state):
+        self.steps = state["steps"]
+
+
+def _batch(x: float, y: float):
+    return torch.tensor([[[[x]]]]), torch.tensor([y])
+
+
+def test_short_final_accumulation_window_is_normalized_by_actual_size() -> None:
+    model = ScalarModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = CountingScheduler()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        optimizer,
+        TrainerConfig(
+            epochs=1,
+            grad_accum_steps=2,
+            amp=False,
+            grad_clip_norm=None,
+        ),
+        scheduler=scheduler,
+        device="cpu",
+    )
+    result = trainer.train_epoch([_batch(1, 1), _batch(1, 3), _batch(1, 5)], epoch=0)
+    assert result["total"] > 0
+    assert model.weight.item() == pytest.approx(1.32)
+    assert trainer.global_step == 2
+    assert scheduler.steps == 2
+    assert model.weight.grad is None
+
+
+def test_validation_restores_model_mode_and_updates_metric_adapter() -> None:
+    class Metric:
+        def reset(self):
+            self.count = 0
+
+        def update(self, prediction, target):
+            self.count += prediction.numel()
+
+        def compute(self):
+            return {"count": self.count}
+
+    model = ScalarModel().train()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        TrainerConfig(epochs=1, amp=False),
+        device="cpu",
+        validation_metrics=Metric(),
+    )
+    result = trainer.validate([_batch(1, 1), _batch(2, 2)], epoch=0)
+    assert model.training
+    assert result["count"] == 2
+    assert "total" in result
+
+
+def test_mapping_batch_and_five_dimensional_clip_reach_model_unchanged() -> None:
+    class ClipModel(ScalarModel):
+        def forward(self, inputs):
+            self.seen_shape = tuple(inputs.shape)
+            return inputs[:, -1].reshape(inputs.shape[0]) * self.weight
+
+    model = ClipModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        TrainerConfig(epochs=1, amp=False),
+        device="cpu",
+    )
+    clip = torch.arange(3.0).reshape(1, 3, 1, 1, 1)
+    trainer.train_epoch([{"inputs": clip, "targets": torch.tensor([1.0])}], epoch=0)
+    assert model.seen_shape == (1, 3, 1, 1, 1)
+
+
+def test_fit_checkpoint_and_resume_continue_at_next_epoch(tmp_path) -> None:
+    config = TrainerConfig(epochs=2, amp=False, monitor="val/total")
+    manager = CheckpointManager(tmp_path)
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        config,
+        device="cpu",
+        checkpoint_manager=manager,
+    )
+    history = trainer.fit([_batch(1, 1)], [_batch(1, 1)])
+    assert len(history) == 2
+    assert manager.last_path.exists()
+    assert (tmp_path / "best.pt").exists()
+
+    restored = ScalarModel()
+    resumed = Trainer(
+        restored,
+        MSECriterion(),
+        torch.optim.SGD(restored.parameters(), lr=0.1),
+        config,
+        device="cpu",
+        checkpoint_manager=manager,
+    )
+    state = resumed.resume()
+    assert state.next_epoch == 2
+    assert resumed.start_epoch == 2
+    assert resumed.global_step == trainer.global_step
+    torch.testing.assert_close(restored.weight, model.weight, rtol=0, atol=0)
+
+
+def test_non_finite_loss_stops_before_optimizer_step() -> None:
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        TrainerConfig(epochs=1, amp=False),
+        device="cpu",
+    )
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        trainer.train_epoch([_batch(float("nan"), 1)], epoch=0)
+    assert trainer.global_step == 0
+
+
+def test_move_to_device_preserves_nested_non_tensor_values() -> None:
+    value = {"tensor": torch.ones(1), "list": [torch.zeros(1), "id"], "none": None}
+    moved = move_to_device(value, torch.device("cpu"))
+    assert moved["tensor"].device.type == "cpu"
+    assert moved["list"][1] == "id"
+    assert moved["none"] is None
+
+
+def test_real_replite_joint_cpu_training_step_is_finite() -> None:
+    config = RepLiteConfig(
+        backbone_name="mobilenetv3_small_050",
+        tasks=TaskConfig(detection_classes=2, segmentation_classes=3, depth=True),
+        recurrent_c4_channels=12,
+        recurrent_c5_channels=16,
+        neck_channels=12,
+        dense_channels=8,
+        task_adapter_channels=8,
+        detection_head_channels=12,
+        detection_head_blocks=1,
+        recurrence_steps=1,
+    )
+    model = RepLiteMultiTaskModel(config)
+    before = model.detection_head.class_predictors[0].weight.detach().clone()
+    criterion = MultiTaskCriterion(
+        detection_num_classes=2,
+        depth_loss_type="l1",
+    )
+    trainer = Trainer(
+        model,
+        criterion,
+        torch.optim.SGD(model.parameters(), lr=1e-3),
+        TrainerConfig(epochs=1, amp=False, grad_clip_norm=1.0),
+        device="cpu",
+    )
+    images = torch.randn(1, 3, 64, 96)
+    targets = {
+        "detection": [
+            {
+                "boxes": torch.tensor([[8.0, 8.0, 40.0, 40.0]]),
+                "labels": torch.tensor([1], dtype=torch.long),
+                "valid_size": (64, 96),
+            }
+        ],
+        "segmentation": torch.randint(0, 3, (1, 64, 96)),
+        "depth": torch.full((1, 1, 64, 96), 2.0),
+        "depth_valid": torch.ones(1, 1, 64, 96, dtype=torch.bool),
+    }
+    result = trainer.train_epoch([(images, targets)], epoch=0)
+    assert all(torch.isfinite(torch.tensor(value)) for value in result.values())
+    assert trainer.global_step == 1
+    assert not torch.equal(before, model.detection_head.class_predictors[0].weight)
+
+
+def test_uninterrupted_and_epoch_boundary_resume_are_exact(tmp_path) -> None:
+    config = TrainerConfig(
+        epochs=2,
+        amp=False,
+        grad_clip_norm=None,
+        checkpoint_every_n_epochs=1,
+    )
+    torch.manual_seed(123)
+    initial = ScalarModel().state_dict()
+
+    continuous_model = ScalarModel()
+    continuous_model.load_state_dict(initial)
+    continuous_scheduler = CountingScheduler()
+    continuous = Trainer(
+        continuous_model,
+        MSECriterion(),
+        torch.optim.SGD(continuous_model.parameters(), lr=0.1, momentum=0.9),
+        config,
+        scheduler=continuous_scheduler,
+        device="cpu",
+    )
+    continuous.train_epoch([_batch(1, 1), _batch(2, 3)], epoch=0)
+    continuous.train_epoch([_batch(1, 2), _batch(2, 4)], epoch=1)
+
+    interrupted_model = ScalarModel()
+    interrupted_model.load_state_dict(initial)
+    interrupted_scheduler = CountingScheduler()
+    manager = CheckpointManager(tmp_path)
+    interrupted = Trainer(
+        interrupted_model,
+        MSECriterion(),
+        torch.optim.SGD(interrupted_model.parameters(), lr=0.1, momentum=0.9),
+        config,
+        scheduler=interrupted_scheduler,
+        checkpoint_manager=manager,
+        device="cpu",
+    )
+    interrupted.train_epoch([_batch(1, 1), _batch(2, 3)], epoch=0)
+    manager.save_last(
+        model=interrupted.model,
+        optimizer=interrupted.optimizer,
+        scheduler=interrupted.scheduler,
+        scaler=interrupted.scaler,
+        criterion=interrupted.criterion,
+        epoch_completed=0,
+        global_step=interrupted.global_step,
+        trainer_config=config,
+        extra={"amp_skip_count": interrupted.amp_skip_count},
+    )
+
+    resumed_model = ScalarModel()
+    resumed_scheduler = CountingScheduler()
+    resumed = Trainer(
+        resumed_model,
+        MSECriterion(),
+        torch.optim.SGD(resumed_model.parameters(), lr=0.1, momentum=0.9),
+        config,
+        scheduler=resumed_scheduler,
+        checkpoint_manager=manager,
+        device="cpu",
+    )
+    resumed.resume()
+    resumed.train_epoch([_batch(1, 2), _batch(2, 4)], epoch=1)
+
+    torch.testing.assert_close(
+        resumed_model.weight,
+        continuous_model.weight,
+        rtol=0,
+        atol=0,
+    )
+    assert resumed.global_step == continuous.global_step
+    assert resumed_scheduler.steps == continuous_scheduler.steps
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_joint_cuda_amp_smoke() -> None:
+    config = RepLiteConfig(
+        backbone_name="mobilenetv3_small_050",
+        tasks=TaskConfig(detection_classes=2, segmentation_classes=3, depth=True),
+        recurrent_c4_channels=12,
+        recurrent_c5_channels=16,
+        neck_channels=12,
+        dense_channels=8,
+        task_adapter_channels=8,
+        detection_head_channels=12,
+        detection_head_blocks=1,
+        recurrence_steps=1,
+    )
+    model = RepLiteMultiTaskModel(config)
+    trainer = Trainer(
+        model,
+        MultiTaskCriterion(detection_num_classes=2, depth_loss_type="l1"),
+        torch.optim.SGD(model.parameters(), lr=1e-3),
+        TrainerConfig(epochs=1, amp=True),
+        device="cuda",
+    )
+    targets = {
+        "detection": [
+            {
+                "boxes": torch.tensor([[8.0, 8.0, 40.0, 40.0]]),
+                "labels": torch.tensor([1], dtype=torch.long),
+                "valid_size": (64, 96),
+            }
+        ],
+        "segmentation": torch.randint(0, 3, (1, 64, 96)),
+        "depth": torch.full((1, 1, 64, 96), 2.0),
+        "depth_valid": torch.ones(1, 1, 64, 96, dtype=torch.bool),
+    }
+    result = trainer.train_epoch([(torch.randn(1, 3, 64, 96), targets)], epoch=0)
+    assert trainer.amp_enabled
+    assert all(math.isfinite(value) for value in result.values())
