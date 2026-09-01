@@ -266,6 +266,9 @@ def _stage_plan() -> dict[str, int | float]:
 def test_stage_train_wires_detailed_progress_reporter(
     tmp_path: Path, monkeypatch
 ) -> None:
+    first = SimpleNamespace(key=("train", "session-a", "head", "s", "a"))
+    second = SimpleNamespace(key=("train", "session-b", "head", "s", "b"))
+
     class Stage:
         local_root = tmp_path / "unit-stage"
 
@@ -273,23 +276,34 @@ def test_stage_train_wires_detailed_progress_reporter(
             self.calls: list[str] = []
             self.reporter = None
 
-        def disk_plan(self):
+        def disk_plan(self, records):
             self.calls.append("plan")
+            assert records == (first, second)
             return _stage_plan()
 
-        def prepare_all(self, *, on_event):
+        def prepare_all(self, *, on_event, records):
             self.calls.append("prepare")
             self.reporter = on_event
+            assert records == (first, second)
             return {
                 "complete": True,
-                "completed_count": 186,
-                "record_count": 186,
+                "completed_count": 2,
+                "record_count": 2,
                 "completed_extracted_bytes": 123,
             }
 
     stage = Stage()
     monkeypatch.setattr(
-        runner, "prepare", lambda filename: SimpleNamespace(train_stage=stage)
+        runner,
+        "prepare",
+        lambda filename: SimpleNamespace(
+            train_stage=stage,
+            catalog=SimpleNamespace(train_records=(first, second)),
+            split=SimpleNamespace(
+                train_records=(first,),
+                validation_records=(second,),
+            ),
+        ),
     )
     result = runner.stage_official_train("config.json")
     assert result["complete"] is True
@@ -445,6 +459,22 @@ def test_stage_test_requires_complete_campaign_then_cleans_train(
     result = runner.stage_official_test("config.json")
     assert result["complete"] is True
     assert events == ["cleanup-train", "plan-test", "prepare-test"]
+
+
+def test_subset_campaign_never_deletes_shared_stage(capsys) -> None:
+    class Stage:
+        def cleanup(self) -> None:
+            raise AssertionError("shared stage must not be deleted")
+
+    prepared = SimpleNamespace(
+        train_stage=Stage(),
+        config={
+            "run_id": "subset20-v1",
+            "data": {"local_staging": {"cache_id": "full-v4"}},
+        },
+    )
+    assert runner._cleanup_private_train_stage(prepared) is False
+    assert "Shared official-train SSD cache" in capsys.readouterr().out
 
 
 def test_stage_test_does_not_delete_train_before_full_campaign(

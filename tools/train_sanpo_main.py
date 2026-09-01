@@ -36,6 +36,7 @@ from replite.data import (
     SANPO_DETECTION_CLASS_NAMES,
     SANPO_SEGMENTATION_CLASS_NAMES,
     SANPO_SEGMENTATION_IGNORE_INDEX,
+    SanpoArchiveRecord,
     canonical_json_sha256,
     create_or_load_group_split,
     load_archive_catalog,
@@ -71,8 +72,8 @@ EXPECTED = {
     "train_frames": 14_718,
     "test_frames": 3_803,
 }
-PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v4"
-APPROVAL_KIND = "replite-sanpo-main-epoch1-approval-v3"
+PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v5"
+APPROVAL_KIND = "replite-sanpo-main-epoch1-approval-v4"
 DETECTION_MIN_COMPONENT_PIXELS = int(
     SANPO_DERIVED_DETECTION_CONFIG["min_component_pixels"]
 )
@@ -235,6 +236,18 @@ class Prepared:
     val_loader: ArchiveShardLoader
 
 
+def _selected_official_train_records(
+    catalog: ArchiveCatalog,
+    split: ArchiveGroupSplit,
+) -> tuple[SanpoArchiveRecord, ...]:
+    selected_keys = {
+        record.key for record in (*split.train_records, *split.validation_records)
+    }
+    return tuple(
+        record for record in catalog.train_records if record.key in selected_keys
+    )
+
+
 def prepare(filename: str | os.PathLike[str]) -> Prepared:
     config_path, config = load_campaign(filename)
     data_root = Path(config["drive_data_root"]).expanduser().resolve()
@@ -263,14 +276,35 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
     )
     seed = int(config["data"]["split_seed"])
     fraction = float(config["data"]["validation_fraction"])
+    session_limit = config["data"].get("official_train_session_limit")
+    train_session_count = len(
+        {record.session_id for record in catalog.train_records}
+    )
+    if session_limit is not None and (
+        isinstance(session_limit, bool)
+        or not isinstance(session_limit, int)
+        or session_limit < 2
+        or session_limit > train_session_count
+    ):
+        raise ValueError(
+            "data.official_train_session_limit must be between two and "
+            f"{train_session_count}"
+        )
     basis_points = round(fraction * 10_000)
+    split_name = (
+        f"replite_main_split_seed{seed}_val{basis_points:04d}_v2.json"
+        if session_limit is None
+        else (
+            f"replite_main_split_seed{seed}_val{basis_points:04d}_"
+            f"sessions{session_limit:03d}_lexicographic_v1.json"
+        )
+    )
     split = create_or_load_group_split(
         catalog,
-        data_root
-        / "metadata"
-        / f"replite_main_split_seed{seed}_val{basis_points:04d}_v2.json",
+        data_root / "metadata" / split_name,
         seed=seed,
         validation_fraction=fraction,
+        session_limit=session_limit,
     )
     train_sessions = {item.session_id for item in split.train_records}
     val_sessions = {item.session_id for item in split.validation_records}
@@ -278,13 +312,21 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         raise AssertionError("train/validation session leakage")
     if split.official_test_records != catalog.test_records:
         raise AssertionError("official-test identity changed during split creation")
-    if {item.key for item in (*split.train_records, *split.validation_records)} != {
-        item.key for item in catalog.train_records
+    selected_records = _selected_official_train_records(catalog, split)
+    if {item.key for item in selected_records} != {
+        item.key for item in (*split.train_records, *split.validation_records)
     }:
-        raise AssertionError("fit plus inner-validation does not cover official train")
+        raise AssertionError("selected fit plus inner-validation record set changed")
+    selected_sessions = {item.session_id for item in selected_records}
+    if session_limit is None:
+        if len(selected_records) != len(catalog.train_records):
+            raise AssertionError("full campaign no longer covers official train")
+    elif len(selected_sessions) != session_limit:
+        raise AssertionError("session-limited campaign selected the wrong count")
     print(
-        f"[prepare] 3/3 split OK | fit={len(split.train_records)} | "
-        f"inner-val={len(split.validation_records)} | "
+        f"[prepare] 3/3 split OK | selected={len(selected_sessions)} sessions, "
+        f"{len(selected_records)} shards | fit={len(split.train_records)} shards | "
+        f"inner-val={len(split.validation_records)} shards | "
         f"official-test={len(split.official_test_records)}",
         flush=True,
     )
@@ -653,12 +695,29 @@ def inspection_payload(
 ) -> dict[str, Any]:
     train_sessions = {item.session_id for item in prepared.split.train_records}
     val_sessions = {item.session_id for item in prepared.split.validation_records}
+    selected_records = _selected_official_train_records(
+        prepared.catalog, prepared.split
+    )
+    selected_sessions = train_sessions | val_sessions
     return {
         "schema_version": 1,
         "protocol_id": PROTOCOL_ID,
         "context": prepared.context.as_dict(),
         "data": {
             "catalog_records": len(prepared.catalog.records),
+            "official_train_pool_archives": len(prepared.catalog.train_records),
+            "official_train_pool_sessions": len(
+                {item.session_id for item in prepared.catalog.train_records}
+            ),
+            "selected_official_train_archives": len(selected_records),
+            "selected_official_train_sessions": len(selected_sessions),
+            "selected_official_train_session_ids": sorted(selected_sessions),
+            "train_session_ids": sorted(train_sessions),
+            "validation_session_ids": sorted(val_sessions),
+            "official_train_session_limit": prepared.config["data"].get(
+                "official_train_session_limit"
+            ),
+            "session_selection_ordering": "lexicographic session_id",
             "annotation_policy": prepared.catalog.annotation_policy,
             "detection_config_sha256": prepared.catalog.detection_config_sha256,
             "train_archives": len(prepared.split.train_records),
@@ -684,7 +743,7 @@ def inspection_payload(
             "detection_archive_sources": {
                 source: sum(
                     item.detection_source == source
-                    for item in prepared.catalog.records
+                    for item in selected_records
                 )
                 for source in ("packaged_json", "panoptic_on_load")
             },
@@ -742,10 +801,11 @@ def inspection_payload(
             "tf32": False,
             "persistent_workers": False,
             "archive_policy": (
-                "stage all 186 official-train shards once on local SSD; "
-                "reuse for fit and inner-validation; official-test deferred"
+                f"stage only {len(selected_records)} selected official-train "
+                "shards from the full 186-shard SSD cache; reuse for fit and "
+                "inner-validation; official-test deferred"
             ),
-            "train_stage": prepared.train_stage.disk_plan(),
+            "train_stage": prepared.train_stage.disk_plan(selected_records),
         },
     }
 
@@ -764,6 +824,13 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
         "DATA AUDIT",
         ("split", "archives", "sessions", "samples", "role"),
         (
+            (
+                "official-train pool",
+                result["data"]["official_train_pool_archives"],
+                result["data"]["official_train_pool_sessions"],
+                EXPECTED["train_frames"],
+                "audited source; only selected subset is opened",
+            ),
             (
                 "train",
                 result["data"]["train_archives"],
@@ -790,6 +857,28 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
                 EXPECTED["test_frames"],
                 "RESERVED, not opened",
             ),
+        ),
+    )
+    _table(
+        f"SELECTED {result['data']['selected_official_train_sessions']}-SESSION SUBSET",
+        ("session_id", "split", "archives", "samples"),
+        tuple(
+            (
+                session_id,
+                "train" if session_id in {
+                    item.session_id for item in prepared.split.train_records
+                } else "val",
+                sum(
+                    item.session_id == session_id
+                    for item in (*prepared.split.train_records, *prepared.split.validation_records)
+                ),
+                sum(
+                    item.joint_frames
+                    for item in (*prepared.split.train_records, *prepared.split.validation_records)
+                    if item.session_id == session_id
+                ),
+            )
+            for session_id in result["data"]["selected_official_train_session_ids"]
         ),
     )
     _table(
@@ -1546,10 +1635,12 @@ def stage_official_train(filename: str | os.PathLike[str]) -> dict[str, Any]:
     """Copy, verify, and extract official-train once for all later epochs."""
 
     prepared = prepare(filename)
-    plan = prepared.train_stage.disk_plan()
+    selected = _selected_official_train_records(prepared.catalog, prepared.split)
+    plan = prepared.train_stage.disk_plan(selected)
     _print_stage_plan("STAGE OFFICIAL-TRAIN TO LOCAL SSD", plan)
     result = prepared.train_stage.prepare_all(
-        on_event=StageProgressReporter(prepared.train_stage.local_root)
+        on_event=StageProgressReporter(prepared.train_stage.local_root),
+        records=selected,
     )
     if result.get("complete") is not True:
         raise RuntimeError("official-train SSD stage did not complete")
@@ -1577,6 +1668,21 @@ def _official_test_stage(prepared: Prepared) -> LocalArchiveStage:
     )
 
 
+def _cleanup_private_train_stage(prepared: Prepared) -> bool:
+    staging = prepared.config.get("data", {}).get("local_staging", {})
+    run_id = prepared.config.get("run_id")
+    cache_id = staging.get("cache_id", run_id)
+    if run_id is not None and cache_id != run_id:
+        print(
+            "Shared official-train SSD cache được giữ lại: "
+            f"cache_id={cache_id}. Chỉ xoá thủ công khi không còn campaign dùng nó.",
+            flush=True,
+        )
+        return False
+    prepared.train_stage.cleanup()
+    return True
+
+
 def stage_official_test(filename: str | os.PathLike[str]) -> dict[str, Any]:
     """Stage the untouched holdout only after a checksum-valid full campaign."""
 
@@ -1597,9 +1703,9 @@ def stage_official_test(filename: str | os.PathLike[str]) -> dict[str, Any]:
             "training campaign is complete"
         )
 
-    # The full campaign no longer needs official-train pixels. This is an
-    # ownership-checked deletion under /content; Drive archives are untouched.
-    prepared.train_stage.cleanup()
+    # A private stage can be reclaimed here. Shared v4 caches are preserved so
+    # a subset campaign cannot delete another campaign's verified shards.
+    _cleanup_private_train_stage(prepared)
     test_stage = _official_test_stage(prepared)
     plan = test_stage.disk_plan()
     _print_stage_plan("STAGE OFFICIAL-TEST TO LOCAL SSD", plan)
@@ -1621,6 +1727,8 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("pilot requires an NVIDIA CUDA runtime")
     prepared = prepare(filename)
+    selected = _selected_official_train_records(prepared.catalog, prepared.split)
+    prepared.train_stage.require_complete(selected)
     existing = _load_gate(prepared)
     if existing is not None:
         restored = _restore(prepared)
@@ -1633,8 +1741,6 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
         raise FileExistsError(
             "unpublished local checkpoint exists; use a new RUN_ID"
         )
-
-    prepared.train_stage.require_complete()
 
     inspection = _load_cached_inspection(prepared)
     if inspection is None:
@@ -1805,7 +1911,8 @@ def run_main(filename: str | os.PathLike[str], supplied_token: str) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("main training requires an NVIDIA CUDA runtime")
     prepared = prepare(filename)
-    prepared.train_stage.require_complete()
+    selected = _selected_official_train_records(prepared.catalog, prepared.split)
+    prepared.train_stage.require_complete(selected)
     _verify_approval(prepared, supplied_token)
     restored = _restore(prepared)
     objects = build_train_objects(prepared)
@@ -1884,11 +1991,14 @@ def run_main(filename: str | os.PathLike[str], supplied_token: str) -> None:
             f"{snapshot.snapshot_dir} | {snapshot.checkpoint_sha256}"
         )
     objects.logger.close()
-    prepared.train_stage.cleanup()
+    stage_removed = _cleanup_private_train_stage(prepared)
     print("\nTRAINING COMPLETE")
     print("Drive run:", prepared.drive_run)
     print("Best:", objects.trainer.best_metrics)
-    print("Official-train local SSD stage đã được xoá; Drive archives còn nguyên.")
+    if stage_removed:
+        print("Official-train local SSD stage đã được xoá; Drive archives còn nguyên.")
+    else:
+        print("Shared official-train SSD stage vẫn được giữ; Drive archives còn nguyên.")
     print("Official-test vẫn chưa được dùng.")
 
 

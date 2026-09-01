@@ -351,8 +351,10 @@ Use
 [`notebooks/SANPO_Real_Main_Train.ipynb`](notebooks/SANPO_Real_Main_Train.ipynb)
 after all 234 downloader archives are present on Drive. The notebook audits the
 expected 186 official-train session-camera archives (14,718 joint targets) and
-48 official-test archives (3,803 targets). It freezes a deterministic,
-session-disjoint split from official-train only; official-test is catalogued
+48 official-test archives (3,803 targets). The current limited-data campaign
+selects the first 20 official-train sessions in canonical lexicographic order,
+then freezes a deterministic, session-disjoint fit/validation split inside
+that subset; official-test is catalogued
 for provenance but is never extracted or passed to training, validation,
 early stopping, or checkpoint selection.
 
@@ -374,7 +376,10 @@ either directly there or in `sanpo_real_v0_joint_human_only_rgb3`; it never
 searches arbitrary Drive locations. Inspection validates the three compact
 metadata manifests without issuing per-archive FUSE `resolve/stat` calls. Cell
 4 then copies, byte/SHA-verifies, and atomically extracts
-all 186 official-train shards (fit plus inner-validation) once to `/content`.
+only the shards belonging to the selected 20 sessions (fit plus
+inner-validation) once to `/content`. The full 186-shard stage identity is
+retained so completed prefix shards from the existing v4 SSD cache can be
+verified and reused without copying them again.
 Cell 5 performs a disposable one-batch preflight and then runs exactly campaign
 epoch 1 over the complete train split with complete validation. If FP16 scaled
 gradients overflow, preflight records the affected parameters and backs the
@@ -405,24 +410,28 @@ incompatible snapshots. Each `RUN_ID` also writes an immutable source pin on
 Drive, so Cell 2 checks out the campaign's original commit even if `main` has
 advanced since the previous Colab session.
 
-Within the same live Colab runtime, the v5 logging-only campaign has a new
-source pin while retaining the v4 local stage cache ID. (`/content` is
+Within the same live Colab runtime, the subset20 campaign has its own source
+pin while retaining the v4 local stage cache ID. (`/content` is
 ephemeral, so no SSD cache survives a runtime reset.) `LocalArchiveStage`
 still verifies the dataset-owned stage
 marker, archive identity, and referenced payload signatures before reuse; this
 lets an in-progress v4 SSD extraction continue under the clearer UI without
 downloading completed shards again.
 
-The staged loader reuses the extracted official-train corpus directly from SSD
+The staged loader reuses the selected extracted corpus directly from SSD
 for every epoch, so epochs do not reread Drive or re-extract archives. The stage
 is resumable shard-by-shard; its completion gate rechecks every referenced file
 against the stored path/size signature. Capacity planning uses the downloader's
-exact selected-file byte totals plus a configurable allowance. The stage is
-deleted only after the final epoch snapshot is safe on Drive. Cell 8 can then
+exact selected-file byte totals plus a configurable allowance. Because v4 is a
+shared cache, the subset campaign does not delete it automatically. Cell 8 can then
 stage the 48 official-test shards; it is
 blocked before full campaign completion and staging alone does not evaluate the
 holdout. Derived detection boxes remain an internal panoptic-to-box protocol,
 not an official SANPO detection benchmark.
+
+This is explicitly a 20-session limited-data experiment. Its metrics must not
+be reported as full-corpus SANPO results; the selected session IDs and policy
+are stored in the immutable split manifest and bound into snapshot parity.
 
 ## Standalone backbones
 

@@ -45,8 +45,10 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         "BATCH_SIZE = 4",
         "VAL_FRACTION = 0.15",
         'DRIVE_BASE_ROOT = Path("/content/drive/MyDrive/nckh1m_data")',
-        'RUN_ID = "replite_sanpo_mnv4convs_seed42_v5"',
+        'RUN_ID = "replite_sanpo_mnv4convs_subset20_seed42_v1"',
         'LOCAL_STAGE_CACHE_ID = "replite_sanpo_mnv4convs_seed42_v4"',
+        "OFFICIAL_TRAIN_SESSION_LIMIT = 20",
+        '"official_train_session_limit": OFFICIAL_TRAIN_SESSION_LIMIT',
         '"cache_id": LOCAL_STAGE_CACHE_ID',
         "PROGRESS_EVERY_N_STEPS = 10",
         'print("SANPO DATA ROOT:", DRIVE_DATA_ROOT)',
@@ -64,6 +66,7 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         'run_live(["stage-test"])',
         "def run_live(arguments)",
         "tail -F",
+        "Stage subset 20 session official-train lên SSD",
     ):
         assert marker in source
 

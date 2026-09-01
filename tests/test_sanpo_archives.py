@@ -493,6 +493,132 @@ def test_group_split_is_session_stable_excludes_test_and_is_immutable(tmp_path: 
         )
 
 
+def test_group_split_limits_lexicographic_sessions_and_keeps_all_cameras(
+    tmp_path: Path,
+) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    catalog = load_archive_catalog(root)
+    manifest = tmp_path / "splits" / "subset-two.json"
+    split = create_or_load_group_split(
+        catalog,
+        manifest,
+        seed=42,
+        validation_fraction=0.34,
+        session_limit=2,
+    )
+
+    selected = (*split.train_records, *split.validation_records)
+    selected_sessions = {record.session_id for record in selected}
+    assert selected_sessions == {"session-a", "session-b"}
+    assert sum(record.session_id == "session-a" for record in selected) == 2
+    assert {record.session_id for record in split.train_records}.isdisjoint(
+        {record.session_id for record in split.validation_records}
+    )
+    assert split.official_test_records == catalog.test_records
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["session_limit"] == 2
+    assert payload["selected_official_train_session_ids"] == [
+        "session-a",
+        "session-b",
+    ]
+    assert payload["session_selection_ordering"] == "lexicographic session_id"
+
+    again = create_or_load_group_split(
+        catalog,
+        manifest,
+        seed=42,
+        validation_fraction=0.34,
+        session_limit=2,
+    )
+    assert again.manifest_sha256 == split.manifest_sha256
+    with pytest.raises(FileExistsError, match="differs"):
+        create_or_load_group_split(
+            catalog,
+            manifest,
+            seed=42,
+            validation_fraction=0.34,
+            session_limit=3,
+        )
+
+
+@pytest.mark.parametrize("session_limit", [True, 0, 1, 4])
+def test_group_split_rejects_invalid_session_limit(
+    tmp_path: Path,
+    session_limit: object,
+) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    catalog = load_archive_catalog(root)
+    with pytest.raises(ValueError, match="session_limit"):
+        create_or_load_group_split(
+            catalog,
+            tmp_path / f"invalid-{session_limit}.json",
+            session_limit=session_limit,  # type: ignore[arg-type]
+        )
+
+
+def test_twenty_session_split_has_seventeen_fit_three_val_and_no_leakage(
+    tmp_path: Path,
+) -> None:
+    records: list[SanpoArchiveRecord] = []
+    for index in range(25):
+        sensors = ("camera_head", "camera_chest") if index == 3 else ("camera_head",)
+        for sensor in sensors:
+            token = f"session-{index:02d}-{sensor}"
+            records.append(
+                SanpoArchiveRecord(
+                    split="train",
+                    session_id=f"session-{index:02d}",
+                    sensor=sensor,
+                    annotation_policy=_ANNOTATION_POLICY,
+                    selection_sha256=_sha(f"selection-{token}"),
+                    detection_source="panoptic_on_load",
+                    detection_config_sha256=_DETECTION_CONFIG_SHA,
+                    package_sha256=None,
+                    archive_path=tmp_path / f"{token}.tar.zst",
+                    archive_bytes=100,
+                    archive_sha256=_sha(f"archive-{token}"),
+                    joint_frames=4,
+                    source_bytes=100,
+                )
+            )
+    test_record = SanpoArchiveRecord(
+        **{
+            **records[0].__dict__,
+            "split": "test",
+            "session_id": "official-test",
+            "archive_sha256": _sha("official-test-archive"),
+        }
+    )
+    catalog = archives_module.ArchiveCatalog(
+        drive_root=tmp_path,
+        records=tuple(records) + (test_record,),
+        annotation_policy=_ANNOTATION_POLICY,
+        detection_config_sha256=_DETECTION_CONFIG_SHA,
+        catalog_sha256=_sha("twenty-session-catalog"),
+    )
+    split = create_or_load_group_split(
+        catalog,
+        tmp_path / "twenty-session-split.json",
+        seed=42,
+        validation_fraction=0.15,
+        session_limit=20,
+    )
+
+    train_sessions = {record.session_id for record in split.train_records}
+    val_sessions = {record.session_id for record in split.validation_records}
+    assert len(train_sessions) == 17
+    assert len(val_sessions) == 3
+    assert train_sessions.isdisjoint(val_sessions)
+    assert train_sessions | val_sessions == {
+        f"session-{index:02d}" for index in range(20)
+    }
+    assert sum(record.session_id == "session-03" for record in split.train_records) in {0, 2}
+    assert sum(
+        record.session_id == "session-03" for record in split.validation_records
+    ) in {0, 2}
+    assert split.official_test_records == (test_record,)
+
+
 def _joint_manifest_bytes(
     *,
     split: str,
@@ -865,6 +991,66 @@ def test_persistent_stage_keeps_legacy_callback_and_emits_detailed_events(
     for event in events:
         assert event["purpose"] == "official_train"
         assert event["total_records"] == 1
+
+
+def test_persistent_stage_prepares_and_gates_only_selected_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    records = tuple(
+        _write_tar_archive(
+            tmp_path / "source" / f"subset-{index}.tar.zst",
+            session_id=f"session-{index}",
+            sensor="camera_head",
+            selection_sha=_sha(f"subset-stage-{index}"),
+        )
+        for index in range(3)
+    )
+    copied: list[str] = []
+    original_copy = archives_module._copy_verified
+
+    def counted_copy(record, destination, progress=None):
+        copied.append(record.session_id)
+        return original_copy(record, destination, progress)
+
+    monkeypatch.setattr(archives_module, "_copy_verified", counted_copy)
+    stage = LocalArchiveStage(
+        records,
+        local_root=tmp_path / "subset-stage",
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=0,
+    )
+    selected = (records[0], records[2])
+
+    with pytest.raises(RuntimeError, match="0/2"):
+        stage.require_complete(selected)
+    first = stage.prepare_all(records=selected)
+    assert first["complete"] is True
+    assert first["record_count"] == 2
+    assert first["completed_count"] == 2
+    assert first["stage_record_count"] == 3
+    assert first["stage_completed_count"] == 2
+    assert copied == ["session-0", "session-2"]
+    assert not stage._record_root(records[1]).exists()
+    assert stage.require_complete(selected)["complete"] is True
+    with pytest.raises(RuntimeError, match="2/3"):
+        stage.require_complete()
+
+    second = stage.prepare_all(records=selected)
+    assert second["complete"] is True
+    assert copied == ["session-0", "session-2"]
+    with pytest.raises(ValueError, match="not a subset"):
+        stage.disk_plan(
+            (
+                SanpoArchiveRecord(
+                    **{
+                        **records[0].__dict__,
+                        "archive_sha256": _sha("foreign-subset-record"),
+                    }
+                ),
+            )
+        )
 
 
 def test_persistent_stage_enforces_official_split_and_complete_gate(

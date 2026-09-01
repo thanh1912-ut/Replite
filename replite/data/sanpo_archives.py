@@ -666,10 +666,26 @@ def _group_split_payload(
     *,
     seed: int,
     validation_fraction: float,
+    session_limit: int | None = None,
 ) -> tuple[dict[str, object], set[str], set[str]]:
     train_sessions = sorted({record.session_id for record in catalog.train_records})
     if len(train_sessions) < 2:
         raise ValueError("at least two official-train sessions are required")
+    if session_limit is not None:
+        if (
+            isinstance(session_limit, bool)
+            or not isinstance(session_limit, int)
+            or session_limit < 2
+            or session_limit > len(train_sessions)
+        ):
+            raise ValueError(
+                "session_limit must be between two and the available "
+                "official-train session count"
+            )
+        # Catalog order is stable and is also the order used by persistent
+        # staging, so a small campaign naturally reuses the earliest shards
+        # already copied before an interrupted full-corpus stage.
+        train_sessions = train_sessions[:session_limit]
     ordered = sorted(
         train_sessions,
         key=lambda session_id: (
@@ -701,6 +717,15 @@ def _group_split_payload(
         "official_test_session_ids": test_sessions,
         "protocol_note": "Official test is excluded from training, validation, and selection.",
     }
+    if session_limit is not None:
+        payload.update(
+            {
+                "subset_schema_version": 1,
+                "session_limit": session_limit,
+                "session_selection_ordering": "lexicographic session_id",
+                "selected_official_train_session_ids": train_sessions,
+            }
+        )
     payload["manifest_sha256"] = canonical_json_sha256(payload)
     return payload, fit_sessions, validation_sessions
 
@@ -727,6 +752,7 @@ def create_or_load_group_split(
     *,
     seed: int = 42,
     validation_fraction: float = 0.15,
+    session_limit: int | None = None,
 ) -> ArchiveGroupSplit:
     """Create or verify an immutable, deterministic session-level split."""
 
@@ -741,7 +767,10 @@ def create_or_load_group_split(
         raise ValueError("validation_fraction must be finite and between zero and one")
     fraction = float(validation_fraction)
     payload, train_sessions, validation_sessions = _group_split_payload(
-        catalog, seed=seed, validation_fraction=fraction
+        catalog,
+        seed=seed,
+        validation_fraction=fraction,
+        session_limit=session_limit,
     )
     path = Path(manifest_path).expanduser().resolve()
     _write_json_immutable(path, payload)
@@ -1128,6 +1157,21 @@ class LocalArchiveStage:
         )
         self._records_by_key = {record.key: record for record in self.records}
 
+    def _select_records(
+        self,
+        records: Sequence[SanpoArchiveRecord] | None,
+    ) -> tuple[SanpoArchiveRecord, ...]:
+        selected = self.records if records is None else tuple(records)
+        if not selected:
+            raise ValueError("local SANPO stage selection cannot be empty")
+        if any(not isinstance(record, SanpoArchiveRecord) for record in selected):
+            raise TypeError("local SANPO stage selection must contain archive records")
+        if len({record.key for record in selected}) != len(selected):
+            raise ValueError("local SANPO stage selection contains duplicate keys")
+        if any(self._records_by_key.get(record.key) != record for record in selected):
+            raise ValueError("record selection is not a subset of this SANPO stage")
+        return selected
+
     @property
     def marker_path(self) -> Path:
         return self.local_root / _PERSISTENT_STAGE_MARKER
@@ -1310,6 +1354,49 @@ class LocalArchiveStage:
         _atomic_json_file(self.status_path, payload)
         return payload
 
+    def _selection_status(
+        self,
+        records: Sequence[SanpoArchiveRecord],
+        global_status: Mapping[str, object],
+    ) -> dict[str, object]:
+        selected = self._select_records(records)
+        if selected == self.records:
+            return dict(global_status)
+        completed_ids: list[str] = []
+        extracted_bytes = 0
+        for record in selected:
+            record_id = self._record_stage_id(record)
+            root = self._shards_root / record_id
+            if not root.is_dir():
+                continue
+            complete = _read_json_object(
+                root / _PERSISTENT_SHARD_COMPLETE,
+                "completed SANPO shard marker",
+            )
+            value = complete.get("extracted_bytes")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(
+                    "completed SANPO shard has invalid extracted byte count"
+                )
+            completed_ids.append(record_id)
+            extracted_bytes += value
+        completed_ids.sort()
+        return {
+            "schema_version": 1,
+            "stage_sha256": self.stage_sha256,
+            "purpose": self.purpose,
+            "selection_sha256": canonical_json_sha256(
+                [_record_id(record) for record in selected]
+            ),
+            "record_count": len(selected),
+            "completed_count": len(completed_ids),
+            "complete": len(completed_ids) == len(selected),
+            "completed_record_ids": completed_ids,
+            "completed_extracted_bytes": extracted_bytes,
+            "stage_record_count": global_status["record_count"],
+            "stage_completed_count": global_status["completed_count"],
+        }
+
     def _remove_owned_partials(self) -> None:
         for partial in self._partials_root.iterdir():
             if not partial.is_dir():
@@ -1328,10 +1415,14 @@ class LocalArchiveStage:
         ratio_estimate = math.ceil(record.archive_bytes * self.expansion_factor)
         return max(ratio_estimate, record.source_bytes or 0)
 
-    def _disk_plan_unlocked(self) -> dict[str, int | float]:
+    def _disk_plan_unlocked(
+        self,
+        records: Sequence[SanpoArchiveRecord] | None = None,
+    ) -> dict[str, int | float]:
+        selected = self._select_records(records)
         pending = [
             record
-            for record in self.records
+            for record in selected
             if self._existing_manifest(record) is None
         ]
         archive_bytes = sum(record.archive_bytes for record in pending)
@@ -1360,14 +1451,20 @@ class LocalArchiveStage:
             "expansion_factor": self.expansion_factor,
         }
 
-    def disk_plan(self) -> dict[str, int | float]:
+    def disk_plan(
+        self,
+        records: Sequence[SanpoArchiveRecord] | None = None,
+    ) -> dict[str, int | float]:
         """Return capacity bytes needed to finish all missing shards."""
 
         with self._locked():
-            return self._disk_plan_unlocked()
+            return self._disk_plan_unlocked(records)
 
-    def _assert_disk_capacity(self) -> dict[str, int | float]:
-        plan = self._disk_plan_unlocked()
+    def _assert_disk_capacity(
+        self,
+        records: Sequence[SanpoArchiveRecord] | None = None,
+    ) -> dict[str, int | float]:
+        plan = self._disk_plan_unlocked(records)
         if int(plan["available_free_bytes"]) < int(plan["required_free_bytes"]):
             raise OSError(
                 "insufficient local SSD for SANPO stage: "
@@ -1497,6 +1594,7 @@ class LocalArchiveStage:
         progress: Callable[[int, int, SanpoArchiveRecord, str], None] | None = None,
         *,
         on_event: _StageProgressCallback | None = None,
+        records: Sequence[SanpoArchiveRecord] | None = None,
     ) -> dict[str, object]:
         """Preflight disk, resume missing shards, and return the stage manifest.
 
@@ -1506,12 +1604,13 @@ class LocalArchiveStage:
         that still expect ``(index, total, record, status)``.
         """
 
+        selected = self._select_records(records)
         with self._locked():
             self._remove_owned_partials()
-            plan = self._assert_disk_capacity()
-        total = len(self.records)
+            plan = self._assert_disk_capacity(selected)
+        total = len(selected)
         total_bytes = sum(
-            self._estimated_unpacked_bytes(record) for record in self.records
+            self._estimated_unpacked_bytes(record) for record in selected
         )
         ready_records = 0
         ready_bytes = 0
@@ -1529,7 +1628,7 @@ class LocalArchiveStage:
         existing_by_key: dict[
             tuple[str, str, str, str, str], Path | None
         ] = {}
-        for index, record in enumerate(self.records, start=1):
+        for index, record in enumerate(selected, start=1):
             existing = self._existing_manifest(record, verify_payloads=True)
             existing_by_key[record.key] = existing
             if existing is not None:
@@ -1560,7 +1659,7 @@ class LocalArchiveStage:
                     "ready_bytes": ready_bytes,
                 }
             )
-        for index, record in enumerate(self.records, start=1):
+        for index, record in enumerate(selected, start=1):
             existing = existing_by_key[record.key]
             status = "cached" if existing is not None else "extract"
             if progress is not None:
@@ -1632,7 +1731,7 @@ class LocalArchiveStage:
                 }
             )
         with self._locked():
-            for index, record in enumerate(self.records, start=1):
+            for index, record in enumerate(selected, start=1):
                 self._existing_manifest(record, verify_payloads=True)
                 if on_event is not None:
                     on_event(
@@ -1648,7 +1747,8 @@ class LocalArchiveStage:
                             "total_bytes": total_bytes,
                         }
                     )
-            payload = self._write_status()
+            global_status = self._write_status()
+            payload = self._selection_status(selected, global_status)
         if on_event is not None:
             on_event(
                 {
@@ -1662,18 +1762,26 @@ class LocalArchiveStage:
             )
         return {**payload, "disk_plan": plan}
 
-    def status(self) -> dict[str, object]:
+    def status(
+        self,
+        records: Sequence[SanpoArchiveRecord] | None = None,
+    ) -> dict[str, object]:
         """Validate completed shards and return the resumable stage status."""
 
+        selected = self._select_records(records)
         with self._locked():
-            for record in self.records:
+            for record in selected:
                 self._existing_manifest(record, verify_payloads=True)
-            return self._write_status()
+            global_status = self._write_status()
+            return self._selection_status(selected, global_status)
 
-    def require_complete(self) -> dict[str, object]:
+    def require_complete(
+        self,
+        records: Sequence[SanpoArchiveRecord] | None = None,
+    ) -> dict[str, object]:
         """Reject training until every selected archive is present on SSD."""
 
-        payload = self.status()
+        payload = self.status(records)
         if payload.get("complete") is not True:
             raise RuntimeError(
                 "local SANPO stage is incomplete: "
