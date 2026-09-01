@@ -347,6 +347,7 @@ def load_training_checkpoint(
     strict_config: bool = True,
     strict_model_metadata: bool = True,
     verify_checksum: bool = True,
+    expected_extra: Mapping[str, Any] | None = None,
 ) -> ResumeState:
     """Strictly restore a trusted epoch-boundary checkpoint.
 
@@ -383,6 +384,23 @@ def load_training_checkpoint(
         payload.get("model_metadata")
     ) != _metadata_signature(_model_metadata(model)):
         raise ValueError("model metadata/architecture mismatch")
+    if expected_extra is not None:
+        if not isinstance(expected_extra, Mapping):
+            raise TypeError("expected_extra must be a mapping or None")
+        saved_extra = payload.get("extra")
+        if not isinstance(saved_extra, Mapping):
+            raise ValueError("checkpoint extra metadata is missing")
+        mismatched = [
+            str(key)
+            for key, value in expected_extra.items()
+            if key not in saved_extra
+            or _canonical_hash(saved_extra[key]) != _canonical_hash(value)
+        ]
+        if mismatched:
+            raise ValueError(
+                "checkpoint extra metadata mismatch: "
+                + ", ".join(sorted(mismatched))
+            )
 
     _unwrap_model(model).load_state_dict(payload["model"], strict=True)
     optimizer.load_state_dict(payload["optimizer"])

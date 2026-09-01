@@ -1,5 +1,16 @@
 """Dataset adapters and target conversion helpers."""
 
+from .sanpo_archives import (
+    ArchiveCatalog,
+    ArchiveGroupSplit,
+    ArchiveMaterializer,
+    ArchiveShardLoader,
+    SanpoArchiveRecord,
+    canonical_json_bytes,
+    canonical_json_sha256,
+    create_or_load_group_split,
+    load_archive_catalog,
+)
 from .sanpo import (
     SANPO_DETECTION_CLASS_NAMES,
     SANPO_LABELMAP,
@@ -25,6 +36,10 @@ from .sanpo_joint import (
 )
 
 __all__ = [
+    "ArchiveCatalog",
+    "ArchiveGroupSplit",
+    "ArchiveMaterializer",
+    "ArchiveShardLoader",
     "SANPO_DETECTION_CLASS_NAMES",
     "SANPO_LABELMAP",
     "SANPO_LABEL_TYPES",
@@ -35,10 +50,15 @@ __all__ = [
     "IMAGENET_RGB_MEAN",
     "IMAGENET_RGB_STD",
     "SanpoComponent",
+    "SanpoArchiveRecord",
     "SanpoJointDataset",
     "SanpoJointInfo",
+    "canonical_json_bytes",
+    "canonical_json_sha256",
+    "create_or_load_group_split",
     "decode_sanpo_panoptic",
     "extract_sanpo_components",
+    "load_archive_catalog",
     "load_sanpo_detection",
     "load_sanpo_joint_manifest",
     "read_sanpo_depth",

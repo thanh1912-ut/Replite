@@ -124,6 +124,41 @@ def test_mapping_batch_and_five_dimensional_clip_reach_model_unchanged() -> None
     assert model.seen_shape == (1, 3, 1, 1, 1)
 
 
+def test_event_callback_receives_yolo_progress_fields() -> None:
+    class MappingCriterion(nn.Module):
+        def forward(self, prediction, target):
+            del target
+            loss = prediction.square().mean()
+            return {"total": loss}
+
+    events = []
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MappingCriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        TrainerConfig(epochs=1, amp=False),
+        device="cpu",
+        event_callback=lambda name, payload: events.append((name, payload)),
+    )
+    targets = {
+        "detection": [
+            {
+                "labels": torch.tensor([0, 1]),
+                "ignore_boxes": torch.zeros(3, 4),
+            }
+        ]
+    }
+    trainer.train_epoch([(torch.ones(1, 1, 1, 1), targets)], epoch=0)
+    names = [name for name, _ in events]
+    assert names == ["train_epoch_start", "train_batch_end", "train_epoch_end"]
+    batch = events[1][1]
+    assert batch["instances"] == 2
+    assert batch["ignored_instances"] == 3
+    assert batch["image_size"] == (1, 1)
+    assert batch["running_losses"]["total"] >= 0
+
+
 def test_fit_checkpoint_and_resume_continue_at_next_epoch(tmp_path) -> None:
     config = TrainerConfig(epochs=2, amp=False, monitor="val/total")
     manager = CheckpointManager(tmp_path)
@@ -157,6 +192,102 @@ def test_fit_checkpoint_and_resume_continue_at_next_epoch(tmp_path) -> None:
     torch.testing.assert_close(restored.weight, model.weight, rtol=0, atol=0)
 
 
+def test_fit_can_pause_after_first_campaign_epoch_and_resume_same_config(tmp_path) -> None:
+    config = TrainerConfig(
+        epochs=3,
+        amp=False,
+        validate_every_n_epochs=3,
+        checkpoint_every_n_epochs=3,
+    )
+    manager = CheckpointManager(tmp_path)
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        config,
+        device="cpu",
+        checkpoint_manager=manager,
+        checkpoint_extra={"split_sha256": "a" * 64},
+    )
+
+    pilot = trainer.fit(
+        [_batch(1, 1)],
+        [_batch(1, 1)],
+        stop_after_epoch=1,
+    )
+    assert [record["epoch"] for record in pilot] == [0]
+    assert "val" in pilot[0]
+    assert trainer.start_epoch == 1
+    assert manager.last_path.is_file()
+
+    resumed_model = ScalarModel()
+    resumed = Trainer(
+        resumed_model,
+        MSECriterion(),
+        torch.optim.SGD(resumed_model.parameters(), lr=0.1),
+        config,
+        device="cpu",
+        checkpoint_manager=manager,
+        checkpoint_extra={"split_sha256": "a" * 64},
+    )
+    state = resumed.resume()
+    assert state.next_epoch == 1
+    assert state.extra["split_sha256"] == "a" * 64
+    remainder = resumed.fit(
+        [_batch(1, 1)],
+        [_batch(1, 1)],
+        stop_after_epoch=3,
+    )
+    assert [record["epoch"] for record in remainder] == [1, 2]
+    assert resumed.start_epoch == 3
+
+
+def test_resume_rejects_checkpoint_context_before_mutating_model(tmp_path) -> None:
+    config = TrainerConfig(epochs=2, amp=False)
+    source = ScalarModel()
+    manager = CheckpointManager(tmp_path)
+    source_trainer = Trainer(
+        source,
+        MSECriterion(),
+        torch.optim.SGD(source.parameters(), lr=0.1),
+        config,
+        device="cpu",
+        checkpoint_manager=manager,
+        checkpoint_extra={"split_sha256": "a" * 64},
+    )
+    source_trainer.fit([_batch(1, 1)], stop_after_epoch=1)
+
+    target = ScalarModel()
+    before = target.weight.detach().clone()
+    target_trainer = Trainer(
+        target,
+        MSECriterion(),
+        torch.optim.SGD(target.parameters(), lr=0.1),
+        config,
+        device="cpu",
+        checkpoint_manager=manager,
+        checkpoint_extra={"split_sha256": "b" * 64},
+    )
+    with pytest.raises(ValueError, match="split_sha256"):
+        target_trainer.resume()
+    torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("value", [0, 4, True, 1.5])
+def test_fit_rejects_invalid_pause_epoch(value) -> None:
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        TrainerConfig(epochs=3, amp=False),
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="stop_after_epoch"):
+        trainer.fit([_batch(1, 1)], stop_after_epoch=value)
+
+
 def test_non_finite_loss_stops_before_optimizer_step() -> None:
     model = ScalarModel()
     trainer = Trainer(
@@ -169,6 +300,19 @@ def test_non_finite_loss_stops_before_optimizer_step() -> None:
     with pytest.raises(FloatingPointError, match="non-finite"):
         trainer.train_epoch([_batch(float("nan"), 1)], epoch=0)
     assert trainer.global_step == 0
+
+
+def test_fit_fails_when_validation_monitor_is_missing() -> None:
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        TrainerConfig(epochs=1, amp=False, monitor="val/not_a_metric"),
+        device="cpu",
+    )
+    with pytest.raises(KeyError, match="not_a_metric"):
+        trainer.fit([_batch(1, 1)], [_batch(1, 1)])
 
 
 def test_skipped_optimizer_update_is_logged_with_scale(tmp_path) -> None:

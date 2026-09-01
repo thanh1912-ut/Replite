@@ -161,6 +161,8 @@ class Trainer:
         logger: TrainingLogger | None = None,
         checkpoint_manager: CheckpointManager | None = None,
         validation_metrics: object | None = None,
+        checkpoint_extra: Mapping[str, Any] | None = None,
+        event_callback: object | None = None,
     ) -> None:
         if not isinstance(model, nn.Module) or not isinstance(criterion, nn.Module):
             raise TypeError("model and criterion must be nn.Module instances")
@@ -186,6 +188,12 @@ class Trainer:
         self.logger = logger
         self.checkpoint_manager = checkpoint_manager
         self.validation_metrics = validation_metrics
+        if checkpoint_extra is not None and not isinstance(checkpoint_extra, Mapping):
+            raise TypeError("checkpoint_extra must be a mapping or None")
+        self.checkpoint_extra = dict(checkpoint_extra or {})
+        if event_callback is not None and not callable(event_callback):
+            raise TypeError("event_callback must be callable or None")
+        self.event_callback = event_callback
         self.amp_enabled = bool(config.amp and self.device.type == "cuda")
         self.amp_dtype = torch.float16 if config.amp_dtype == "float16" else torch.bfloat16
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
@@ -193,6 +201,36 @@ class Trainer:
         self.start_epoch = 0
         self.amp_skip_count = 0
         self.best_metrics: dict[str, float] = {}
+
+    def _emit(self, event: str, **payload: Any) -> None:
+        if self.event_callback is not None:
+            self.event_callback(event, dict(payload))
+
+    @staticmethod
+    def _batch_summary(inputs: Tensor, targets: Any) -> dict[str, Any]:
+        instances = 0
+        ignored_instances = 0
+        if isinstance(targets, Mapping):
+            detection = targets.get("detection")
+            if isinstance(detection, Sequence) and not isinstance(
+                detection, (str, bytes, Tensor)
+            ):
+                for item in detection:
+                    if not isinstance(item, Mapping):
+                        continue
+                    labels = item.get("labels")
+                    ignore_boxes = item.get("ignore_boxes")
+                    if isinstance(labels, Tensor):
+                        instances += int(labels.numel())
+                    if isinstance(ignore_boxes, Tensor) and ignore_boxes.ndim >= 1:
+                        ignored_instances += int(ignore_boxes.shape[0])
+        return {
+            "batch_size": int(inputs.shape[0]),
+            "clip_length": int(inputs.shape[1]) if inputs.ndim == 5 else 1,
+            "image_size": (int(inputs.shape[-2]), int(inputs.shape[-1])),
+            "instances": instances,
+            "ignored_instances": ignored_instances,
+        }
 
     def _autocast(self):
         if not self.amp_enabled:
@@ -259,8 +297,15 @@ class Trainer:
             total_batches = len(loader)
         except TypeError:
             total_batches = None
+        self._emit(
+            "train_epoch_start",
+            epoch=epoch,
+            total_epochs=self.config.epochs,
+            total_batches=total_batches,
+        )
         for batch_index, batch in enumerate(loader):
             inputs, targets = _split_batch(batch)
+            batch_summary = self._batch_summary(inputs, targets)
             inputs = move_to_device(inputs, self.device, non_blocking=self.device.type == "cuda")
             targets = move_to_device(targets, self.device, non_blocking=self.device.type == "cuda")
             with self._autocast():
@@ -271,8 +316,11 @@ class Trainer:
             self.scaler.scale(total).backward() if self.amp_enabled else total.backward()
             microbatches += 1
             batches += 1
+            current_losses: dict[str, float] = {}
             for name, value in losses.items():
-                sums[name] = sums.get(name, 0.0) + float(value.detach().float().cpu())
+                scalar = float(value.detach().float().cpu())
+                current_losses[name] = scalar
+                sums[name] = sums.get(name, 0.0) + scalar
             is_last = total_batches is not None and batch_index + 1 == total_batches
             boundary = microbatches == self.config.grad_accum_steps or is_last
             if boundary:
@@ -297,13 +345,42 @@ class Trainer:
                         global_step=self.global_step,
                         split="train",
                     )
+            self._emit(
+                "train_batch_end",
+                epoch=epoch,
+                total_epochs=self.config.epochs,
+                batch_index=batch_index,
+                batches_completed=batches,
+                total_batches=total_batches,
+                losses=current_losses,
+                running_losses={name: value / batches for name, value in sums.items()},
+                global_step=self.global_step,
+                amp_skip_count=self.amp_skip_count,
+                lr=[float(group["lr"]) for group in self.optimizer.param_groups],
+                gpu_memory_bytes=(
+                    int(torch.cuda.memory_reserved(self.device))
+                    if self.device.type == "cuda"
+                    else 0
+                ),
+                **batch_summary,
+            )
         if microbatches:
             stepped, _ = self._optimizer_step(microbatches)
             if not stepped:
                 self._log_amp_overflow_skip(epoch=epoch, batch_index=batch_index)
         if batches == 0:
             raise ValueError("training loader is empty")
-        return {name: value / batches for name, value in sums.items()}
+        result = {name: value / batches for name, value in sums.items()}
+        self._emit(
+            "train_epoch_end",
+            epoch=epoch,
+            total_epochs=self.config.epochs,
+            batches=batches,
+            result=result,
+            global_step=self.global_step,
+            amp_skip_count=self.amp_skip_count,
+        )
+        return result
 
     def validate(self, loader: Any, *, epoch: int | None = None) -> dict[str, Any]:
         was_training = self.model.training
@@ -315,6 +392,16 @@ class Trainer:
             reset()
         sums: dict[str, float] = {}
         batches = 0
+        try:
+            total_batches = len(loader)
+        except TypeError:
+            total_batches = None
+        self._emit(
+            "validation_start",
+            epoch=epoch,
+            total_epochs=self.config.epochs,
+            total_batches=total_batches,
+        )
         try:
             with torch.inference_mode():
                 for batch in loader:
@@ -329,6 +416,13 @@ class Trainer:
                     if self.validation_metrics is not None:
                         self.validation_metrics.update(outputs, targets)
                     batches += 1
+                    self._emit(
+                        "validation_batch_end",
+                        epoch=epoch,
+                        total_epochs=self.config.epochs,
+                        batches_completed=batches,
+                        total_batches=total_batches,
+                    )
         finally:
             self.model.train(was_training)
         if batches == 0:
@@ -349,6 +443,14 @@ class Trainer:
                 global_step=self.global_step,
                 split="val",
             )
+        self._emit(
+            "validation_end",
+            epoch=epoch,
+            total_epochs=self.config.epochs,
+            batches=batches,
+            result=result,
+            global_step=self.global_step,
+        )
         return result
 
     def resume(self, path: str | None = None) -> ResumeState:
@@ -359,6 +461,7 @@ class Trainer:
             "scheduler": self.scheduler,
             "scaler": self.scaler,
             "criterion": self.criterion,
+            "expected_extra": self.checkpoint_extra,
         }
         if path is None:
             if self.checkpoint_manager is None:
@@ -389,14 +492,47 @@ class Trainer:
             return True
         return value < previous if self.config.monitor_mode == "min" else value > previous
 
-    def fit(self, train_loader: Any, val_loader: Any | None = None) -> list[dict[str, Any]]:
+    def fit(
+        self,
+        train_loader: Any,
+        val_loader: Any | None = None,
+        *,
+        stop_after_epoch: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fit through an epoch boundary without changing campaign semantics.
+
+        ``stop_after_epoch`` is the one-based number of completed epochs at
+        which to pause.  The stored :class:`TrainerConfig`, optimizer schedule,
+        and checkpoint hash still describe the complete campaign.  This makes
+        a gated first epoch resumable as epoch two instead of creating a
+        different one-epoch experiment.  A pause boundary always triggers
+        validation and a ``last.pt`` checkpoint when those objects are
+        configured.
+        """
+
+        if stop_after_epoch is None:
+            end_epoch = self.config.epochs
+        else:
+            if (
+                isinstance(stop_after_epoch, bool)
+                or not isinstance(stop_after_epoch, Integral)
+                or not 1 <= int(stop_after_epoch) <= self.config.epochs
+            ):
+                raise ValueError(
+                    "stop_after_epoch must be in [1, config.epochs] or None"
+                )
+            end_epoch = int(stop_after_epoch)
+        if end_epoch < self.start_epoch:
+            raise ValueError(
+                "stop_after_epoch precedes the next epoch in the resumed state"
+            )
         history: list[dict[str, Any]] = []
-        for epoch in range(self.start_epoch, self.config.epochs):
+        for epoch in range(self.start_epoch, end_epoch):
             train_result = self.train_epoch(train_loader, epoch=epoch)
             record: dict[str, Any] = {"epoch": epoch, "train": train_result}
             validation_due = val_loader is not None and (
                 (epoch + 1) % self.config.validate_every_n_epochs == 0
-                or epoch + 1 == self.config.epochs
+                or epoch + 1 == end_epoch
             )
             val_result = self.validate(val_loader, epoch=epoch) if validation_due else None
             if val_result is not None:
@@ -405,6 +541,11 @@ class Trainer:
             if val_result is not None:
                 combined.update({f"val/{key}": value for key, value in _scalar_metrics(val_result).items()})
             improved = False
+            if val_result is not None and self.config.monitor not in combined:
+                raise KeyError(
+                    f"configured monitor {self.config.monitor!r} is absent from "
+                    "the epoch metrics"
+                )
             if self.config.monitor in combined:
                 monitored = float(combined[self.config.monitor])
                 improved = self._is_better(monitored)
@@ -429,6 +570,7 @@ class Trainer:
                     "criterion": self.criterion,
                     "best_metrics": self.best_metrics,
                     "extra": {
+                        **self.checkpoint_extra,
                         "amp_skip_count": self.amp_skip_count,
                         "amp_scale": float(self.scaler.get_scale()),
                     },
@@ -437,10 +579,11 @@ class Trainer:
                     self.checkpoint_manager.save_named("best.pt", **checkpoint_kwargs)
                 if (
                     (epoch + 1) % self.config.checkpoint_every_n_epochs == 0
-                    or epoch + 1 == self.config.epochs
+                    or epoch + 1 == end_epoch
                 ):
                     self.checkpoint_manager.save_last(**checkpoint_kwargs)
             history.append(record)
+            self.start_epoch = epoch + 1
         return history
 
 
