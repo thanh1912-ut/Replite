@@ -18,6 +18,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from os import PathLike
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -28,7 +29,12 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .sanpo import SANPO_DETECTION_CLASS_NAMES, SANPO_LABELMAP, decode_sanpo_panoptic
+from .sanpo import (
+    SANPO_DETECTION_CLASS_NAMES,
+    SANPO_LABELMAP,
+    decode_sanpo_panoptic,
+    sanpo_panoptic_to_detection,
+)
 
 
 SANPO_SEGMENTATION_CLASS_NAMES = tuple(
@@ -92,7 +98,12 @@ def load_sanpo_joint_manifest(
         raise ValueError(f"cannot read SANPO joint manifest: {path}") from exc
     if not isinstance(payload, dict):
         raise ValueError("SANPO joint manifest must contain a JSON object")
-    if payload.get("schema_version") != 2:
+    schema_version = payload.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in {1, 2}
+    ):
         raise ValueError("unsupported SANPO joint manifest schema")
     if payload.get("dataset") != "SANPO-Real-v0-joint":
         raise ValueError("manifest is not a SANPO-Real-v0 joint subset")
@@ -121,11 +132,7 @@ def load_sanpo_joint_manifest(
     if path.parent.name != "left" or path.parent.parent.name != sensor:
         raise ValueError("manifest path and sensor/lens disagree")
 
-    required_paths = (
-        "panoptic_path",
-        "depth_path",
-        "detection_path",
-    )
+    required_paths = ("panoptic_path", "depth_path")
     seen_frames: set[int] = set()
     for index, sample in enumerate(samples):
         if not isinstance(sample, dict):
@@ -147,6 +154,16 @@ def load_sanpo_joint_manifest(
             )
         for key in required_paths:
             _safe_relative_path(session_root, sample.get(key), f"samples[{index}].{key}")
+        # Archives created before detection targets were packaged contain the
+        # same official panoptic supervision but no detection_path.  That is a
+        # supported legacy representation; malformed paths that are present
+        # remain strict failures rather than silently falling back.
+        if "detection_path" in sample:
+            _safe_relative_path(
+                session_root,
+                sample.get("detection_path"),
+                f"samples[{index}].detection_path",
+            )
 
     return payload, SanpoJointInfo(
         manifest_path=path,
@@ -240,6 +257,8 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
         image_size: Sequence[int] = (288, 512),
         depth_min: float = 0.1,
         depth_max: float = 80.0,
+        detection_min_area: int = 100,
+        use_packaged_detection: bool = True,
         normalize: bool = True,
     ) -> None:
         super().__init__()
@@ -261,8 +280,18 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             raise ValueError("depth_max must be finite and greater than depth_min")
         if not isinstance(normalize, bool):
             raise TypeError("normalize must be a boolean")
+        if isinstance(detection_min_area, bool) or not isinstance(
+            detection_min_area, Integral
+        ):
+            raise TypeError("detection_min_area must be an integer")
+        if detection_min_area < 0:
+            raise ValueError("detection_min_area must be non-negative")
+        if not isinstance(use_packaged_detection, bool):
+            raise TypeError("use_packaged_detection must be a boolean")
         self.depth_min = float(depth_min)
         self.depth_max = float(depth_max)
+        self.detection_min_area = int(detection_min_area)
+        self.use_packaged_detection = use_packaged_detection
         self.normalize = normalize
         self._mean = torch.tensor(IMAGENET_RGB_MEAN, dtype=torch.float32).reshape(3, 1, 1)
         self._std = torch.tensor(IMAGENET_RGB_STD, dtype=torch.float32).reshape(3, 1, 1)
@@ -298,7 +327,8 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
         panoptic_path = self._path(sample["panoptic_path"], "panoptic_path")
         with Image.open(panoptic_path) as image:
             image.load()
-            semantic, _ = decode_sanpo_panoptic(image.convert("RGB"))
+            panoptic_rgb = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+        semantic, _ = decode_sanpo_panoptic(panoptic_rgb)
         semantic_image = Image.fromarray(semantic, mode="L").resize(
             (self.image_size[1], self.image_size[0]),
             resample=Image.Resampling.NEAREST,
@@ -332,8 +362,19 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
         ).astype(bool, copy=False)
         depth[~depth_valid] = 0.0
 
-        detection_path = self._path(sample["detection_path"], "detection_path")
-        detection = _read_detection_target(detection_path)
+        detection_relative = (
+            sample.get("detection_path")
+            if self.use_packaged_detection
+            else None
+        )
+        if detection_relative is None:
+            detection = sanpo_panoptic_to_detection(
+                panoptic_rgb,
+                min_area=self.detection_min_area,
+            )
+        else:
+            detection_path = self._path(detection_relative, "detection_path")
+            detection = _read_detection_target(detection_path)
         if tuple(semantic.shape) != detection["valid_size"]:
             raise ValueError(
                 "panoptic mask and derived detection target have different source sizes"
@@ -368,8 +409,17 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             "rgb_context_paths": list(sample["rgb_context_paths"]),
             "panoptic_path": sample["panoptic_path"],
             "depth_path": sample["depth_path"],
-            "detection_path": sample["detection_path"],
+            "detection_path": sample.get("detection_path"),
+            "detection_source": self._detection_source(sample),
         }
+
+    def _detection_source(self, sample: Mapping[str, Any]) -> str:
+        return (
+            "packaged_json"
+            if self.use_packaged_detection
+            and sample.get("detection_path") is not None
+            else "panoptic_on_load"
+        )
 
 
 def sanpo_joint_collate(

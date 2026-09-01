@@ -36,8 +36,12 @@ def _sha(value: str) -> str:
 _ANNOTATION_POLICY = "human_only"
 _DETECTION_CONFIG = {
     "schema_version": 1,
+    "bbox_format": "XYXY half-open, absolute target-RGB pixels",
     "component_connectivity": 8,
     "min_component_pixels": 100,
+    "small_component_policy": "ignore_boxes",
+    "instance_zero_policy": "keep_as_valid_panoptic_instance",
+    "crowd_policy": "none; SANPO does not publish iscrowd",
 }
 _DETECTION_CONFIG_SHA = canonical_json_sha256(_DETECTION_CONFIG)
 
@@ -49,6 +53,24 @@ def _package_sha(selection_sha: str, detection_sha: str = _DETECTION_CONFIG_SHA)
             "detection_config_sha256": detection_sha,
         }
     )
+
+
+def _ledger_key(entry: dict[str, object]) -> str:
+    digest = entry.get("package_sha256", entry["selection_sha256"])
+    return "/".join(
+        str(entry[field]) for field in ("split", "session_id", "sensor")
+    ) + f"/{digest}"
+
+
+def _first_ledger_entry(
+    ledger: dict[str, object],
+) -> tuple[str, dict[str, object]]:
+    archives = ledger["archives"]
+    assert isinstance(archives, dict)
+    key = next(iter(archives))
+    entry = archives[key]
+    assert isinstance(entry, dict)
+    return key, entry
 
 
 def _catalog_fixture(tmp_path: Path):
@@ -93,7 +115,7 @@ def _catalog_fixture(tmp_path: Path):
             "archive_sha256": archive_sha,
             "joint_frames": frames,
         }
-        ledger_entries[f"entry-{index}"] = entry
+        ledger_entries[_ledger_key(entry)] = entry
         _write_json(
             archive.with_name(archive.name + ".manifest.json"),
             {"schema_version": 1, "entry": entry},
@@ -130,6 +152,34 @@ def _catalog_fixture(tmp_path: Path):
     return root, specifications
 
 
+def _legacy_variant(
+    root: Path, modern: dict[str, object], *, payload: bytes
+) -> tuple[str, dict[str, object]]:
+    legacy = dict(modern)
+    legacy.pop("detection_config_sha256")
+    legacy.pop("package_sha256")
+    split = str(legacy["split"])
+    name = (
+        f"{legacy['session_id']}__{legacy['sensor']}__"
+        f"{str(legacy['selection_sha256'])[:12]}.tar.zst"
+    )
+    archive = root / "archives" / split / name
+    archive.write_bytes(payload)
+    legacy.update(
+        archive=f"/content/drive/old-root/{name}",
+        archive_bytes=archive.stat().st_size,
+        archive_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    _write_json(
+        archive.with_name(archive.name + ".manifest.json"),
+        {"schema_version": 1, "entry": legacy},
+    )
+    archive.with_name(archive.name + ".sha256").write_text(
+        f"{legacy['archive_sha256']}  {name}\n", encoding="utf-8"
+    )
+    return _ledger_key(legacy), legacy
+
+
 def test_catalog_joins_manifests_and_resolves_only_below_current_drive_root(
     tmp_path: Path,
 ) -> None:
@@ -145,29 +195,75 @@ def test_catalog_joins_manifests_and_resolves_only_below_current_drive_root(
         assert "/old-root/" not in str(record.archive_path)
 
 
-def test_catalog_coalesces_equivalent_duplicate_ledger_entries(tmp_path: Path) -> None:
-    root, _ = _catalog_fixture(tmp_path)
-    baseline = load_archive_catalog(root)
+def test_catalog_matches_real_mixed_legacy_and_modern_ledger_shape(
+    tmp_path: Path,
+) -> None:
+    root, specifications = _catalog_fixture(tmp_path)
     ledger_path = root / "archive_manifest.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    ledger["archives"]["duplicate"] = dict(ledger["archives"]["entry-0"])
-    ledger["archives"]["duplicate"]["archive"] = ledger["archives"]["duplicate"][
-        "archive"
-    ].replace("/old-root/", "/another-old-mount/")
-    ledger["archives"]["duplicate"]["verified_utc"] = "2000-01-01T00:00:00Z"
+    modern_items = list(ledger["archives"].items())
+    for index, (modern_key, modern) in enumerate(modern_items):
+        legacy_key, legacy = _legacy_variant(
+            root, modern, payload=f"legacy-{index}".encode()
+        )
+        ledger["archives"][legacy_key] = legacy
+        # Keep one modern duplicate, just as the real ledger keeps three
+        # repackaged pilots alongside 234 source-keyed legacy archives.
+        if index:
+            del ledger["archives"][modern_key]
     _write_json(ledger_path, ledger)
 
-    duplicate = load_archive_catalog(root)
+    catalog = load_archive_catalog(root)
 
-    assert duplicate.records == baseline.records
-    assert duplicate.catalog_sha256 == baseline.catalog_sha256
+    assert len(ledger["archives"]) == len(specifications) + 1
+    assert len(catalog.records) == len(specifications)
+    assert sum(item.detection_source == "packaged_json" for item in catalog.records) == 1
+    assert sum(item.detection_source == "panoptic_on_load" for item in catalog.records) == 4
+    assert catalog.detection_config_sha256 == _DETECTION_CONFIG_SHA
+
+
+def test_catalog_supports_complete_legacy_selection_without_repackaging(
+    tmp_path: Path,
+) -> None:
+    root, specifications = _catalog_fixture(tmp_path)
+    ledger_path = root / "archive_manifest.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    replacement: dict[str, object] = {}
+    for index, modern in enumerate(ledger["archives"].values()):
+        legacy_key, legacy = _legacy_variant(
+            root, modern, payload=f"legacy-only-{index}".encode()
+        )
+        replacement[legacy_key] = legacy
+    ledger["archives"] = replacement
+    _write_json(ledger_path, ledger)
+
+    catalog = load_archive_catalog(root)
+
+    assert len(catalog.records) == len(specifications)
+    assert all(item.detection_source == "panoptic_on_load" for item in catalog.records)
+    assert catalog.detection_config_sha256 == _DETECTION_CONFIG_SHA
+
+
+def test_catalog_rejects_ledger_alias_that_disagrees_with_provenance(
+    tmp_path: Path,
+) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    ledger_path = root / "archive_manifest.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    _, first = _first_ledger_entry(ledger)
+    ledger["archives"]["alias"] = dict(first)
+    _write_json(ledger_path, ledger)
+
+    with pytest.raises(ValueError, match="ledger key does not match"):
+        load_archive_catalog(root)
 
 
 def test_catalog_rejects_conflicting_active_package_entries(tmp_path: Path) -> None:
     root, _ = _catalog_fixture(tmp_path)
     ledger_path = root / "archive_manifest.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    conflicting = dict(ledger["archives"]["entry-0"])
+    _, first = _first_ledger_entry(ledger)
+    conflicting = dict(first)
     conflicting_name = "session-a__camera_head__conflict.tar.zst"
     conflicting_archive = root / "archives" / "train" / conflicting_name
     conflicting_archive.write_bytes(b"different-active-package-bytes")
@@ -179,7 +275,7 @@ def test_catalog_rejects_conflicting_active_package_entries(tmp_path: Path) -> N
     ledger["archives"]["conflicting"] = conflicting
     _write_json(ledger_path, ledger)
 
-    with pytest.raises(ValueError, match="exactly one active package"):
+    with pytest.raises(ValueError, match="ledger key does not match"):
         load_archive_catalog(root)
 
 
@@ -196,7 +292,8 @@ def test_catalog_selects_package_for_active_detection_config(tmp_path: Path) -> 
     _write_json(detection_manifest_path, detection_manifest)
     ledger_path = root / "archive_manifest.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    historical = dict(ledger["archives"]["entry-0"])
+    _, first = _first_ledger_entry(ledger)
+    historical = dict(first)
     historical_detection_sha = _sha("old-detection-config")
     historical.update(
         detection_config_sha256=historical_detection_sha,
@@ -207,7 +304,7 @@ def test_catalog_selects_package_for_active_detection_config(tmp_path: Path) -> 
         archive_bytes=123,
         archive_sha256=_sha("deleted-historical-package"),
     )
-    ledger["archives"]["historical-package"] = historical
+    ledger["archives"][_ledger_key(historical)] = historical
     _write_json(ledger_path, ledger)
 
     catalog = load_archive_catalog(root)
@@ -221,7 +318,7 @@ def test_catalog_selects_package_for_active_detection_config(tmp_path: Path) -> 
     assert selected.package_sha256 == _package_sha(selected.selection_sha256)
 
 
-def test_catalog_rejects_two_complete_package_families_without_metadata_hint(
+def test_catalog_ignores_foreign_package_family_without_metadata_config_fields(
     tmp_path: Path,
 ) -> None:
     root, _ = _catalog_fixture(tmp_path)
@@ -245,11 +342,16 @@ def test_catalog_rejects_two_complete_package_families_without_metadata_hint(
         alternative["archive"] = (
             f"/content/drive/old-root/{key}-second-family.tar.zst"
         )
-        ledger["archives"][f"{key}-second"] = alternative
+        ledger["archives"][_ledger_key(alternative)] = alternative
     _write_json(ledger_path, ledger)
 
-    with pytest.raises(ValueError, match="cannot resolve one SANPO detection package"):
-        load_archive_catalog(root)
+    catalog = load_archive_catalog(root)
+
+    assert catalog.detection_config_sha256 == _DETECTION_CONFIG_SHA
+    assert all(
+        record.detection_config_sha256 == _DETECTION_CONFIG_SHA
+        for record in catalog.records
+    )
 
 
 def test_catalog_rejects_bad_sha_sidecar(tmp_path: Path) -> None:
@@ -257,7 +359,8 @@ def test_catalog_rejects_bad_sha_sidecar(tmp_path: Path) -> None:
     ledger_path = root / "archive_manifest.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
 
-    first_name = Path(ledger["archives"]["entry-0"]["archive"]).name
+    _, first = _first_ledger_entry(ledger)
+    first_name = Path(first["archive"]).name
     sidecar = root / "archives" / "train" / f"{first_name}.sha256"
     sidecar.write_text(f"{'0' * 64}  {first_name}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="SHA sidecar"):
@@ -295,17 +398,18 @@ def test_catalog_rejects_invalid_active_package_provenance(tmp_path: Path) -> No
     root, _ = _catalog_fixture(tmp_path)
     ledger_path = root / "archive_manifest.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    ledger["archives"]["entry-0"]["package_sha256"] = "0" * 64
+    _, first = _first_ledger_entry(ledger)
+    first["package_sha256"] = "0" * 64
     _write_json(ledger_path, ledger)
 
-    with pytest.raises(ValueError, match="cannot resolve one SANPO detection package"):
+    with pytest.raises(ValueError, match="package_sha256 does not match"):
         load_archive_catalog(root)
 
 
 def test_catalog_rejects_sidecar_package_provenance_mismatch(tmp_path: Path) -> None:
     root, _ = _catalog_fixture(tmp_path)
     ledger = json.loads((root / "archive_manifest.json").read_text(encoding="utf-8"))
-    entry = ledger["archives"]["entry-0"]
+    _, entry = _first_ledger_entry(ledger)
     archive_name = Path(entry["archive"]).name
     sidecar_path = root / "archives" / "train" / f"{archive_name}.manifest.json"
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
@@ -376,11 +480,15 @@ def _joint_manifest_bytes(
     session_id: str,
     sensor: str,
     selection_sha: str,
-    detection_config_sha: str = _DETECTION_CONFIG_SHA,
+    schema_version: int = 2,
+    detection_config_sha: str | None = _DETECTION_CONFIG_SHA,
+    include_detection_paths: bool = True,
+    include_annotation_policy: bool = True,
     frames: int = 1,
 ) -> bytes:
-    samples = [
-        {
+    samples = []
+    for index in range(frames):
+        sample = {
             "target_frame": index + 2,
             "rgb_context_paths": [
                 f"{sensor}/left/rgb/{index}.png",
@@ -389,27 +497,30 @@ def _joint_manifest_bytes(
             ],
             "panoptic_path": f"{sensor}/left/panoptic/{index + 2}.png",
             "depth_path": f"{sensor}/left/depth/{index + 2}.gz",
-            "detection_path": f"{sensor}/left/detection/{index + 2}.json",
         }
-        for index in range(frames)
-    ]
-    return json.dumps(
-        {
-            "schema_version": 2,
-            "dataset": "SANPO-Real-v0-joint",
-            "official_split": split,
-            "session_id": session_id,
-            "sensor": sensor,
-            "annotation_policy": _ANNOTATION_POLICY,
-            "selection_sha256": selection_sha,
-            "joint_frames": frames,
-            "samples": samples,
-            "detection": {
-                "derived": True,
-                "config_sha256": detection_config_sha,
-            },
+        if include_detection_paths:
+            sample["detection_path"] = (
+                f"{sensor}/left/detection/{index + 2}.json"
+            )
+        samples.append(sample)
+    manifest = {
+        "schema_version": schema_version,
+        "dataset": "SANPO-Real-v0-joint",
+        "official_split": split,
+        "session_id": session_id,
+        "sensor": sensor,
+        "selection_sha256": selection_sha,
+        "joint_frames": frames,
+        "samples": samples,
+    }
+    if include_annotation_policy:
+        manifest["annotation_policy"] = _ANNOTATION_POLICY
+    if detection_config_sha is not None:
+        manifest["detection"] = {
+            "derived": True,
+            "config_sha256": detection_config_sha,
         }
-    ).encode()
+    return json.dumps(manifest).encode()
 
 
 def _write_tar_archive(
@@ -420,6 +531,11 @@ def _write_tar_archive(
     sensor: str = "camera_head",
     selection_sha: str,
     unsafe_name: str | None = None,
+    detection_source: str = "packaged_json",
+    manifest_schema_version: int = 2,
+    manifest_detection_config_sha: str | None = _DETECTION_CONFIG_SHA,
+    include_detection_paths: bool = True,
+    include_annotation_policy: bool = True,
 ) -> SanpoArchiveRecord:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(path, "w") as tar:
@@ -431,6 +547,10 @@ def _write_tar_archive(
             session_id=session_id,
             sensor=sensor,
             selection_sha=selection_sha,
+            schema_version=manifest_schema_version,
+            detection_config_sha=manifest_detection_config_sha,
+            include_detection_paths=include_detection_paths,
+            include_annotation_policy=include_annotation_policy,
         )
         info = tarfile.TarInfo(name)
         info.size = len(payload)
@@ -441,8 +561,13 @@ def _write_tar_archive(
         sensor=sensor,
         annotation_policy=_ANNOTATION_POLICY,
         selection_sha256=selection_sha,
-        detection_config_sha256=_DETECTION_CONFIG_SHA,
-        package_sha256=_package_sha(selection_sha),
+        detection_source=detection_source,
+        detection_config_sha256=(
+            _DETECTION_CONFIG_SHA if detection_source == "packaged_json" else None
+        ),
+        package_sha256=(
+            _package_sha(selection_sha) if detection_source == "packaged_json" else None
+        ),
         archive_path=path.resolve(),
         archive_bytes=path.stat().st_size,
         archive_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -483,6 +608,99 @@ def test_materializer_verifies_extracts_and_cleans_owned_stage(
     assert list(local_root.iterdir()) == []
 
 
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_materializer_accepts_legacy_manifest_without_detection_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema_version: int,
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    record = _write_tar_archive(
+        tmp_path / "source" / f"legacy-v{schema_version}.tar.zst",
+        selection_sha=_sha("legacy-selection"),
+        detection_source="panoptic_on_load",
+        manifest_schema_version=schema_version,
+        manifest_detection_config_sha=None,
+        include_detection_paths=False,
+        include_annotation_policy=False,
+    )
+    local_root = tmp_path / "cache"
+
+    with ArchiveMaterializer(record, local_root=local_root) as manifest_path:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["schema_version"] == schema_version
+        assert "detection" not in manifest
+        assert "detection_path" not in manifest["samples"][0]
+    assert list(local_root.iterdir()) == []
+
+
+def test_materializer_ignores_unversioned_legacy_detection_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    record = _write_tar_archive(
+        tmp_path / "source" / "legacy-unversioned-detection.tar.zst",
+        selection_sha=_sha("legacy-selection"),
+        detection_source="panoptic_on_load",
+        manifest_schema_version=1,
+        manifest_detection_config_sha=_sha("untrusted-legacy-config"),
+    )
+
+    with ArchiveMaterializer(record, local_root=tmp_path / "cache"):
+        pass
+
+
+@pytest.mark.parametrize("manifest_detection_config_sha", [None, _sha("foreign")])
+def test_materializer_requires_modern_detection_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_detection_config_sha: str | None,
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    record = _write_tar_archive(
+        tmp_path / "source" / "modern-bad-provenance.tar.zst",
+        selection_sha=_sha("selection"),
+        manifest_detection_config_sha=manifest_detection_config_sha,
+    )
+    local_root = tmp_path / "cache"
+
+    with pytest.raises(ValueError, match="detection provenance"):
+        with ArchiveMaterializer(record, local_root=local_root):
+            pass
+    assert list(local_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("annotation_policy", "foreign_policy"),
+        ("selection_sha256", _sha("foreign-selection")),
+    ],
+)
+def test_materializer_keeps_legacy_identity_validation_strict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    record = _write_tar_archive(
+        tmp_path / "source" / f"legacy-bad-{field}.tar.zst",
+        selection_sha=_sha("selection"),
+        detection_source="panoptic_on_load",
+        manifest_schema_version=1,
+        manifest_detection_config_sha=None,
+        include_detection_paths=False,
+    )
+    conflicting = SanpoArchiveRecord(**{**record.__dict__, field: value})
+    local_root = tmp_path / "cache"
+
+    with pytest.raises(ValueError, match="manifest disagrees"):
+        with ArchiveMaterializer(conflicting, local_root=local_root):
+            pass
+    assert list(local_root.iterdir()) == []
+
+
 def test_materializer_rejects_tar_traversal_and_cleans(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -502,9 +720,17 @@ def test_materializer_rejects_tar_traversal_and_cleans(
 
 class _FakeDataset(Dataset):
     lengths: dict[str, int] = {}
+    detection_modes: list[tuple[str, bool]] = []
 
-    def __init__(self, manifest_path: Path, **_: object) -> None:
+    def __init__(
+        self,
+        manifest_path: Path,
+        *,
+        use_packaged_detection: bool,
+        **_: object,
+    ) -> None:
         self.name = Path(manifest_path).name
+        self.detection_modes.append((self.name, use_packaged_detection))
 
     def __len__(self) -> int:
         return self.lengths[self.name]
@@ -551,6 +777,7 @@ def _fake_records(tmp_path: Path) -> tuple[SanpoArchiveRecord, ...]:
                 sensor="camera_head",
                 annotation_policy=_ANNOTATION_POLICY,
                 selection_sha256=_sha(f"selection-{index}"),
+                detection_source="packaged_json",
                 detection_config_sha256=_DETECTION_CONFIG_SHA,
                 package_sha256=_package_sha(_sha(f"selection-{index}")),
                 archive_path=path,
@@ -602,6 +829,59 @@ def test_archive_shard_loader_len_epoch_shuffle_and_epoch_cleanup(
         drop_last=True,
     )
     assert len(dropped) == 1 + 2 + 2 + 1
+
+
+def test_archive_shard_loader_routes_record_detection_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "ArchiveMaterializer", _FakeMaterializer)
+    monkeypatch.setattr(archives_module, "SanpoJointDataset", _FakeDataset)
+    modern = _fake_records(tmp_path)[:2]
+    legacy = SanpoArchiveRecord(
+        **{
+            **modern[0].__dict__,
+            "detection_source": "panoptic_on_load",
+            "detection_config_sha256": None,
+            "package_sha256": None,
+        }
+    )
+    records = (legacy, modern[1])
+    _FakeDataset.lengths = {
+        f"shard-{index}": record.joint_frames for index, record in enumerate(records)
+    }
+    _FakeDataset.detection_modes = []
+
+    loader = ArchiveShardLoader(
+        records,
+        local_root=tmp_path / "cache",
+        batch_size=2,
+        image_size=(2, 2),
+    )
+    list(loader)
+
+    assert _FakeDataset.detection_modes == [
+        ("shard-0", False),
+        ("shard-1", True),
+    ]
+
+
+@pytest.mark.parametrize(
+    "dataset_kwargs",
+    [
+        {"use_packaged_detection": True},
+        {"detection_min_area": 101},
+    ],
+)
+def test_archive_shard_loader_locks_detection_policy(
+    tmp_path: Path, dataset_kwargs: dict[str, object]
+) -> None:
+    with pytest.raises(ValueError, match="detection"):
+        ArchiveShardLoader(
+            _fake_records(tmp_path),
+            local_root=tmp_path / "cache",
+            batch_size=2,
+            dataset_kwargs=dataset_kwargs,
+        )
 
 
 def test_canonical_hash_ignores_mapping_order_and_rejects_nan() -> None:

@@ -33,7 +33,7 @@ def _write_depth(path: Path, depth: np.ndarray) -> None:
         handle.write(payload.tobytes())
 
 
-def _build_session(tmp_path: Path) -> Path:
+def _build_session(tmp_path: Path, *, include_detection: bool = True) -> Path:
     session_id = "session-alpha"
     sensor = "camera_head"
     session_root = tmp_path / "sanpo-real" / session_id
@@ -82,8 +82,11 @@ def _build_session(tmp_path: Path) -> Path:
         ],
         "panoptic_path": f"{sensor}/left/segmentation_masks/000010.png",
         "depth_path": f"{sensor}/left/depth_maps/000010.float16.gz",
-        "detection_path": f"{sensor}/left/detection_boxes/000010.json",
     }
+    if include_detection:
+        sample["detection_path"] = (
+            f"{sensor}/left/detection_boxes/000010.json"
+        )
     manifest = {
         "schema_version": 2,
         "dataset": "SANPO-Real-v0-joint",
@@ -96,6 +99,36 @@ def _build_session(tmp_path: Path) -> Path:
     path = left / "_sanpo_joint_manifest.json"
     _write_json(path, manifest)
     return path
+
+
+def _write_detection_threshold_case(manifest_path: Path) -> None:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    session_root = manifest_path.parents[2]
+    sample = payload["samples"][0]
+    panoptic_path = session_root / sample["panoptic_path"]
+    panoptic = np.zeros((20, 25, 3), dtype=np.uint8)
+    panoptic[..., 0] = 1
+    # Exactly 100 pixels: positive under the locked >=100 policy.
+    panoptic[0:10, 0:10, 0] = 21
+    panoptic[0:10, 0:10, 2] = 1
+    # Exactly 99 pixels: retained as an ignore box.
+    panoptic[11:20, 0:11, 0] = 20
+    panoptic[11:20, 0:11, 2] = 2
+    Image.fromarray(panoptic).save(panoptic_path)
+    detection_path = sample.get("detection_path")
+    if detection_path is not None:
+        _write_json(
+            session_root / detection_path,
+            {
+                "schema_version": 1,
+                "dataset": "SANPO-Real-v0-derived-detection",
+                "bbox_format": "absolute_half_open_xyxy",
+                "valid_size": [20, 25],
+                "boxes": [[0.0, 0.0, 10.0, 10.0]],
+                "labels": [8],
+                "ignore_boxes": [[0.0, 11.0, 11.0, 20.0]],
+            },
+        )
 
 
 def test_segmentation_names_exclude_unlabeled_and_keep_source_order() -> None:
@@ -158,6 +191,144 @@ def test_joint_dataset_emits_synchronized_replite_contract(tmp_path: Path) -> No
     provenance = dataset.sample_provenance(0)
     assert provenance["session_id"] == "session-alpha"
     assert provenance["target_frame"] == 10
+    assert provenance["detection_source"] == "packaged_json"
+
+
+def test_legacy_joint_dataset_derives_detection_from_panoptic_per_sample(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _build_session(tmp_path, include_detection=False)
+    manifest, _ = load_sanpo_joint_manifest(manifest_path)
+    assert "detection_path" not in manifest["samples"][0]
+
+    dataset = SanpoJointDataset(
+        manifest_path,
+        image_size=(8, 16),
+        detection_min_area=1,
+        normalize=False,
+    )
+    _, targets = dataset[0]
+
+    detection = targets["detection"]
+    torch.testing.assert_close(
+        detection["boxes"], torch.tensor([[8.0, 0.0, 16.0, 8.0]])
+    )
+    torch.testing.assert_close(detection["labels"], torch.tensor([8]))
+    assert detection["ignore_boxes"].shape == (0, 4)
+    provenance = dataset.sample_provenance(0)
+    assert provenance["detection_path"] is None
+    assert provenance["detection_source"] == "panoptic_on_load"
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_legacy_manifest_versions_are_supported(
+    tmp_path: Path, schema_version: int
+) -> None:
+    path = _build_session(tmp_path, include_detection=False)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = schema_version
+    _write_json(path, payload)
+
+    dataset = SanpoJointDataset(path, detection_min_area=1, normalize=False)
+
+    assert len(dataset) == 1
+    assert dataset.sample_provenance(0)["detection_source"] == "panoptic_on_load"
+
+
+def test_packaged_detection_remains_authoritative_over_panoptic(tmp_path: Path) -> None:
+    dataset = SanpoJointDataset(
+        _build_session(tmp_path),
+        image_size=(8, 16),
+        detection_min_area=1,
+        normalize=False,
+    )
+
+    _, targets = dataset[0]
+
+    # The packaged target deliberately starts at source y=1.  On-load
+    # derivation from the mask would start at y=0, so this proves a new archive
+    # keeps its immutable packaged labels.
+    torch.testing.assert_close(
+        targets["detection"]["boxes"],
+        torch.tensor([[8.0, 2.0, 16.0, 8.0]]),
+    )
+
+
+def test_legacy_catalog_policy_can_force_panoptic_over_unversioned_json(
+    tmp_path: Path,
+) -> None:
+    dataset = SanpoJointDataset(
+        _build_session(tmp_path),
+        image_size=(8, 16),
+        detection_min_area=1,
+        use_packaged_detection=False,
+        normalize=False,
+    )
+
+    _, targets = dataset[0]
+
+    torch.testing.assert_close(
+        targets["detection"]["boxes"],
+        torch.tensor([[8.0, 0.0, 16.0, 8.0]]),
+    )
+    assert dataset.sample_provenance(0)["detection_source"] == "panoptic_on_load"
+
+
+def test_locked_threshold_and_packaged_on_load_detection_are_equivalent(
+    tmp_path: Path,
+) -> None:
+    legacy_manifest = _build_session(
+        tmp_path / "legacy", include_detection=False
+    )
+    packaged_manifest = _build_session(tmp_path / "packaged")
+    _write_detection_threshold_case(legacy_manifest)
+    _write_detection_threshold_case(packaged_manifest)
+
+    legacy = SanpoJointDataset(
+        legacy_manifest, image_size=(20, 25), normalize=False
+    )
+    packaged = SanpoJointDataset(
+        packaged_manifest, image_size=(20, 25), normalize=False
+    )
+    forced = SanpoJointDataset(
+        packaged_manifest,
+        image_size=(20, 25),
+        use_packaged_detection=False,
+        normalize=False,
+    )
+
+    legacy_target = legacy[0][1]["detection"]
+    for candidate in (packaged[0][1]["detection"], forced[0][1]["detection"]):
+        assert candidate["valid_size"] == legacy_target["valid_size"]
+        for field in ("boxes", "labels", "ignore_boxes"):
+            torch.testing.assert_close(candidate[field], legacy_target[field])
+    torch.testing.assert_close(
+        legacy_target["boxes"], torch.tensor([[0.0, 0.0, 10.0, 10.0]])
+    )
+    torch.testing.assert_close(
+        legacy_target["ignore_boxes"],
+        torch.tensor([[0.0, 11.0, 11.0, 20.0]]),
+    )
+    assert legacy.sample_provenance(0)["detection_source"] == "panoptic_on_load"
+    assert packaged.sample_provenance(0)["detection_source"] == "packaged_json"
+    assert forced.sample_provenance(0)["detection_source"] == "panoptic_on_load"
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5])
+def test_detection_min_area_is_validated_early(tmp_path: Path, value: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="detection_min_area"):
+        SanpoJointDataset(
+            _build_session(tmp_path),
+            detection_min_area=value,  # type: ignore[arg-type]
+        )
+
+
+def test_use_packaged_detection_is_validated_early(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="use_packaged_detection"):
+        SanpoJointDataset(
+            _build_session(tmp_path),
+            use_packaged_detection=1,  # type: ignore[arg-type]
+        )
 
 
 def test_collate_keeps_detection_targets_as_list(tmp_path: Path) -> None:
@@ -179,3 +350,15 @@ def test_manifest_rejects_path_traversal(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unsafe"):
         load_sanpo_joint_manifest(path)
 
+
+@pytest.mark.parametrize("schema_version", [True, 0, 3, "2"])
+def test_manifest_rejects_unsupported_schema(
+    tmp_path: Path, schema_version: object
+) -> None:
+    path = _build_session(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = schema_version
+    _write_json(path, payload)
+
+    with pytest.raises(ValueError, match="unsupported SANPO joint manifest schema"):
+        load_sanpo_joint_manifest(path)

@@ -30,6 +30,8 @@ from replite.data import (
     ArchiveCatalog,
     ArchiveGroupSplit,
     ArchiveShardLoader,
+    SANPO_DERIVED_DETECTION_CONFIG,
+    SANPO_DERIVED_DETECTION_CONFIG_SHA256,
     SANPO_DETECTION_CLASS_NAMES,
     SANPO_SEGMENTATION_CLASS_NAMES,
     SANPO_SEGMENTATION_IGNORE_INDEX,
@@ -68,8 +70,11 @@ EXPECTED = {
     "train_frames": 14_718,
     "test_frames": 3_803,
 }
-PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v1"
+PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v2"
 APPROVAL_KIND = "replite-sanpo-main-epoch1-approval-v1"
+DETECTION_MIN_COMPONENT_PIXELS = int(
+    SANPO_DERIVED_DETECTION_CONFIG["min_component_pixels"]
+)
 
 
 def _jsonable(value: Any) -> Any:
@@ -168,6 +173,16 @@ def load_campaign(filename: str | os.PathLike[str]) -> tuple[Path, dict[str, Any
         )
     ):
         raise ValueError("data.image_size must be two positive multiples of 32")
+    detection_min_area = value["data"].get("detection_min_component_pixels")
+    if (
+        isinstance(detection_min_area, bool)
+        or not isinstance(detection_min_area, int)
+        or detection_min_area != DETECTION_MIN_COMPONENT_PIXELS
+    ):
+        raise ValueError(
+            "data.detection_min_component_pixels must be 100 for the locked "
+            "SANPO derived-detection protocol"
+        )
     return path, value
 
 
@@ -224,6 +239,11 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
     if not data_root.is_dir():
         raise FileNotFoundError(f"SANPO data root is missing: {data_root}")
     catalog = load_archive_catalog(data_root, validate_sidecars=True)
+    if catalog.detection_config_sha256 != SANPO_DERIVED_DETECTION_CONFIG_SHA256:
+        raise ValueError(
+            "archive catalog detection policy differs from the locked main "
+            "training protocol"
+        )
     _assert_catalog(catalog)
     seed = int(config["data"]["split_seed"])
     fraction = float(config["data"]["validation_fraction"])
@@ -232,7 +252,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         catalog,
         data_root
         / "metadata"
-        / f"replite_main_split_seed{seed}_val{basis_points:04d}_v1.json",
+        / f"replite_main_split_seed{seed}_val{basis_points:04d}_v2.json",
         seed=seed,
         validation_fraction=fraction,
     )
@@ -275,6 +295,9 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         "dataset_kwargs": {
             "depth_min": float(config["data"]["depth_min_metres"]),
             "depth_max": float(config["data"]["depth_max_metres"]),
+            "detection_min_area": int(
+                config["data"]["detection_min_component_pixels"]
+            ),
             "normalize": True,
         },
     }
@@ -547,6 +570,16 @@ def inspection_payload(
             "image_size": prepared.config["data"]["image_size"],
             "clip_frames": ["t-2", "t-1", "t"],
             "detection_classes": list(SANPO_DETECTION_CLASS_NAMES),
+            "detection_min_component_pixels": prepared.config["data"][
+                "detection_min_component_pixels"
+            ],
+            "detection_archive_sources": {
+                source: sum(
+                    item.detection_source == source
+                    for item in prepared.catalog.records
+                )
+                for source in ("packaged_json", "panoptic_on_load")
+            },
             "segmentation_classes": list(SANPO_SEGMENTATION_CLASS_NAMES),
             "depth_range_metres": [
                 prepared.config["data"]["depth_min_metres"],
@@ -625,6 +658,22 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
                 ),
                 EXPECTED["test_frames"],
                 "RESERVED, not opened",
+            ),
+        ),
+    )
+    _table(
+        "DETECTION LABEL SOURCE",
+        ("source", "archives", "policy"),
+        (
+            (
+                "packaged_json",
+                result["data"]["detection_archive_sources"]["packaged_json"],
+                "versioned JSON inside archive",
+            ),
+            (
+                "panoptic_on_load",
+                result["data"]["detection_archive_sources"]["panoptic_on_load"],
+                "8-connected, min area 100",
             ),
         ),
     )
@@ -890,6 +939,7 @@ def _write_metadata(
                     "sensor": item.sensor,
                     "annotation_policy": item.annotation_policy,
                     "selection_sha256": item.selection_sha256,
+                    "detection_source": item.detection_source,
                     "detection_config_sha256": item.detection_config_sha256,
                     "package_sha256": item.package_sha256,
                     "archive_name": item.archive_path.name,

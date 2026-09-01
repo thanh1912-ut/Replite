@@ -54,6 +54,11 @@ cells = [
         1-epoch khác. Mỗi archive được stream-extract riêng lên SSD `/content`, train xong
         shard nào dọn shard đó, nên không cần giải nén đồng thời khoảng 187 GiB. Snapshot
         versioned có SHA-256 được mirror lên Drive sau từng epoch.
+
+        `archive_manifest.json` có thể có 237 entry vì ba pilot đã được đóng gói lại.
+        Audit sẽ chọn đúng 234 source shard: ưu tiên ba package mới, còn 231 archive cũ
+        sinh box trực tiếp từ panoptic theo cùng policy khóa ở ngưỡng 100 pixel; không
+        tải lại hay repack dữ liệu cũ.
         """
     ),
     code(
@@ -117,7 +122,7 @@ cells = [
         LOCAL_WORK_ROOT = Path("/content/replite_sanpo_main")
         DRIVE_RUNS_ROOT = DRIVE_DATA_ROOT / "main_runs"
 
-        RUN_ID = "replite_sanpo_mnv4convs_seed42_v1"  #@param {type:"string"}
+        RUN_ID = "replite_sanpo_mnv4convs_seed42_v2"  #@param {type:"string"}
         BACKBONE_NAME = "mobilenetv4_conv_small"  #@param ["mobilenetv4_conv_small", "mobilenetv3_small_050"]
         PRETRAINED_IN1K = True  #@param {type:"boolean"}
         EPOCHS = 50  #@param {type:"integer"}
@@ -126,6 +131,7 @@ cells = [
         BATCH_SIZE = 4  #@param {type:"integer"}
         NUM_WORKERS = 2  #@param {type:"integer"}
         PREFETCH_FACTOR = 2  #@param {type:"integer"}
+        DETECTION_MIN_COMPONENT_PIXELS = 100
         SEED = 42  #@param {type:"integer"}
         VAL_FRACTION = 0.15  #@param {type:"number"}
 
@@ -175,6 +181,7 @@ cells = [
                 "batch_size": BATCH_SIZE,
                 "num_workers": NUM_WORKERS,
                 "prefetch_factor": PREFETCH_FACTOR,
+                "detection_min_component_pixels": DETECTION_MIN_COMPONENT_PIXELS,
                 "validation_fraction": VAL_FRACTION,
                 "split_seed": SEED,
                 "depth_min_metres": 0.1,

@@ -22,7 +22,10 @@ def _config(tmp_path: Path) -> dict[str, object]:
         "drive_runs_root": str(tmp_path / "runs"),
         "local_work_root": str(tmp_path / "local"),
         "model": {},
-        "data": {"image_size": [288, 512]},
+        "data": {
+            "image_size": [288, 512],
+            "detection_min_component_pixels": 100,
+        },
         "train": {"epochs": 50},
         "metrics": {},
     }
@@ -44,6 +47,18 @@ def test_load_campaign_accepts_visible_notebook_shape(tmp_path: Path) -> None:
         (lambda value: value.update(run_id="../escape"), "run_id"),
         (lambda value: value["train"].update(epochs=1), "epochs"),
         (lambda value: value["data"].update(image_size=[287, 512]), "image_size"),
+        (
+            lambda value: value["data"].update(
+                detection_min_component_pixels=101
+            ),
+            "detection_min_component_pixels",
+        ),
+        (
+            lambda value: value["data"].update(
+                detection_min_component_pixels=100.0
+            ),
+            "detection_min_component_pixels",
+        ),
     ),
 )
 def test_load_campaign_rejects_unsafe_or_incompatible_config(
@@ -113,6 +128,7 @@ def test_runner_never_builds_a_loader_from_official_test() -> None:
     assert "stop_after_epoch=1" in source
     assert "publish_epoch_snapshot(" in source
     assert "restore_latest_snapshot(" in source
+    assert '"DETECTION LABEL SOURCE"' in source
 
 
 def test_cli_requires_explicit_approval_for_main() -> None:

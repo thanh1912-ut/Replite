@@ -356,6 +356,15 @@ session-disjoint split from official-train only; official-test is catalogued
 for provenance but is never extracted or passed to training, validation,
 early stopping, or checkpoint selection.
 
+The Drive ledger may contain 237 entries because the three pilot sessions were
+repackaged after versioned detection JSON was introduced. Catalog resolution
+still produces exactly 234 source shards: it prefers those three packages and
+uses the 231 source-keyed legacy archives for the remainder. Legacy shards do
+not need to be downloaded or repacked again; their boxes are derived from the
+already-loaded panoptic mask with the same locked 8-connected, 100-pixel,
+half-open-XYXY policy. The catalog fingerprint records which representation
+was used for every shard.
+
 Run the notebook cells in order. Cell 3 prints the resolved architecture,
 MobileNet feature stages, ImageNet-1K weight provenance, parameter counts,
 optimizer groups, schedule, archive hashes, and frozen split before any model
