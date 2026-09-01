@@ -42,20 +42,26 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         "EPOCHS = 50",
         "IMAGE_HEIGHT = 288",
         "IMAGE_WIDTH = 512",
-        "BATCH_SIZE = 4",
-        "VAL_FRACTION = 0.15",
+        "BATCH_SIZE = 16",
+        "NUM_WORKERS = 4",
+        "PREFETCH_FACTOR = 2",
+        "AMP_INITIAL_SCALE = 1024.0",
         'DRIVE_BASE_ROOT = Path("/content/drive/MyDrive/nckh1m_data")',
-        'RUN_ID = "replite_sanpo_mnv4convs_subset20_seed42_v1"',
-        'LOCAL_STAGE_CACHE_ID = "replite_sanpo_mnv4convs_seed42_v4"',
-        "OFFICIAL_TRAIN_SESSION_LIMIT = 20",
-        '"official_train_session_limit": OFFICIAL_TRAIN_SESSION_LIMIT',
+        'RUN_ID = "replite_sanpo_mnv4convs_20fit_1val_1test_seed42_v1"',
+        "LOCAL_STAGE_CACHE_ID = RUN_ID",
+        "FIT_SESSION_COUNT = 20",
+        "VALIDATION_SESSION_COUNT = 1",
+        "OFFICIAL_TEST_SESSION_COUNT = 1",
+        '"fit_session_count": FIT_SESSION_COUNT',
+        '"validation_session_count": VALIDATION_SESSION_COUNT',
+        '"official_test_session_count": OFFICIAL_TEST_SESSION_COUNT',
         '"cache_id": LOCAL_STAGE_CACHE_ID',
         "PROGRESS_EVERY_N_STEPS = 10",
         'print("SANPO DATA ROOT:", DRIVE_DATA_ROOT)',
         "LOCAL_STAGE_EXPANSION_FACTOR = 1.03",
         'SOURCE_PIN = DRIVE_RUNS_ROOT / RUN_ID / "source_pin.json"',
         '"checkout", "--detach", pinned_commit',
-        'assert SOURCE_COMMIT == pinned_commit',
+        "assert SOURCE_COMMIT == pinned_commit",
         'run_live(["stage-train"])',
         '"monitor": "val/total"',
         'run_live(["pilot"])',
@@ -66,9 +72,13 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         'run_live(["stage-test"])',
         "def run_live(arguments)",
         "tail -F",
-        "Stage subset 20 session official-train lên SSD",
+        "Stage đúng 20 fit + 1 val session lên SSD",
     ):
         assert marker in source
+    assert (
+        "tiền xử lý một lần RGB/mask/depth/box vào cache SSD"
+        in NOTEBOOK.read_text(encoding="utf-8")
+    )
 
 
 def test_main_notebook_delegates_audited_streaming_and_never_downloads() -> None:
@@ -86,7 +96,7 @@ def test_main_notebook_keeps_command_logs_isolated_and_visible() -> None:
     assert 'CONSOLE_LOG.open("w"' in source
     assert 'command_log.open("x"' in source
     assert 'CONSOLE_LOG.open("a"' not in source
-    assert 'fcntl.LOCK_EX | fcntl.LOCK_NB' in source
+    assert "fcntl.LOCK_EX | fcntl.LOCK_NB" in source
     assert 'f"[run_live] START action={action}' in source
     assert 'f"[run_live] WAIT action={action}' in source
     assert "silent={silent}s (process still running)" in source

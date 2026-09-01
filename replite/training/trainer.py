@@ -146,6 +146,28 @@ def _scalar_metrics(values: Mapping[str, Any]) -> dict[str, float]:
     return result
 
 
+def _loss_scalars(values: Mapping[str, Tensor]) -> dict[str, float]:
+    """Snapshot scalar losses with one device-to-host synchronization.
+
+    Loss dictionaries contain several zero-dimensional CUDA tensors.  Calling
+    ``.cpu()`` for each entry serializes the stream once per loss component.
+    Stacking detached FP32 values preserves the previous scalar/logging
+    contract while paying for a single, small host transfer per batch.
+    """
+
+    if not values:
+        return {}
+    names = tuple(values)
+    tensors = tuple(values[name].detach().float() for name in names)
+    device = tensors[0].device
+    if any(value.device != device for value in tensors):
+        # Criterion losses are expected to be colocated.  Keep a defensive
+        # fallback for custom criteria rather than silently moving tensors.
+        return {name: float(value.cpu()) for name, value in zip(names, tensors)}
+    numbers = torch.stack(tensors).cpu().tolist()
+    return {name: float(number) for name, number in zip(names, numbers)}
+
+
 class Trainer:
     """Train, validate, log, and checkpoint one RepLite-compatible model."""
 
@@ -242,16 +264,19 @@ class Trainer:
             if parameter.grad is not None:
                 parameter.grad.div_(float(divisor))
 
-    def _optimizer_step(self, microbatches: int) -> tuple[bool, float | None]:
+    def _optimizer_step(self, microbatches: int) -> tuple[bool, Tensor | None]:
         if microbatches <= 0:
             raise RuntimeError("optimizer step requires accumulated gradients")
         if self.amp_enabled:
             self.scaler.unscale_(self.optimizer)
         self._divide_gradients(microbatches)
-        grad_norm: float | None = None
+        grad_norm: Tensor | None = None
         if self.config.grad_clip_norm is not None:
             norm = clip_grad_norm_(self.model.parameters(), float(self.config.grad_clip_norm))
-            grad_norm = float(norm.detach().cpu())
+            # Keep the scalar on device.  It is materialized only on durable
+            # log steps instead of forcing an extra CUDA synchronization after
+            # every optimizer update.
+            grad_norm = norm.detach()
         if self.amp_enabled:
             old_scale = self.scaler.get_scale()
             self.scaler.step(self.optimizer)
@@ -316,10 +341,8 @@ class Trainer:
             self.scaler.scale(total).backward() if self.amp_enabled else total.backward()
             microbatches += 1
             batches += 1
-            current_losses: dict[str, float] = {}
-            for name, value in losses.items():
-                scalar = float(value.detach().float().cpu())
-                current_losses[name] = scalar
+            current_losses = _loss_scalars(losses)
+            for name, scalar in current_losses.items():
                 sums[name] = sums.get(name, 0.0) + scalar
             is_last = total_batches is not None and batch_index + 1 == total_batches
             boundary = microbatches == self.config.grad_accum_steps or is_last
@@ -333,8 +356,10 @@ class Trainer:
                     metrics.update(
                         {f"lr/group_{index}": float(group["lr"]) for index, group in enumerate(self.optimizer.param_groups)}
                     )
-                    if grad_norm is not None and math.isfinite(grad_norm):
-                        metrics["grad_norm"] = grad_norm
+                    if grad_norm is not None:
+                        grad_norm_value = float(grad_norm.float().cpu())
+                        if math.isfinite(grad_norm_value):
+                            metrics["grad_norm"] = grad_norm_value
                     metrics["amp_skip_count"] = float(self.amp_skip_count)
                     if self.amp_enabled:
                         metrics["amp_scale"] = float(self.scaler.get_scale())
@@ -406,15 +431,29 @@ class Trainer:
             with torch.inference_mode():
                 for batch in loader:
                     inputs, targets = _split_batch(batch)
+                    host_targets = targets
                     inputs = move_to_device(inputs, self.device, non_blocking=self.device.type == "cuda")
                     targets = move_to_device(targets, self.device, non_blocking=self.device.type == "cuda")
                     with self._autocast():
                         outputs = self.model(inputs)
                         _, losses = _loss_mapping(self.criterion(outputs, targets))
-                    for name, value in losses.items():
-                        sums[name] = sums.get(name, 0.0) + float(value.detach().float().cpu())
+                    for name, scalar in _loss_scalars(losses).items():
+                        sums[name] = sums.get(name, 0.0) + scalar
                     if self.validation_metrics is not None:
-                        self.validation_metrics.update(outputs, targets)
+                        metric_targets = targets
+                        # Detection metrics retain targets on CPU for the full
+                        # validation epoch.  Reuse the loader's host copy rather
+                        # than copying every box/label tensor back from CUDA.
+                        # Dense targets remain device-resident because their
+                        # confusion/error reductions run on the accelerator.
+                        if (
+                            isinstance(host_targets, Mapping)
+                            and isinstance(targets, Mapping)
+                            and "detection" in host_targets
+                        ):
+                            metric_targets = dict(targets)
+                            metric_targets["detection"] = host_targets["detection"]
+                        self.validation_metrics.update(outputs, metric_targets)
                     batches += 1
                     self._emit(
                         "validation_batch_end",

@@ -32,12 +32,12 @@ def code(source: str) -> dict[str, object]:
 cells = [
     markdown(
         r"""
-        # RepLite × SANPO-Real — subset 20 session từ bộ 234 archive
+        # RepLite × SANPO-Real — 20 fit + 1 val + 1 test holdout
 
         Notebook này **không tải lại data**. Nó dùng 234 archive đã có trên Drive,
-        audit đủ `186 official-train + 48 official-test`, rồi chọn đúng **20 session
-        official-train đầu tiên theo session_id** để tận dụng prefix shard đã stage trên
-        SSD. Chỉ 20 session đó được chia train/val theo **session_id**.
+        audit đủ `186 official-train + 48 official-test`, rồi dùng seed 42 + SHA-256
+        để khóa đúng **20 official-train session cho fit**, **1 official-train session
+        khác cho validation**, và **1 official-test session cho holdout**.
         Official-test không được mở trong train, validation, early stopping hay chọn checkpoint.
 
         Luồng chạy:
@@ -46,8 +46,8 @@ cells = [
         2. khóa cấu hình campaign;
         3. audit data/split, dựng model và in backbone, feature stages, pretrained SHA,
            cấu hình neck/head, số parameter, optimizer/scheduler **trước khi train**;
-        4. kiểm cache, copy + SHA + giải nén chỉ các shard thuộc **20 session được
-           chọn** lên SSD `/content`, có disk preflight và resume;
+        4. kiểm cache, copy + SHA + giải nén chỉ các shard thuộc **20 fit + 1 val**
+           lên SSD `/content`, có disk preflight và resume;
         5. preflight bằng model dùng một lần, sau đó chạy đúng **epoch 1** trên toàn bộ
            train/val với log kiểu YOLO và metric mAP/mIoU/depth;
         6. chỉ khi gate epoch 1 đạt và bạn nhập approval token, strict-resume epoch 2
@@ -55,8 +55,8 @@ cells = [
 
         Epoch 1 dùng ngay config/scheduler của toàn campaign; không phải một schedule
         1-epoch khác. Train và inner-val đọc lại trực tiếp từ SSD qua mọi epoch, không
-        copy Drive hoặc giải nén lại. Cache v4 dùng chung được giữ an toàn khi campaign
-        hoàn tất; 48 official-test chỉ được stage sau đó bằng cell riêng. Snapshot versioned có
+        copy Drive hoặc giải nén lại. Cache riêng của campaign được giữ đến khi train
+        hoàn tất; đúng 1 official-test holdout chỉ được stage sau đó bằng cell riêng. Snapshot versioned có
         SHA-256 được mirror lên Drive sau từng epoch.
 
         `archive_manifest.json` có thể có 237 entry vì ba pilot đã được đóng gói lại.
@@ -157,22 +157,23 @@ cells = [
         LOCAL_WORK_ROOT = Path("/content/replite_sanpo_main")
         DRIVE_RUNS_ROOT = DRIVE_DATA_ROOT / "main_runs"
 
-        RUN_ID = "replite_sanpo_mnv4convs_subset20_seed42_v1"  #@param {type:"string"}
-        # Reuse the checksum-verified SSD shards already staged by v4. The
-        # campaign/source pin is new, but the data cache identity stays fixed.
-        LOCAL_STAGE_CACHE_ID = "replite_sanpo_mnv4convs_seed42_v4"
+        RUN_ID = "replite_sanpo_mnv4convs_20fit_1val_1test_seed42_v1"  #@param {type:"string"}
+        # Cache riêng của campaign. Sau khi train đủ epoch, Cell 8 có thể xóa
+        # 21 official-train shard rồi stage đúng một official-test holdout.
+        LOCAL_STAGE_CACHE_ID = RUN_ID
         BACKBONE_NAME = "mobilenetv4_conv_small"  #@param ["mobilenetv4_conv_small", "mobilenetv3_small_050"]
         PRETRAINED_IN1K = True  #@param {type:"boolean"}
         EPOCHS = 50  #@param {type:"integer"}
         IMAGE_HEIGHT = 288  #@param {type:"integer"}
         IMAGE_WIDTH = 512  #@param {type:"integer"}
-        BATCH_SIZE = 4  #@param {type:"integer"}
-        NUM_WORKERS = 2  #@param {type:"integer"}
+        BATCH_SIZE = 16  #@param {type:"integer"}
+        NUM_WORKERS = 4  #@param {type:"integer"}
         PREFETCH_FACTOR = 2  #@param {type:"integer"}
         DETECTION_MIN_COMPONENT_PIXELS = 100
         SEED = 42  #@param {type:"integer"}
-        VAL_FRACTION = 0.15  #@param {type:"number"}
-        OFFICIAL_TRAIN_SESSION_LIMIT = 20
+        FIT_SESSION_COUNT = 20
+        VALIDATION_SESSION_COUNT = 1
+        OFFICIAL_TEST_SESSION_COUNT = 1
 
         BASE_LR = 3e-4  #@param {type:"number"}
         BACKBONE_LR_MULTIPLIER = 0.1  #@param {type:"number"}
@@ -181,7 +182,7 @@ cells = [
         MIN_LR_RATIO = 0.05  #@param {type:"number"}
         GRAD_ACCUM_STEPS = 1  #@param {type:"integer"}
         GRAD_CLIP_NORM = 1.0  #@param {type:"number"}
-        AMP_INITIAL_SCALE = 4096.0
+        AMP_INITIAL_SCALE = 1024.0
         PROGRESS_EVERY_N_STEPS = 10
         MAX_PEAK_VRAM_GIB = 22.0
         LOCAL_STAGE_EXPANSION_FACTOR = 1.03
@@ -248,8 +249,9 @@ cells = [
         assert EPOCHS >= 2, "Campaign phải có ít nhất 2 epoch để gate sau epoch 1"
         assert IMAGE_HEIGHT % 32 == 0 and IMAGE_WIDTH % 32 == 0
         assert BATCH_SIZE > 0 and NUM_WORKERS >= 0 and PREFETCH_FACTOR > 0
-        assert 0.0 < VAL_FRACTION < 0.5
-        assert OFFICIAL_TRAIN_SESSION_LIMIT == 20
+        assert FIT_SESSION_COUNT == 20
+        assert VALIDATION_SESSION_COUNT == 1
+        assert OFFICIAL_TEST_SESSION_COUNT == 1
 
         CAMPAIGN = {
             "schema_version": 1,
@@ -280,8 +282,9 @@ cells = [
                 "num_workers": NUM_WORKERS,
                 "prefetch_factor": PREFETCH_FACTOR,
                 "detection_min_component_pixels": DETECTION_MIN_COMPONENT_PIXELS,
-                "validation_fraction": VAL_FRACTION,
-                "official_train_session_limit": OFFICIAL_TRAIN_SESSION_LIMIT,
+                "fit_session_count": FIT_SESSION_COUNT,
+                "validation_session_count": VALIDATION_SESSION_COUNT,
+                "official_test_session_count": OFFICIAL_TEST_SESSION_COUNT,
                 "split_seed": SEED,
                 "depth_min_metres": 0.1,
                 "depth_max_metres": 80.0,
@@ -472,10 +475,14 @@ cells = [
         r"""
         ## Stage official-train lên SSD `/content`
 
-        Cell này chỉ xử lý các shard thuộc 20 session official-train đã khóa (bao gồm fit và inner-val):
+        Cell này chỉ xử lý các shard thuộc 21 official-train session đã khóa
+        (20 fit + 1 inner-val):
         kiểm dung lượng, copy từng archive từ Drive trong khi tính SHA-256, giải nén vào
         thư mục tạm rồi publish atomically. Archive nén local được xoá ngay sau khi shard
-        giải nén xong. Nếu cell ngắt, chạy lại sẽ bỏ qua shard đã hoàn tất.
+        giải nén xong. Sau đó cell tiền xử lý một lần RGB/mask/depth/box vào cache SSD
+        có progress, tốc độ và ETA; pilot/main chỉ đọc cache này thay vì lặp lại PNG,
+        `depth.gz` và connected-components mỗi epoch. Nếu cell ngắt, chạy lại sẽ bỏ qua
+        shard và sample cache đã hoàn tất.
 
         Pilot và main train sẽ bị từ chối nếu subset đã chọn chưa stage đủ. Các shard
         ngoài subset không cần có trên SSD. Official-test hoàn
@@ -484,7 +491,7 @@ cells = [
     ),
     code(
         r"""
-        #@title 4) Stage subset 20 session official-train lên SSD
+        #@title 4) Stage đúng 20 fit + 1 val session lên SSD
         run_live(["stage-train"])
         """
     ),
@@ -544,9 +551,9 @@ cells = [
         r"""
         ## Sau khi campaign hoàn tất: stage official-test
 
-        Vì cache v4 có thể được nhiều campaign dùng chung, Cell 7 không tự xoá nó.
         Cell dưới đây bị khóa cho đến khi checksum-valid snapshot đủ `EPOCHS`
-        được xác nhận; nó chỉ giải nén 48 official-test shard lên SSD và **chưa đánh giá**.
+        được xác nhận. Khi đó nó xóa cache train/val riêng của campaign để thu hồi SSD,
+        rồi chỉ giải nén shard của **1 official-test session holdout** và **chưa đánh giá**.
         """
     ),
     code(

@@ -42,6 +42,49 @@ def test_load_campaign_accepts_visible_notebook_shape(tmp_path: Path) -> None:
     assert actual == expected
 
 
+def test_load_campaign_accepts_locked_twenty_one_one_subset(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    expected = _config(tmp_path)
+    expected["data"].update(  # type: ignore[union-attr]
+        fit_session_count=20,
+        validation_session_count=1,
+        official_test_session_count=1,
+    )
+    path.write_text(json.dumps(expected), encoding="utf-8")
+    _, actual = runner.load_campaign(path)
+    assert actual["data"]["fit_session_count"] == 20
+
+
+@pytest.mark.parametrize(
+    "counts",
+    (
+        {"fit_session_count": 20},
+        {
+            "fit_session_count": 20,
+            "validation_session_count": 0,
+            "official_test_session_count": 1,
+        },
+        {
+            "fit_session_count": True,
+            "validation_session_count": 1,
+            "official_test_session_count": 1,
+        },
+    ),
+)
+def test_load_campaign_rejects_incomplete_or_invalid_subset_counts(
+    tmp_path: Path,
+    counts: dict[str, object],
+) -> None:
+    path = tmp_path / "bad-subset.json"
+    value = _config(tmp_path)
+    value["data"].update(counts)  # type: ignore[union-attr]
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="fit_session_count"):
+        runner.load_campaign(path)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
@@ -50,15 +93,11 @@ def test_load_campaign_accepts_visible_notebook_shape(tmp_path: Path) -> None:
         (lambda value: value["train"].update(epochs=1), "epochs"),
         (lambda value: value["data"].update(image_size=[287, 512]), "image_size"),
         (
-            lambda value: value["data"].update(
-                detection_min_component_pixels=101
-            ),
+            lambda value: value["data"].update(detection_min_component_pixels=101),
             "detection_min_component_pixels",
         ),
         (
-            lambda value: value["data"].update(
-                detection_min_component_pixels=100.0
-            ),
+            lambda value: value["data"].update(detection_min_component_pixels=100.0),
             "detection_min_component_pixels",
         ),
     ),
@@ -91,6 +130,22 @@ def test_approval_token_is_deterministic_and_context_bound() -> None:
         split_sha256="d" * 64,
     )
     assert token != runner.approval_token(changed, "e" * 64, "f" * 64)
+
+
+def test_state_sha256_supports_scalar_integer_buffers() -> None:
+    class ScalarBufferModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor([1.0, 2.0]))
+            self.register_buffer("counter", torch.tensor(7, dtype=torch.long))
+
+    model = ScalarBufferModel()
+    first = runner._state_sha256(model)
+    assert first == runner._state_sha256(model)
+    assert len(first) == 64
+
+    model.counter.add_(1)
+    assert runner._state_sha256(model) != first
 
 
 def test_preflight_amp_overflow_backs_off_without_mutating_model() -> None:
@@ -141,6 +196,16 @@ def test_preflight_gradient_health_distinguishes_missing_and_nonfinite() -> None
     assert runner._gradient_health(model) == (2, ("weight",))
 
 
+@pytest.mark.parametrize(
+    ("proven", "backoffs", "expected"),
+    ((4096.0, 2, 1024.0), (4.0, 2, 1.0), (1.0, 2, 1.0), (8.0, 0, 8.0)),
+)
+def test_production_amp_scale_has_recorded_safety_margin(
+    proven: float, backoffs: int, expected: float
+) -> None:
+    assert runner._production_amp_scale(proven, safety_backoffs=backoffs) == expected
+
+
 def test_disposable_preflight_reports_proven_amp_scale(monkeypatch) -> None:
     class OneBatch:
         def set_epoch(self, epoch: int) -> None:
@@ -169,9 +234,7 @@ def test_disposable_preflight_reports_proven_amp_scale(monkeypatch) -> None:
             return {"total": loss, "toy": loss}
 
     monkeypatch.setattr(runner, "create_model", lambda prepared: ToyModel())
-    monkeypatch.setattr(
-        runner, "create_criterion", lambda prepared: ToyCriterion()
-    )
+    monkeypatch.setattr(runner, "create_criterion", lambda prepared: ToyCriterion())
 
     def schedule(prepared, model):
         return torch.optim.SGD(model.parameters(), lr=0.1), None, 1, 0
@@ -184,9 +247,12 @@ def test_disposable_preflight_reports_proven_amp_scale(monkeypatch) -> None:
     result = runner.disposable_preflight(prepared)
     assert result["optimizer_stepped"] is True
     assert result["amp_stable_scale"] >= 1.0
-    assert result["amp_backoff_count"] == len(
-        result["amp_overflow_attempts"]
+    assert result["amp_production_scale"] == runner._production_amp_scale(
+        result["amp_stable_scale"]
     )
+    assert result["amp_safety_backoff_count"] == 2
+    assert result["amp_safety_margin_factor"] == 4
+    assert result["amp_backoff_count"] == len(result["amp_overflow_attempts"])
     assert result["production_model_mutated"] is False
 
 
@@ -292,12 +358,25 @@ def test_stage_train_wires_detailed_progress_reporter(
                 "completed_extracted_bytes": 123,
             }
 
+    class Loader:
+        def __init__(self, samples: int) -> None:
+            self.samples = samples
+            self.reporter = None
+
+        def warm_prepared_cache(self, *, on_event):
+            self.reporter = on_event
+            return {"ready_samples": self.samples}
+
     stage = Stage()
+    train_loader = Loader(11)
+    val_loader = Loader(7)
     monkeypatch.setattr(
         runner,
         "prepare",
         lambda filename: SimpleNamespace(
             train_stage=stage,
+            train_loader=train_loader,
+            val_loader=val_loader,
             catalog=SimpleNamespace(train_records=(first, second)),
             split=SimpleNamespace(
                 train_records=(first,),
@@ -309,6 +388,48 @@ def test_stage_train_wires_detailed_progress_reporter(
     assert result["complete"] is True
     assert stage.calls == ["plan", "prepare"]
     assert isinstance(stage.reporter, runner.StageProgressReporter)
+    assert isinstance(train_loader.reporter, runner.PreparedCacheProgressReporter)
+    assert isinstance(val_loader.reporter, runner.PreparedCacheProgressReporter)
+
+
+def test_prepared_cache_reporter_is_newline_safe_and_shows_eta(capsys) -> None:
+    ticks = iter((0.0, 1.0, 3.0))
+    reporter = runner.PreparedCacheProgressReporter(
+        "fit", interval_seconds=0.0, clock=lambda: next(ticks)
+    )
+    reporter(
+        {
+            "event": "cache_warm_start",
+            "sample_count": 32,
+            "estimated_pending_bytes": 2 * 1024**3,
+            "available_free_bytes": 100 * 1024**3,
+        }
+    )
+    reporter(
+        {
+            "event": "cache_warm_progress",
+            "batch_index": 1,
+            "total_batches": 2,
+            "completed_samples": 16,
+            "sample_count": 32,
+        }
+    )
+    reporter(
+        {
+            "event": "cache_warm_end",
+            "ready_samples": 32,
+            "sample_count": 32,
+            "cached_bytes": 2 * 1024**3,
+        }
+    )
+    output = capsys.readouterr().out
+    assert "CACHE fit" in output
+    assert "1/2" in output
+    assert "Samples/s" in output
+    assert "ETA" in output
+    assert "CACHE fit READY" in output
+    assert "\r" not in output
+    assert "\x1b[" not in output
 
 
 def test_stage_progress_reporter_is_newline_safe_and_shows_overall_eta(
@@ -515,6 +636,41 @@ def test_stage_test_does_not_delete_train_before_full_campaign(
     assert cleaned is False
 
 
+def test_official_test_stage_contains_only_the_frozen_holdout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    holdout = SimpleNamespace(session_id="test-holdout", key=("test", "holdout"))
+    captured: dict[str, object] = {}
+
+    class Stage:
+        def __init__(self, records, **kwargs) -> None:
+            captured["records"] = tuple(records)
+            captured.update(kwargs)
+
+    monkeypatch.setattr(runner, "LocalArchiveStage", Stage)
+    prepared = SimpleNamespace(
+        split=SimpleNamespace(official_test_records=(holdout,)),
+        local_root=tmp_path,
+        config={
+            "run_id": "twenty-one-one",
+            "data": {
+                "local_staging": {
+                    "cache_id": "twenty-one-one",
+                    "expansion_factor": 1.03,
+                    "reserve_gib": 4.0,
+                }
+            },
+        },
+    )
+
+    runner._official_test_stage(prepared)
+
+    assert captured["records"] == (holdout,)
+    assert captured["purpose"] == "official_test"
+    assert str(captured["local_root"]).endswith("/stages/twenty-one-one/official_test")
+
+
 def test_cached_inspection_is_reused_only_when_context_matches(
     tmp_path: Path,
 ) -> None:
@@ -567,6 +723,16 @@ def test_execution_plan_prints_exact_batches_updates_and_log_cadence(
         },
         train_loader=Loader(125, 500),
         val_loader=Loader(25, 100),
+        split=SimpleNamespace(
+            train_records=(
+                SimpleNamespace(session_id="fit-a", joint_frames=250),
+                SimpleNamespace(session_id="fit-b", joint_frames=250),
+            ),
+            validation_records=(SimpleNamespace(session_id="val-a", joint_frames=100),),
+            official_test_records=(
+                SimpleNamespace(session_id="test-a", joint_frames=9),
+            ),
+        ),
     )
     objects = SimpleNamespace(
         config=SimpleNamespace(grad_accum_steps=2, epochs=50),
@@ -583,6 +749,8 @@ def test_execution_plan_prints_exact_batches_updates_and_log_cadence(
     assert "train=500 samples, 125 batches/epoch" in output
     assert "optimizer=63 updates/epoch" in output
     assert "validation=100 samples, 25 batches/epoch" in output
+    assert "sessions fit=2 | validation=1 | official-test holdout=1" in output
+    assert "9 samples, 3 future batches; NOT LOADED" in output
     assert "campaign optimizer updates=3,150" in output
     assert "warmup=158" in output
     assert "progress every=10 batches" in output

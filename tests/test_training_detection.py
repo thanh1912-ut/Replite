@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from replite.multitask.heads import DetectionHead, DetectionOutput
+from replite.training import detection as detection_module
 from replite.training.detection import (
     DetectionCriterion,
     assign_fcos_targets,
@@ -308,6 +309,29 @@ def test_class_aware_nms_suppresses_only_same_class_and_is_stable() -> None:
     assert keep.tolist() == [0, 2]
 
 
+@pytest.mark.skipif(
+    detection_module._torchvision_batched_nms is None,
+    reason="torchvision NMS is unavailable",
+)
+def test_accelerated_nms_preserves_reference_ties_and_classes() -> None:
+    boxes = torch.tensor(
+        [
+            [0.0, 0.0, 10.0, 10.0],
+            [0.0, 0.0, 10.0, 10.0],
+            [0.0, 0.0, 10.0, 10.0],
+            [20.0, 20.0, 30.0, 30.0],
+        ]
+    )
+    scores = torch.tensor([0.9, 0.9, 0.8, 0.7])
+    labels = torch.tensor([0, 0, 1, 0], dtype=torch.long)
+
+    expected = class_aware_nms(boxes, scores, labels, 0.5)
+    actual = detection_module._accelerated_class_aware_nms(
+        boxes, scores, labels, 0.5
+    )
+    assert actual.tolist() == expected.tolist()
+
+
 def test_decode_uses_stable_pre_nms_tie_order_and_keeps_different_classes() -> None:
     classes = (
         torch.tensor([[[[10.0, 10.0]], [[-20.0, -20.0]]]]),
@@ -385,4 +409,3 @@ def test_invalid_feature_shape_and_target_contract_fail_clearly() -> None:
             ({"boxes": torch.tensor([[0.0, 0.0, 8.0, 8.0]]), "labels": torch.tensor([0.0])},),
             image_size=(64, 64),
         )
-

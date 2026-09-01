@@ -1,9 +1,11 @@
 """Anchor-free detection assignment, losses, decoding, and post-processing.
 
 The model deliberately exposes raw detection maps.  This module supplies one
-small, deterministic FCOS-style training contract for those maps without
-adding a torchvision dependency.  Coordinates use half-open ``XYXY`` pixel
-boxes, while head regressions use LTRB distances measured in feature cells.
+small, deterministic FCOS-style training contract for those maps. Coordinates
+use half-open ``XYXY`` pixel boxes, while head regressions use LTRB distances
+measured in feature cells.  CUDA validation opportunistically uses
+``torchvision.ops.batched_nms`` and retains the dependency-free implementation
+as the deterministic CPU/fallback path.
 """
 
 from __future__ import annotations
@@ -18,6 +20,11 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from replite.multitask.heads import DetectionOutput
+
+try:  # timm installations normally provide torchvision, but keep portability.
+    from torchvision.ops import batched_nms as _torchvision_batched_nms
+except (ImportError, RuntimeError):  # pragma: no cover - environment dependent
+    _torchvision_batched_nms = None
 
 
 DEFAULT_STRIDES = (8, 16, 32)
@@ -833,6 +840,33 @@ def nms(boxes: Tensor, scores: Tensor, iou_threshold: float) -> Tensor:
     return torch.stack(keep)
 
 
+def _accelerated_class_aware_nms(
+    boxes: Tensor,
+    scores: Tensor,
+    labels: Tensor,
+    iou_threshold: float,
+) -> Tensor:
+    """Run torchvision NMS with repository-stable score ordering."""
+
+    if _torchvision_batched_nms is None:
+        raise RuntimeError("torchvision batched_nms is unavailable")
+    stable_order = torch.argsort(scores.float(), descending=True, stable=True)
+    rank_scores = torch.empty_like(scores, dtype=torch.float32)
+    rank_scores[stable_order] = torch.arange(
+        boxes.shape[0],
+        0,
+        -1,
+        device=boxes.device,
+        dtype=torch.float32,
+    )
+    return _torchvision_batched_nms(
+        boxes.float(),
+        rank_scores,
+        labels,
+        iou_threshold,
+    )
+
+
 def class_aware_nms(
     boxes: Tensor,
     scores: Tensor,
@@ -846,6 +880,14 @@ def class_aware_nms(
     if boxes.shape[0] == 0:
         return torch.empty(0, dtype=torch.long, device=boxes.device)
     boxes_float = boxes.float()
+    if boxes.is_cuda and _torchvision_batched_nms is not None:
+        # torchvision's CUDA kernel removes the Python/kernel-launch loop from
+        # validation. Give it unique rank scores so equal input scores preserve
+        # the repository's stable, first-occurrence tie contract on every
+        # backend. NMS only consumes score order, not score magnitudes.
+        return _accelerated_class_aware_nms(
+            boxes_float, scores, labels, iou_threshold
+        )
     span = (boxes_float.max() - boxes_float.min()).clamp_min(0) + 1.0
     offsets = labels.to(dtype=torch.float32) * span
     return nms(boxes_float + offsets[:, None], scores.float(), iou_threshold)

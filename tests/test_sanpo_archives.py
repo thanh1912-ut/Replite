@@ -59,9 +59,10 @@ def _package_sha(selection_sha: str, detection_sha: str = _DETECTION_CONFIG_SHA)
 
 def _ledger_key(entry: dict[str, object]) -> str:
     digest = entry.get("package_sha256", entry["selection_sha256"])
-    return "/".join(
-        str(entry[field]) for field in ("split", "session_id", "sensor")
-    ) + f"/{digest}"
+    return (
+        "/".join(str(entry[field]) for field in ("split", "session_id", "sensor"))
+        + f"/{digest}"
+    )
 
 
 def _first_ledger_entry(
@@ -236,8 +237,13 @@ def test_catalog_matches_real_mixed_legacy_and_modern_ledger_shape(
 
     assert len(ledger["archives"]) == len(specifications) + 1
     assert len(catalog.records) == len(specifications)
-    assert sum(item.detection_source == "packaged_json" for item in catalog.records) == 1
-    assert sum(item.detection_source == "panoptic_on_load" for item in catalog.records) == 4
+    assert (
+        sum(item.detection_source == "packaged_json" for item in catalog.records) == 1
+    )
+    assert (
+        sum(item.detection_source == "panoptic_on_load" for item in catalog.records)
+        == 4
+    )
     assert catalog.detection_config_sha256 == _DETECTION_CONFIG_SHA
 
 
@@ -301,9 +307,7 @@ def test_catalog_rejects_conflicting_active_package_entries(tmp_path: Path) -> N
 def test_catalog_selects_package_for_active_detection_config(tmp_path: Path) -> None:
     root, _ = _catalog_fixture(tmp_path)
     detection_manifest_path = root / "metadata" / "derived_detection_classes.json"
-    detection_manifest = json.loads(
-        detection_manifest_path.read_text(encoding="utf-8")
-    )
+    detection_manifest = json.loads(detection_manifest_path.read_text(encoding="utf-8"))
     # Reproduce early downloader metadata: taxonomy exists, but the wrapper
     # does not expose the derived-box config or its digest.
     detection_manifest.pop("detection_config")
@@ -342,9 +346,7 @@ def test_catalog_ignores_foreign_package_family_without_metadata_config_fields(
 ) -> None:
     root, _ = _catalog_fixture(tmp_path)
     detection_manifest_path = root / "metadata" / "derived_detection_classes.json"
-    detection_manifest = json.loads(
-        detection_manifest_path.read_text(encoding="utf-8")
-    )
+    detection_manifest = json.loads(detection_manifest_path.read_text(encoding="utf-8"))
     detection_manifest.pop("detection_config")
     detection_manifest.pop("detection_config_sha256")
     _write_json(detection_manifest_path, detection_manifest)
@@ -358,9 +360,7 @@ def test_catalog_ignores_foreign_package_family_without_metadata_config_fields(
         alternative["package_sha256"] = _package_sha(
             alternative["selection_sha256"], second_config
         )
-        alternative["archive"] = (
-            f"/content/drive/old-root/{key}-second-family.tar.zst"
-        )
+        alternative["archive"] = f"/content/drive/old-root/{key}-second-family.tar.zst"
         ledger["archives"][_ledger_key(alternative)] = alternative
     _write_json(ledger_path, ledger)
 
@@ -463,7 +463,9 @@ def test_catalog_ignores_missing_unrelated_historical_ledger_entry(
     assert all(record.session_id != "old-session" for record in catalog.records)
 
 
-def test_group_split_is_session_stable_excludes_test_and_is_immutable(tmp_path: Path) -> None:
+def test_group_split_is_session_stable_excludes_test_and_is_immutable(
+    tmp_path: Path,
+) -> None:
     root, _ = _catalog_fixture(tmp_path)
     catalog = load_archive_catalog(root)
     manifest = tmp_path / "splits" / "seed42.json"
@@ -484,13 +486,16 @@ def test_group_split_is_session_stable_excludes_test_and_is_immutable(tmp_path: 
     assert val_sessions.isdisjoint(test_sessions)
     # Both cameras from session-a can never be split across train and val.
     assert "session-a" in train_sessions ^ val_sessions
-    assert sum(record.session_id == "session-a" for record in first.train_records) in {0, 2}
-    assert sum(record.session_id == "session-a" for record in first.validation_records) in {0, 2}
+    assert sum(record.session_id == "session-a" for record in first.train_records) in {
+        0,
+        2,
+    }
+    assert sum(
+        record.session_id == "session-a" for record in first.validation_records
+    ) in {0, 2}
 
     with pytest.raises(FileExistsError, match="differs"):
-        create_or_load_group_split(
-            catalog, manifest, seed=7, validation_fraction=0.34
-        )
+        create_or_load_group_split(catalog, manifest, seed=7, validation_fraction=0.34)
 
 
 def test_group_split_limits_lexicographic_sessions_and_keeps_all_cameras(
@@ -556,7 +561,7 @@ def test_group_split_rejects_invalid_session_limit(
         )
 
 
-def test_twenty_session_split_has_seventeen_fit_three_val_and_no_leakage(
+def test_locked_subset_has_twenty_fit_one_val_one_test_and_no_leakage(
     tmp_path: Path,
 ) -> None:
     records: list[SanpoArchiveRecord] = []
@@ -598,25 +603,85 @@ def test_twenty_session_split_has_seventeen_fit_three_val_and_no_leakage(
     )
     split = create_or_load_group_split(
         catalog,
-        tmp_path / "twenty-session-split.json",
+        tmp_path / "twenty-fit-one-val-one-test.json",
         seed=42,
         validation_fraction=0.15,
-        session_limit=20,
+        session_limit=21,
+        validation_session_count=1,
+        official_test_session_limit=1,
     )
 
     train_sessions = {record.session_id for record in split.train_records}
     val_sessions = {record.session_id for record in split.validation_records}
-    assert len(train_sessions) == 17
-    assert len(val_sessions) == 3
+    test_sessions = {record.session_id for record in split.official_test_records}
+    assert len(train_sessions) == 20
+    assert len(val_sessions) == 1
+    assert test_sessions == {"official-test"}
     assert train_sessions.isdisjoint(val_sessions)
-    assert train_sessions | val_sessions == {
-        f"session-{index:02d}" for index in range(20)
+    assert (train_sessions | val_sessions).isdisjoint(test_sessions)
+    expected_order = sorted(
+        (f"session-{index:02d}" for index in range(25)),
+        key=lambda session_id: (
+            hashlib.sha256(
+                f"replite-sanpo-split-v1:42:{session_id}".encode()
+            ).hexdigest(),
+            session_id,
+        ),
+    )
+    assert val_sessions == {expected_order[0]}
+    assert train_sessions == set(expected_order[1:21])
+    assert sum(record.session_id == "session-03" for record in split.train_records) in {
+        0,
+        2,
     }
-    assert sum(record.session_id == "session-03" for record in split.train_records) in {0, 2}
     assert sum(
         record.session_id == "session-03" for record in split.validation_records
     ) in {0, 2}
     assert split.official_test_records == (test_record,)
+    payload = json.loads(split.manifest_path.read_text(encoding="utf-8"))
+    assert payload["fit_session_count"] == 20
+    assert payload["validation_session_count"] == 1
+    assert payload["official_test_session_limit"] == 1
+    assert payload["selected_official_test_session_ids"] == ["official-test"]
+    assert payload["session_selection_ordering"] == (
+        "sha256(replite-sanpo-split-v1:seed:session_id)"
+    )
+    assert payload["official_test_selection_ordering"] == (
+        "sha256(replite-sanpo-test-holdout-v1:seed:session_id)"
+    )
+    assert payload["protocol_note"] == (
+        "Official test is excluded from training, validation, and selection."
+    )
+
+
+@pytest.mark.parametrize("validation_count", [True, 0, 3])
+def test_group_split_rejects_invalid_explicit_validation_count(
+    tmp_path: Path,
+    validation_count: object,
+) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    catalog = load_archive_catalog(root)
+    with pytest.raises(ValueError, match="validation_session_count"):
+        create_or_load_group_split(
+            catalog,
+            tmp_path / f"invalid-val-{validation_count}.json",
+            validation_session_count=validation_count,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("test_limit", [True, 0, 2])
+def test_group_split_rejects_invalid_official_test_limit(
+    tmp_path: Path,
+    test_limit: object,
+) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    catalog = load_archive_catalog(root)
+    with pytest.raises(ValueError, match="official_test_session_limit"):
+        create_or_load_group_split(
+            catalog,
+            tmp_path / f"invalid-test-{test_limit}.json",
+            official_test_session_limit=test_limit,  # type: ignore[arg-type]
+        )
 
 
 def _joint_manifest_bytes(
@@ -644,9 +709,7 @@ def _joint_manifest_bytes(
             "depth_path": f"{sensor}/left/depth/{index + 2}.gz",
         }
         if include_detection_paths:
-            sample["detection_path"] = (
-                f"{sensor}/left/detection/{index + 2}.json"
-            )
+            sample["detection_path"] = f"{sensor}/left/detection/{index + 2}.json"
         samples.append(sample)
     manifest = {
         "schema_version": schema_version,
@@ -687,15 +750,19 @@ def _write_tar_archive(
         name = unsafe_name or (
             f"sanpo-real/{session_id}/{sensor}/left/_sanpo_joint_manifest.json"
         )
-        payload = b"unsafe" if unsafe_name else _joint_manifest_bytes(
-            split=split,
-            session_id=session_id,
-            sensor=sensor,
-            selection_sha=selection_sha,
-            schema_version=manifest_schema_version,
-            detection_config_sha=manifest_detection_config_sha,
-            include_detection_paths=include_detection_paths,
-            include_annotation_policy=include_annotation_policy,
+        payload = (
+            b"unsafe"
+            if unsafe_name
+            else _joint_manifest_bytes(
+                split=split,
+                session_id=session_id,
+                sensor=sensor,
+                selection_sha=selection_sha,
+                schema_version=manifest_schema_version,
+                detection_config_sha=manifest_detection_config_sha,
+                include_detection_paths=include_detection_paths,
+                include_annotation_policy=include_annotation_policy,
+            )
         )
         info = tarfile.TarInfo(name)
         info.size = len(payload)
@@ -711,9 +778,7 @@ def _write_tar_archive(
                     referenced.add(sample["detection_path"])
             for relative in sorted(referenced):
                 content = b"fixture"
-                member = tarfile.TarInfo(
-                    f"sanpo-real/{session_id}/{relative}"
-                )
+                member = tarfile.TarInfo(f"sanpo-real/{session_id}/{relative}")
                 member.size = len(content)
                 tar.addfile(member, io.BytesIO(content))
     return SanpoArchiveRecord(
@@ -981,9 +1046,7 @@ def test_persistent_stage_keeps_legacy_callback_and_emits_detailed_events(
         "final_verify",
         "stage_end",
     ]
-    detailed = [
-        event for event in events if event["event"] == "record_progress"
-    ]
+    detailed = [event for event in events if event["event"] == "record_progress"]
     phases = [event["phase"] for event in detailed]
     assert phases[0] == "copy+sha"
     assert "extract" in phases
@@ -1223,21 +1286,31 @@ def test_persistent_stage_never_claims_nonempty_unowned_directory(
 class _FakeDataset(Dataset):
     lengths: dict[str, int] = {}
     detection_modes: list[tuple[str, bool]] = []
+    cache_builds = 0
 
     def __init__(
         self,
         manifest_path: Path,
         *,
         use_packaged_detection: bool,
+        prepared_cache_dir: Path | None = None,
         **_: object,
     ) -> None:
         self.name = Path(manifest_path).name
+        self.prepared_cache_dir = prepared_cache_dir
+        if self.prepared_cache_dir is not None:
+            self.prepared_cache_dir.mkdir(parents=True, exist_ok=True)
         self.detection_modes.append((self.name, use_packaged_detection))
 
     def __len__(self) -> int:
         return self.lengths[self.name]
 
     def __getitem__(self, index: int):
+        if self.prepared_cache_dir is not None:
+            cached = self.prepared_cache_dir / f"{index:08d}.pt"
+            if not cached.exists():
+                cached.write_bytes(b"prepared")
+                type(self).cache_builds += 1
         identity = int(self.name.removeprefix("shard-")) * 100 + index
         clip = torch.full((3, 3, 2, 2), float(identity))
         targets = {
@@ -1252,6 +1325,27 @@ class _FakeDataset(Dataset):
         }
         return clip, targets
 
+    def prepared_cache_status(self) -> dict[str, int | bool | str | None]:
+        ready = (
+            0
+            if self.prepared_cache_dir is None
+            else sum(1 for _ in self.prepared_cache_dir.glob("*.pt"))
+        )
+        pending = len(self) - ready
+        return {
+            "enabled": self.prepared_cache_dir is not None,
+            "cache_key": self.name,
+            "cache_dir": (
+                None if self.prepared_cache_dir is None else str(self.prepared_cache_dir)
+            ),
+            "sample_count": len(self),
+            "ready_samples": ready,
+            "pending_samples": pending,
+            "estimated_sample_bytes": 8,
+            "estimated_pending_bytes": pending * 8,
+            "cached_bytes": ready * 8,
+        }
+
 
 class _FakeMaterializer:
     order: list[str] = []
@@ -1265,6 +1359,23 @@ class _FakeMaterializer:
 
     def __exit__(self, *args: object) -> None:
         return None
+
+
+class _FakeLocalStage:
+    def __init__(self, records: tuple[SanpoArchiveRecord, ...], root: Path) -> None:
+        self.local_root = root
+        self.local_root.mkdir(parents=True, exist_ok=True)
+        self.reserve_bytes = 0
+        self._records_by_key = {record.key: record for record in records}
+        self.materialize_calls: list[tuple[str, str, str, str, str]] = []
+
+    @staticmethod
+    def _record_stage_id(record: SanpoArchiveRecord) -> str:
+        return record.session_id
+
+    def materialize(self, record: SanpoArchiveRecord) -> Path:
+        self.materialize_calls.append(record.key)
+        return Path(f"shard-{record.session_id.removeprefix('session-')}")
 
 
 def _fake_records(tmp_path: Path) -> tuple[SanpoArchiveRecord, ...]:
@@ -1331,6 +1442,164 @@ def test_archive_shard_loader_len_epoch_shuffle_and_epoch_cleanup(
         drop_last=True,
     )
     assert len(dropped) == 1 + 2 + 2 + 1
+
+
+def test_staged_loader_has_one_global_tail_and_crosses_shard_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "LocalArchiveStage", _FakeLocalStage)
+    monkeypatch.setattr(archives_module, "SanpoJointDataset", _FakeDataset)
+    records = _fake_records(tmp_path)
+    _FakeDataset.lengths = {
+        f"shard-{index}": record.joint_frames for index, record in enumerate(records)
+    }
+    _FakeDataset.detection_modes = []
+    stage = _FakeLocalStage(records, tmp_path / "stage")
+    loader = ArchiveShardLoader(
+        records,
+        local_root=tmp_path / "unused",
+        local_stage=stage,  # type: ignore[arg-type]
+        batch_size=4,
+        image_size=(2, 2),
+        shuffle=False,
+    )
+
+    batches = list(loader)
+
+    assert len(loader) == 4
+    assert [len(batch) for batch, _ in batches] == [4, 4, 4, 2]
+    # The first shard has only three samples, so the fourth item proves that
+    # the global batch crosses a session boundary instead of emitting a tail.
+    assert batches[0][0][:, 0, 0, 0, 0].tolist() == [0.0, 1.0, 2.0, 100.0]
+    assert len(stage.materialize_calls) == len(records)
+    assert len(_FakeDataset.detection_modes) == len(records)
+
+    repeated = list(loader)
+    assert len(repeated) == 4
+    assert len(stage.materialize_calls) == len(records)
+    assert len(_FakeDataset.detection_modes) == len(records)
+
+    dropped = ArchiveShardLoader(
+        records,
+        local_root=tmp_path / "unused-drop",
+        local_stage=stage,  # type: ignore[arg-type]
+        batch_size=4,
+        image_size=(2, 2),
+        drop_last=True,
+    )
+    assert len(dropped) == 3
+    assert sum(len(batch) for batch, _ in dropped) == 12
+
+
+def test_staged_global_epoch_shuffle_is_exact_after_fresh_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "LocalArchiveStage", _FakeLocalStage)
+    monkeypatch.setattr(archives_module, "SanpoJointDataset", _FakeDataset)
+    records = _fake_records(tmp_path)
+    _FakeDataset.lengths = {
+        f"shard-{index}": record.joint_frames for index, record in enumerate(records)
+    }
+
+    def make_loader() -> ArchiveShardLoader:
+        return ArchiveShardLoader(
+            records,
+            local_root=tmp_path / "unused",
+            local_stage=_FakeLocalStage(records, tmp_path / "stage"),  # type: ignore[arg-type]
+            batch_size=3,
+            image_size=(2, 2),
+            seed=91,
+            shuffle=True,
+        )
+
+    def identities(loader: ArchiveShardLoader) -> list[int]:
+        return [int(value) for batch, _ in loader for value in batch[:, 0, 0, 0, 0]]
+
+    continuous = make_loader()
+    epoch_zero = identities(continuous)
+    continuous.set_epoch(1)
+    epoch_one = identities(continuous)
+    assert epoch_zero != epoch_one
+    assert sorted(epoch_zero) == sorted(epoch_one)
+
+    resumed = make_loader()
+    resumed.set_epoch(1)
+    assert identities(resumed) == epoch_one
+    assert identities(resumed) == epoch_one
+
+
+def test_staged_loader_enables_persistent_workers_only_when_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "LocalArchiveStage", _FakeLocalStage)
+    monkeypatch.setattr(archives_module, "SanpoJointDataset", _FakeDataset)
+    records = _fake_records(tmp_path)
+    _FakeDataset.lengths = {
+        f"shard-{index}": record.joint_frames for index, record in enumerate(records)
+    }
+    staged = ArchiveShardLoader(
+        records,
+        local_root=tmp_path / "unused",
+        local_stage=_FakeLocalStage(records, tmp_path / "stage"),  # type: ignore[arg-type]
+        batch_size=4,
+        image_size=(2, 2),
+        num_workers=1,
+    )
+    ephemeral = ArchiveShardLoader(
+        records,
+        local_root=tmp_path / "ephemeral",
+        batch_size=4,
+        image_size=(2, 2),
+        num_workers=1,
+    )
+
+    assert staged.persistent_workers is True
+    assert staged._ensure_staged_loader().persistent_workers is True
+    assert ephemeral.persistent_workers is False
+
+
+def test_staged_cache_warm_reports_progress_and_avoids_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "LocalArchiveStage", _FakeLocalStage)
+    monkeypatch.setattr(archives_module, "SanpoJointDataset", _FakeDataset)
+    records = _fake_records(tmp_path)
+    _FakeDataset.lengths = {
+        f"shard-{index}": record.joint_frames for index, record in enumerate(records)
+    }
+    _FakeDataset.cache_builds = 0
+    loader = ArchiveShardLoader(
+        records,
+        local_root=tmp_path / "unused",
+        local_stage=_FakeLocalStage(records, tmp_path / "stage"),  # type: ignore[arg-type]
+        batch_size=4,
+        image_size=(2, 2),
+        num_workers=0,
+    )
+    events: list[dict[str, object]] = []
+
+    before = loader.prepared_cache_plan()
+    result = loader.warm_prepared_cache(
+        on_event=lambda payload: events.append(dict(payload))
+    )
+
+    assert before["ready_samples"] == 0
+    assert before["pending_samples"] == 14
+    assert result["ready_samples"] == 14
+    assert result["pending_samples"] == 0
+    assert _FakeDataset.cache_builds == 14
+    assert [event["event"] for event in events] == [
+        "cache_warm_start",
+        "cache_warm_progress",
+        "cache_warm_progress",
+        "cache_warm_progress",
+        "cache_warm_progress",
+        "cache_warm_end",
+    ]
+    assert events[-1]["completed_samples"] == 14
+
+    loader.warm_prepared_cache()
+    assert _FakeDataset.cache_builds == 14
 
 
 def test_archive_shard_loader_routes_record_detection_source(

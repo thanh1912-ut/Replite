@@ -91,16 +91,17 @@ class SegmentationMetrics:
             return
         actual = target[mask].long()
         predicted = prediction[mask].long()
-        if bool((actual < 0).any()) or bool((actual >= self.num_classes).any()):
+        if bool(((actual < 0) | (actual >= self.num_classes)).any()):
             raise ValueError("valid targets are outside the configured class range")
-        if bool((predicted < 0).any()) or bool(
-            (predicted >= self.num_classes).any()
-        ):
+        if bool(((predicted < 0) | (predicted >= self.num_classes)).any()):
             raise ValueError("predictions are outside the configured class range")
-        encoded = actual.cpu() * self.num_classes + predicted.cpu()
-        self.confusion_matrix += torch.bincount(
+        # Reduce millions of labels on their current device and transfer only
+        # the small CxC matrix to the host accumulator.
+        encoded = actual * self.num_classes + predicted
+        batch_matrix = torch.bincount(
             encoded, minlength=self.num_classes**2
         ).reshape(self.num_classes, self.num_classes)
+        self.confusion_matrix += batch_matrix.cpu()
 
     def compute(self) -> dict[str, Any]:
         matrix = self.confusion_matrix.double()
@@ -226,7 +227,7 @@ class DepthMetrics:
             return
         predicted = prediction[mask].detach().float()
         actual = target[mask].detach().float()
-        if not bool(torch.isfinite(predicted).all()) or bool((predicted <= 0).any()):
+        if bool((~torch.isfinite(predicted) | predicted.le(0)).any()):
             raise ValueError("valid depth predictions must be finite and positive")
         difference = predicted - actual
         ratio = torch.maximum(
@@ -237,15 +238,21 @@ class DepthMetrics:
             actual.clamp_min(self.eps)
         )
         self.count += int(actual.numel())
-        self.sum_abs_rel += float((difference.abs() / actual).double().sum().cpu())
-        self.sum_sq_rel += float((difference.square() / actual).double().sum().cpu())
-        self.sum_squared_error += float(difference.double().square().sum().cpu())
-        self.sum_squared_log_error += float(
-            log_difference.double().square().sum().cpu()
-        )
-        self.delta1_count += float((ratio < 1.25).sum().cpu())
-        self.delta2_count += float((ratio < 1.25**2).sum().cpu())
-        self.delta3_count += float((ratio < 1.25**3).sum().cpu())
+        # Keep all reductions device-resident and materialize their seven
+        # scalar results in one transfer/synchronization.
+        summary = torch.stack(
+            (
+                (difference.abs() / actual).double().sum(),
+                (difference.square() / actual).double().sum(),
+                difference.double().square().sum(),
+                log_difference.double().square().sum(),
+                (ratio < 1.25).sum().double(),
+                (ratio < 1.25**2).sum().double(),
+                (ratio < 1.25**3).sum().double(),
+            )
+        ).cpu().tolist()
+        for name, value in zip(self._SUM_FIELDS, summary):
+            setattr(self, name, getattr(self, name) + float(value))
 
     def compute(self) -> dict[str, float | int]:
         if self.count == 0:
@@ -451,6 +458,56 @@ def _validate_box_mapping(
     return result
 
 
+def _coalesce_decoded_batch_to_cpu(
+    items: Sequence[Mapping[str, Tensor]],
+) -> list[dict[str, Tensor]]:
+    """Transfer a variable-length decoded batch in two contiguous copies.
+
+    The previous per-image conversion performed three synchronous CUDA-to-CPU
+    copies for every validation image.  Boxes and scores share a float buffer;
+    labels retain their integer dtype in a second buffer.  CPU and unusual
+    mixed-device callers keep the ordinary validation path.
+    """
+
+    if not items:
+        return []
+    try:
+        boxes = tuple(item["boxes"] for item in items)
+        scores = tuple(item["scores"] for item in items)
+        labels = tuple(item["labels"] for item in items)
+    except (KeyError, TypeError):
+        return [dict(item) for item in items]
+    tensors = boxes + scores + labels
+    if not all(isinstance(value, Tensor) for value in tensors):
+        return [dict(item) for item in items]
+    device = boxes[0].device
+    if device.type != "cuda" or any(value.device != device for value in tensors):
+        return [dict(item) for item in items]
+    lengths = tuple(int(value.shape[0]) for value in boxes)
+    packed_float = torch.cat(
+        [
+            torch.cat((box.detach().float(), score.detach().float()[:, None]), dim=1)
+            for box, score in zip(boxes, scores)
+        ],
+        dim=0,
+    ).cpu()
+    packed_labels = torch.cat([value.detach().long() for value in labels], dim=0).cpu()
+    results: list[dict[str, Tensor]] = []
+    offset = 0
+    for length in lengths:
+        next_offset = offset + length
+        rows = packed_float[offset:next_offset]
+        results.append(
+            {
+                "boxes": rows[:, :4],
+                "scores": rows[:, 4],
+                "labels": packed_labels[offset:next_offset],
+            }
+        )
+        offset = next_offset
+    return results
+
+
 class DetectionMAP:
     """Pure-Torch COCO-style 101-point mAP over IoU 0.50:0.05:0.95."""
 
@@ -528,33 +585,72 @@ class DetectionMAP:
             total += float(eligible.max()) if eligible.numel() else 0.0
         return total / 101.0
 
-    def _class_ap(self, class_id: int, threshold: float) -> float | None:
+    def _class_context(self, class_id: int) -> dict[str, Any] | None:
+        """Prepare score order and IoU matrices once for every IoU threshold."""
+
         targets_by_image: list[Tensor] = []
-        ignored_by_image: list[Tensor] = []
+        predicted_boxes_by_image: list[Tensor] = []
+        predicted_scores_by_image: list[Tensor] = []
         total_targets = 0
-        detections: list[tuple[float, int, int, Tensor]] = []
-        insertion = 0
-        for image_index, (prediction, target) in enumerate(
-            zip(self.predictions, self.targets)
-        ):
+        for prediction, target in zip(self.predictions, self.targets):
             boxes = target["boxes"][target["labels"] == class_id]
             targets_by_image.append(boxes)
-            ignored_by_image.append(target["ignore_boxes"])
             total_targets += int(boxes.shape[0])
             mask = prediction["labels"] == class_id
-            for score, box in zip(prediction["scores"][mask], prediction["boxes"][mask]):
-                detections.append((float(score), insertion, image_index, box))
-                insertion += 1
+            predicted_boxes_by_image.append(prediction["boxes"][mask])
+            predicted_scores_by_image.append(prediction["scores"][mask])
         if total_targets == 0:
             return None
+
+        target_overlaps: list[Tensor] = []
+        ignored_overlaps: list[Tensor] = []
+        detections: list[tuple[float, int, int, int]] = []
+        insertion = 0
+        for image_index, (predicted_boxes, predicted_scores, target, target_boxes) in enumerate(
+            zip(
+                predicted_boxes_by_image,
+                predicted_scores_by_image,
+                self.targets,
+                targets_by_image,
+            )
+        ):
+            target_overlaps.append(box_iou(predicted_boxes, target_boxes))
+            ignored_overlaps.append(box_iou(predicted_boxes, target["ignore_boxes"]))
+            for row, score in enumerate(predicted_scores):
+                detections.append((float(score), insertion, image_index, row))
+                insertion += 1
         detections.sort(key=lambda item: (-item[0], item[1]))
+        return {
+            "targets": targets_by_image,
+            "target_overlaps": target_overlaps,
+            "ignored_overlaps": ignored_overlaps,
+            "detections": detections,
+            "total_targets": total_targets,
+        }
+
+    def _class_ap(
+        self,
+        class_id: int,
+        threshold: float,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> float | None:
+        if context is None:
+            context = self._class_context(class_id)
+        if context is None:
+            return None
+        targets_by_image = context["targets"]
+        target_overlaps = context["target_overlaps"]
+        ignored_overlaps = context["ignored_overlaps"]
+        detections = context["detections"]
+        total_targets = int(context["total_targets"])
         matched = [torch.zeros(len(boxes), dtype=torch.bool) for boxes in targets_by_image]
         true_positive: list[float] = []
         false_positive: list[float] = []
-        for _, _, image_index, box in detections:
+        for _, _, image_index, row in detections:
             targets = targets_by_image[image_index]
             if targets.numel():
-                overlaps = box_iou(box.unsqueeze(0), targets).squeeze(0)
+                overlaps = target_overlaps[image_index][row]
                 overlaps = overlaps.masked_fill(matched[image_index], -1.0)
                 overlap, target_index = overlaps.max(dim=0)
                 if overlap >= threshold:
@@ -567,10 +663,8 @@ class DetectionMAP:
             # area into class-agnostic ignore boxes. Training masks these
             # regions, so an otherwise-unmatched detection there must be
             # excluded from both TP and FP. Positive matches take precedence.
-            ignored = ignored_by_image[image_index]
-            if ignored.numel() and bool(
-                (box_iou(box.unsqueeze(0), ignored).squeeze(0) >= threshold).any()
-            ):
+            ignored = ignored_overlaps[image_index][row]
+            if ignored.numel() and bool((ignored >= threshold).any()):
                 continue
             true_positive.append(0.0)
             false_positive.append(1.0)
@@ -583,10 +677,17 @@ class DetectionMAP:
     def compute(self) -> dict[str, Any]:
         threshold_values: dict[float, list[float]] = {}
         per_class: dict[int, list[float]] = {index: [] for index in range(self.num_classes)}
+        class_contexts = {
+            class_id: self._class_context(class_id)
+            for class_id in range(self.num_classes)
+        }
         for threshold in self.iou_thresholds:
             values: list[float] = []
             for class_id in range(self.num_classes):
-                value = self._class_ap(class_id, threshold)
+                context = class_contexts[class_id]
+                if context is None:
+                    continue
+                value = self._class_ap(class_id, threshold, context=context)
                 if value is not None:
                     values.append(value)
                     per_class[class_id].append(value)
@@ -768,6 +869,7 @@ class MultiTaskMetrics:
                     nms_iou_threshold=self.detection_nms_iou_threshold,
                     max_detections=self.detection.max_detections,
                 )
+                decoded = _coalesce_decoded_batch_to_cpu(decoded)
                 self.detection.update(decoded, target_batch)
         if self.segmentation is not None:
             if predictions.segmentation is None:

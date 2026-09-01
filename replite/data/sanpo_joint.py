@@ -14,8 +14,12 @@ half-open XYXY coordinates and are scaled to the configured output size.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import math
+import os
+import pickle
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -45,6 +49,7 @@ SANPO_SEGMENTATION_CLASS_NAMES = tuple(
 SANPO_SEGMENTATION_IGNORE_INDEX = 255
 IMAGENET_RGB_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_RGB_STD = (0.229, 0.224, 0.225)
+_PREPARED_CACHE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -260,6 +265,7 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
         detection_min_area: int = 100,
         use_packaged_detection: bool = True,
         normalize: bool = True,
+        prepared_cache_dir: str | PathLike[str] | None = None,
     ) -> None:
         super().__init__()
         self.manifest, self.info = load_sanpo_joint_manifest(manifest_path)
@@ -295,6 +301,14 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
         self.normalize = normalize
         self._mean = torch.tensor(IMAGENET_RGB_MEAN, dtype=torch.float32).reshape(3, 1, 1)
         self._std = torch.tensor(IMAGENET_RGB_STD, dtype=torch.float32).reshape(3, 1, 1)
+        self._prepared_cache_key = self._make_prepared_cache_key()
+        self._prepared_sample_estimates: dict[int, int] = {}
+        self.prepared_cache_dir: Path | None = None
+        if prepared_cache_dir is not None:
+            root = Path(prepared_cache_dir).expanduser().resolve()
+            self.prepared_cache_dir = root / self._prepared_cache_key
+            self.prepared_cache_dir.mkdir(parents=True, exist_ok=True)
+            self._ensure_prepared_cache_marker()
 
     def __len__(self) -> int:
         return len(self.manifest["samples"])
@@ -305,21 +319,267 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             raise FileNotFoundError(f"missing SANPO sample file: {path}")
         return path
 
-    def _load_rgb(self, path: Path) -> Tensor:
+    def _make_prepared_cache_key(self) -> str:
+        """Bind a local prepared cache to source manifest and preprocessing."""
+
+        manifest_sha256 = hashlib.sha256(
+            self.info.manifest_path.read_bytes()
+        ).hexdigest()
+        contract = {
+            "schema_version": _PREPARED_CACHE_SCHEMA_VERSION,
+            "manifest_sha256": manifest_sha256,
+            "image_size": list(self.image_size),
+            "depth_min": self.depth_min,
+            "depth_max": self.depth_max,
+            "detection_min_area": self.detection_min_area,
+            "use_packaged_detection": self.use_packaged_detection,
+            "rgb_resize": "pillow_bilinear_uint8",
+            "dense_resize": "pillow_nearest",
+            "depth_storage": "float16_exact_source_values",
+            "detection_classes": list(SANPO_DETECTION_CLASS_NAMES),
+            "segmentation_classes": list(SANPO_SEGMENTATION_CLASS_NAMES),
+        }
+        encoded = json.dumps(
+            contract,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _ensure_prepared_cache_marker(self) -> None:
+        assert self.prepared_cache_dir is not None
+        marker = self.prepared_cache_dir / "cache_manifest.json"
+        expected = {
+            "schema_version": _PREPARED_CACHE_SCHEMA_VERSION,
+            "cache_key": self._prepared_cache_key,
+            "sample_count": len(self),
+        }
+        if marker.exists():
+            try:
+                observed = json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"cannot read SANPO prepared-cache marker: {marker}") from exc
+            if observed != expected:
+                raise RuntimeError(f"SANPO prepared-cache marker mismatch: {marker}")
+            return
+        temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(expected, separators=(",", ":"), sort_keys=True),
+                encoding="utf-8",
+            )
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, marker)
+            except FileExistsError:
+                observed = json.loads(marker.read_text(encoding="utf-8"))
+                if observed != expected:
+                    raise RuntimeError(
+                        f"SANPO prepared-cache marker mismatch: {marker}"
+                    )
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _load_rgb_uint8(self, path: Path) -> Tensor:
         with Image.open(path) as image:
             image = image.convert("RGB").resize(
                 (self.image_size[1], self.image_size[0]),
                 resample=Image.Resampling.BILINEAR,
             )
             array = np.asarray(image, dtype=np.uint8).copy()
-        tensor = torch.from_numpy(array).permute(2, 0, 1).float().div_(255.0)
-        return (tensor - self._mean) / self._std if self.normalize else tensor
+        return torch.from_numpy(array)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, dict[str, Any]]:
+    def _prepared_cache_path(self, index: int) -> Path | None:
+        if self.prepared_cache_dir is None:
+            return None
+        return self.prepared_cache_dir / f"{index:08d}.pt"
+
+    def prepared_cache_status(self) -> dict[str, int | bool | str | None]:
+        """Return a cheap local-cache count and conservative disk estimate."""
+
+        estimates = [self._estimated_prepared_sample_bytes(index) for index in range(len(self))]
+        estimated_sample_bytes = max(estimates, default=0)
+        if self.prepared_cache_dir is None:
+            return {
+                "enabled": False,
+                "cache_key": self._prepared_cache_key,
+                "cache_dir": None,
+                "sample_count": len(self),
+                "ready_samples": 0,
+                "pending_samples": len(self),
+                "estimated_sample_bytes": estimated_sample_bytes,
+                "estimated_pending_bytes": sum(estimates),
+                "cached_bytes": 0,
+            }
+        ready_indices: set[int] = set()
+        cached_bytes = 0
+        for path in self.prepared_cache_dir.glob("*.pt"):
+            if len(path.stem) != 8 or not path.stem.isdigit():
+                continue
+            index = int(path.stem)
+            if 0 <= index < len(self):
+                ready_indices.add(index)
+                try:
+                    cached_bytes += path.stat().st_size
+                except OSError:
+                    pass
+        pending = len(self) - len(ready_indices)
+        return {
+            "enabled": True,
+            "cache_key": self._prepared_cache_key,
+            "cache_dir": str(self.prepared_cache_dir),
+            "sample_count": len(self),
+            "ready_samples": len(ready_indices),
+            "pending_samples": pending,
+            "estimated_sample_bytes": estimated_sample_bytes,
+            "estimated_pending_bytes": sum(
+                estimate
+                for index, estimate in enumerate(estimates)
+                if index not in ready_indices
+            ),
+            "cached_bytes": cached_bytes,
+        }
+
+    def _estimated_prepared_sample_bytes(self, index: int) -> int:
+        cached = self._prepared_sample_estimates.get(index)
+        if cached is not None:
+            return cached
         sample = self.manifest["samples"][index]
-        clip = torch.stack(
+        target_pixels = self.image_size[0] * self.image_size[1]
+        # Three RGB uint8 frames (9), segmentation uint8 (1), float16 depth
+        # (2), and depth validity (1) use exactly 13 bytes per output pixel.
+        fixed_tensors = 13 * target_pixels
+        detection_relative = (
+            sample.get("detection_path") if self.use_packaged_detection else None
+        )
+        if detection_relative is not None:
+            detection = _read_detection_target(
+                self._path(detection_relative, "detection_path")
+            )
+            detection_bytes = (
+                int(detection["boxes"].shape[0]) * (4 * 4 + 8)
+                + int(detection["ignore_boxes"].shape[0]) * (4 * 4)
+            )
+        else:
+            panoptic_path = self._path(sample["panoptic_path"], "panoptic_path")
+            with Image.open(panoptic_path) as image:
+                source_width, source_height = image.size
+            # With 8-connectivity, isolated components occupy at most every
+            # second row and column. A positive component uses four float32 box
+            # values plus one int64 label (24 bytes); ignore components use less.
+            component_upper_bound = math.ceil(source_height / 2) * math.ceil(
+                source_width / 2
+            )
+            detection_bytes = component_upper_bound * 24
+        # The fixed allowance covers tensor metadata, zip records, alignment,
+        # filesystem allocation and the small identity payload.
+        estimate = fixed_tensors + detection_bytes + 64 * 1024
+        self._prepared_sample_estimates[index] = estimate
+        return estimate
+
+    def _validate_prepared_sample(
+        self,
+        payload: object,
+        *,
+        index: int,
+    ) -> dict[str, Tensor]:
+        if not isinstance(payload, Mapping):
+            raise ValueError("prepared sample must be a mapping")
+        if (
+            payload.get("schema_version") != _PREPARED_CACHE_SCHEMA_VERSION
+            or payload.get("cache_key") != self._prepared_cache_key
+            or payload.get("sample_index") != index
+        ):
+            raise ValueError("prepared sample identity mismatch")
+        tensors = payload.get("tensors")
+        if not isinstance(tensors, Mapping):
+            raise ValueError("prepared sample has no tensor mapping")
+        required = {
+            "rgb_uint8",
+            "segmentation_uint8",
+            "depth_float16",
+            "depth_valid",
+            "boxes",
+            "labels",
+            "ignore_boxes",
+        }
+        if set(tensors) != required or any(
+            not isinstance(tensors[name], Tensor) for name in required
+        ):
+            raise ValueError("prepared sample tensor schema mismatch")
+        checked = {name: tensors[name] for name in required}
+        height, width = self.image_size
+        expected = {
+            "rgb_uint8": (torch.uint8, (3, height, width, 3)),
+            "segmentation_uint8": (torch.uint8, (height, width)),
+            "depth_float16": (torch.float16, (1, height, width)),
+            "depth_valid": (torch.bool, (1, height, width)),
+        }
+        for name, (dtype, shape) in expected.items():
+            value = checked[name]
+            if value.dtype != dtype or tuple(value.shape) != shape:
+                raise ValueError(f"prepared sample {name} shape/dtype mismatch")
+        boxes = checked["boxes"]
+        labels = checked["labels"]
+        ignore_boxes = checked["ignore_boxes"]
+        if (
+            boxes.dtype != torch.float32
+            or boxes.ndim != 2
+            or boxes.shape[1:] != (4,)
+            or labels.dtype != torch.int64
+            or labels.ndim != 1
+            or labels.shape[0] != boxes.shape[0]
+            or ignore_boxes.dtype != torch.float32
+            or ignore_boxes.ndim != 2
+            or ignore_boxes.shape[1:] != (4,)
+            or not bool(torch.isfinite(boxes).all())
+            or not bool(torch.isfinite(ignore_boxes).all())
+        ):
+            raise ValueError("prepared sample detection tensors are invalid")
+        return checked
+
+    def _read_prepared_sample(self, path: Path, *, index: int) -> dict[str, Tensor]:
+        try:
+            payload = torch.load(
+                path,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+            return self._validate_prepared_sample(payload, index=index)
+        except (OSError, RuntimeError, ValueError, EOFError, pickle.UnpicklingError) as exc:
+            raise ValueError(f"cannot read SANPO prepared sample: {path}") from exc
+
+    def _write_prepared_sample(
+        self,
+        path: Path,
+        *,
+        index: int,
+        tensors: Mapping[str, Tensor],
+    ) -> None:
+        payload = {
+            "schema_version": _PREPARED_CACHE_SCHEMA_VERSION,
+            "cache_key": self._prepared_cache_key,
+            "sample_index": index,
+            "tensors": {name: value.contiguous() for name, value in tensors.items()},
+        }
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            torch.save(payload, temporary)
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _build_prepared_sample(self, index: int) -> dict[str, Tensor]:
+        sample = self.manifest["samples"][index]
+        rgb_uint8 = torch.stack(
             [
-                self._load_rgb(self._path(relative, "rgb_context_path"))
+                self._load_rgb_uint8(self._path(relative, "rgb_context_path"))
                 for relative in sample["rgb_context_paths"]
             ]
         )
@@ -334,9 +594,13 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             resample=Image.Resampling.NEAREST,
         )
         source_labels = np.asarray(semantic_image, dtype=np.uint8)
-        segmentation = np.full(source_labels.shape, SANPO_SEGMENTATION_IGNORE_INDEX, dtype=np.int64)
+        segmentation = np.full(
+            source_labels.shape,
+            SANPO_SEGMENTATION_IGNORE_INDEX,
+            dtype=np.uint8,
+        )
         valid_semantic = (source_labels >= 1) & (source_labels <= 30)
-        segmentation[valid_semantic] = source_labels[valid_semantic].astype(np.int64) - 1
+        segmentation[valid_semantic] = source_labels[valid_semantic] - 1
 
         depth_path = self._path(sample["depth_path"], "depth_path")
         source_depth = read_sanpo_depth(depth_path)
@@ -379,21 +643,54 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             raise ValueError(
                 "panoptic mask and derived detection target have different source sizes"
             )
-        detection_target = {
+        return {
+            "rgb_uint8": rgb_uint8,
+            "segmentation_uint8": torch.from_numpy(segmentation),
+            # SANPO source values are float16. Nearest-neighbour resize only
+            # selects those exact values, so float16 cache storage is lossless.
+            "depth_float16": torch.from_numpy(depth).to(torch.float16).unsqueeze(0),
+            "depth_valid": torch.from_numpy(depth_valid.copy()).unsqueeze(0),
             "boxes": _scale_boxes(detection["boxes"], detection["valid_size"], self.image_size),
             "labels": torch.as_tensor(detection["labels"], dtype=torch.int64),
-            "valid_size": self.image_size,
             "ignore_boxes": _scale_boxes(
                 detection["ignore_boxes"], detection["valid_size"], self.image_size
             ),
         }
 
+    def _prepared_sample(self, index: int) -> dict[str, Tensor]:
+        cache_path = self._prepared_cache_path(index)
+        if cache_path is not None and cache_path.is_file():
+            try:
+                return self._read_prepared_sample(cache_path, index=index)
+            except ValueError:
+                # The cache is derived, local, and replaceable. The immutable
+                # archive remains authoritative when a cache file is damaged.
+                pass
+        tensors = self._build_prepared_sample(index)
+        if cache_path is not None:
+            self._write_prepared_sample(cache_path, index=index, tensors=tensors)
+        return tensors
+
+    def __getitem__(self, index: int) -> tuple[Tensor, dict[str, Any]]:
+        tensors = self._prepared_sample(index)
+        clip = tensors["rgb_uint8"].permute(0, 3, 1, 2).float().div_(255.0)
+        if self.normalize:
+            clip = (clip - self._mean) / self._std
+        segmentation = tensors["segmentation_uint8"].to(torch.int64)
+        segmentation_valid = segmentation != SANPO_SEGMENTATION_IGNORE_INDEX
+        detection_target = {
+            "boxes": tensors["boxes"],
+            "labels": tensors["labels"],
+            "valid_size": self.image_size,
+            "ignore_boxes": tensors["ignore_boxes"],
+        }
+
         targets: dict[str, Any] = {
             "detection": detection_target,
-            "segmentation": torch.from_numpy(segmentation),
-            "segmentation_valid": torch.from_numpy(valid_semantic.copy()),
-            "depth": torch.from_numpy(depth).unsqueeze(0),
-            "depth_valid": torch.from_numpy(depth_valid.copy()).unsqueeze(0),
+            "segmentation": segmentation,
+            "segmentation_valid": segmentation_valid,
+            "depth": tensors["depth_float16"].to(torch.float32),
+            "depth_valid": tensors["depth_valid"],
         }
         return clip, targets
 

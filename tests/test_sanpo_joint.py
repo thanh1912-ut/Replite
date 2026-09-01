@@ -11,6 +11,7 @@ import pytest
 import torch
 from PIL import Image
 
+import replite.data.sanpo_joint as sanpo_joint_module
 from replite.data import (
     SANPO_SEGMENTATION_CLASS_NAMES,
     SanpoJointDataset,
@@ -340,6 +341,117 @@ def test_collate_keeps_detection_targets_as_list(tmp_path: Path) -> None:
     assert len(targets["detection"]) == 2
     assert targets["segmentation"].shape == (2, 8, 16)
     assert targets["depth"].shape == (2, 1, 8, 16)
+
+
+def _assert_joint_sample_equal(
+    first: tuple[torch.Tensor, dict[str, object]],
+    second: tuple[torch.Tensor, dict[str, object]],
+) -> None:
+    torch.testing.assert_close(first[0], second[0], rtol=0, atol=0)
+    first_targets, second_targets = first[1], second[1]
+    assert set(first_targets) == set(second_targets)
+    for name in ("segmentation", "segmentation_valid", "depth", "depth_valid"):
+        torch.testing.assert_close(
+            first_targets[name],  # type: ignore[arg-type]
+            second_targets[name],  # type: ignore[arg-type]
+            rtol=0,
+            atol=0,
+        )
+    first_detection = first_targets["detection"]
+    second_detection = second_targets["detection"]
+    assert isinstance(first_detection, dict)
+    assert isinstance(second_detection, dict)
+    assert first_detection["valid_size"] == second_detection["valid_size"]
+    for name in ("boxes", "labels", "ignore_boxes"):
+        torch.testing.assert_close(
+            first_detection[name],
+            second_detection[name],
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("include_detection", [False, True])
+def test_prepared_cache_is_bit_exact_and_avoids_redecoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    normalize: bool,
+    include_detection: bool,
+) -> None:
+    manifest = _build_session(
+        tmp_path / "source",
+        include_detection=include_detection,
+    )
+    kwargs = {
+        "image_size": (8, 16),
+        "detection_min_area": 1,
+        "normalize": normalize,
+    }
+    expected = SanpoJointDataset(manifest, **kwargs)[0]
+    calls = 0
+    original = sanpo_joint_module.sanpo_panoptic_to_detection
+
+    def counted(*args: object, **call_kwargs: object):
+        nonlocal calls
+        calls += 1
+        return original(*args, **call_kwargs)
+
+    monkeypatch.setattr(
+        sanpo_joint_module,
+        "sanpo_panoptic_to_detection",
+        counted,
+    )
+    cache_root = tmp_path / "prepared"
+    first_dataset = SanpoJointDataset(
+        manifest,
+        prepared_cache_dir=cache_root,
+        **kwargs,
+    )
+    first = first_dataset[0]
+    first_calls = calls
+    assert first_calls == (0 if include_detection else 1)
+    _assert_joint_sample_equal(expected, first)
+
+    cache_file = next(first_dataset.prepared_cache_dir.glob("*.pt"))  # type: ignore[union-attr]
+    payload = torch.load(cache_file, map_location="cpu", weights_only=True)
+    assert payload["tensors"]["rgb_uint8"].dtype == torch.uint8
+    assert payload["tensors"]["segmentation_uint8"].dtype == torch.uint8
+    assert payload["tensors"]["depth_float16"].dtype == torch.float16
+
+    second_dataset = SanpoJointDataset(
+        manifest,
+        prepared_cache_dir=cache_root,
+        **kwargs,
+    )
+    monkeypatch.setattr(
+        second_dataset,
+        "_build_prepared_sample",
+        lambda index: (_ for _ in ()).throw(AssertionError(index)),
+    )
+    second = second_dataset[0]
+    assert calls == first_calls
+    _assert_joint_sample_equal(expected, second)
+
+
+def test_corrupt_prepared_cache_is_atomically_rebuilt(tmp_path: Path) -> None:
+    manifest = _build_session(tmp_path / "source", include_detection=False)
+    dataset = SanpoJointDataset(
+        manifest,
+        image_size=(8, 16),
+        detection_min_area=1,
+        normalize=False,
+        prepared_cache_dir=tmp_path / "prepared",
+    )
+    expected = dataset[0]
+    cache_file = next(dataset.prepared_cache_dir.glob("*.pt"))  # type: ignore[union-attr]
+    cache_file.write_bytes(b"interrupted local cache")
+
+    repaired = dataset[0]
+
+    _assert_joint_sample_equal(expected, repaired)
+    payload = torch.load(cache_file, map_location="cpu", weights_only=True)
+    assert payload["cache_key"] == dataset._prepared_cache_key
 
 
 def test_manifest_rejects_path_traversal(tmp_path: Path) -> None:

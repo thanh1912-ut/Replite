@@ -185,6 +185,20 @@ def load_campaign(filename: str | os.PathLike[str]) -> tuple[Path, dict[str, Any
             "data.detection_min_component_pixels must be 100 for the locked "
             "SANPO derived-detection protocol"
         )
+    subset_fields = (
+        "fit_session_count",
+        "validation_session_count",
+        "official_test_session_count",
+    )
+    subset_values = tuple(value["data"].get(field) for field in subset_fields)
+    if any(item is not None for item in subset_values) and any(
+        isinstance(item, bool) or not isinstance(item, int) or item < 1
+        for item in subset_values
+    ):
+        raise ValueError(
+            "data.fit_session_count, data.validation_session_count, and "
+            "data.official_test_session_count must all be positive integers"
+        )
     return path, value
 
 
@@ -254,8 +268,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
     if not data_root.is_dir():
         raise FileNotFoundError(f"SANPO data root is missing: {data_root}")
     print(
-        "[prepare] 1/3 metadata catalog từ Drive "
-        "(không stat 234 archive/sidecar)",
+        "[prepare] 1/3 metadata catalog từ Drive " "(không stat 234 archive/sidecar)",
         flush=True,
     )
     catalog = load_archive_catalog(
@@ -275,11 +288,36 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         flush=True,
     )
     seed = int(config["data"]["split_seed"])
-    fraction = float(config["data"]["validation_fraction"])
-    session_limit = config["data"].get("official_train_session_limit")
-    train_session_count = len(
-        {record.session_id for record in catalog.train_records}
+    fit_session_count = config["data"].get("fit_session_count")
+    validation_session_count = config["data"].get("validation_session_count")
+    official_test_session_count = config["data"].get("official_test_session_count")
+    exact_counts = (
+        fit_session_count,
+        validation_session_count,
+        official_test_session_count,
     )
+    exact_subset = any(value is not None for value in exact_counts)
+    if exact_subset:
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in exact_counts
+        ):
+            raise ValueError(
+                "data.fit_session_count, data.validation_session_count, and "
+                "data.official_test_session_count must all be positive integers"
+            )
+        session_limit = int(fit_session_count) + int(validation_session_count)
+        fraction = int(validation_session_count) / session_limit
+        legacy_limit = config["data"].get("official_train_session_limit")
+        if legacy_limit is not None and legacy_limit != session_limit:
+            raise ValueError(
+                "data.official_train_session_limit conflicts with the explicit "
+                "fit plus validation session counts"
+            )
+    else:
+        fraction = float(config["data"]["validation_fraction"])
+        session_limit = config["data"].get("official_train_session_limit")
+    train_session_count = len({record.session_id for record in catalog.train_records})
     if session_limit is not None and (
         isinstance(session_limit, bool)
         or not isinstance(session_limit, int)
@@ -291,27 +329,40 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
             f"{train_session_count}"
         )
     basis_points = round(fraction * 10_000)
-    split_name = (
-        f"replite_main_split_seed{seed}_val{basis_points:04d}_v2.json"
-        if session_limit is None
-        else (
+    if exact_subset:
+        split_name = (
+            f"replite_main_split_seed{seed}_fit{int(fit_session_count):03d}_"
+            f"val{int(validation_session_count):03d}_"
+            f"test{int(official_test_session_count):03d}_hash_v1.json"
+        )
+    elif session_limit is None:
+        split_name = f"replite_main_split_seed{seed}_val{basis_points:04d}_v2.json"
+    else:
+        split_name = (
             f"replite_main_split_seed{seed}_val{basis_points:04d}_"
             f"sessions{session_limit:03d}_lexicographic_v1.json"
         )
-    )
     split = create_or_load_group_split(
         catalog,
         data_root / "metadata" / split_name,
         seed=seed,
         validation_fraction=fraction,
         session_limit=session_limit,
+        validation_session_count=(
+            int(validation_session_count) if exact_subset else None
+        ),
+        official_test_session_limit=(
+            int(official_test_session_count) if exact_subset else None
+        ),
     )
     train_sessions = {item.session_id for item in split.train_records}
     val_sessions = {item.session_id for item in split.validation_records}
     if train_sessions & val_sessions:
         raise AssertionError("train/validation session leakage")
-    if split.official_test_records != catalog.test_records:
-        raise AssertionError("official-test identity changed during split creation")
+    catalog_test_keys = {item.key for item in catalog.test_records}
+    selected_test_keys = {item.key for item in split.official_test_records}
+    if not selected_test_keys or not selected_test_keys <= catalog_test_keys:
+        raise AssertionError("official-test holdout is not a catalog subset")
     selected_records = _selected_official_train_records(catalog, split)
     if {item.key for item in selected_records} != {
         item.key for item in (*split.train_records, *split.validation_records)
@@ -323,11 +374,23 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
             raise AssertionError("full campaign no longer covers official train")
     elif len(selected_sessions) != session_limit:
         raise AssertionError("session-limited campaign selected the wrong count")
+    if exact_subset:
+        if len(train_sessions) != fit_session_count:
+            raise AssertionError("exact campaign selected the wrong fit count")
+        if len(val_sessions) != validation_session_count:
+            raise AssertionError("exact campaign selected the wrong validation count")
+        test_sessions = {item.session_id for item in split.official_test_records}
+        if len(test_sessions) != official_test_session_count:
+            raise AssertionError(
+                "exact campaign selected the wrong official-test count"
+            )
+        if (train_sessions | val_sessions) & test_sessions:
+            raise AssertionError("official-test leaked into fit or validation")
     print(
         f"[prepare] 3/3 split OK | selected={len(selected_sessions)} sessions, "
         f"{len(selected_records)} shards | fit={len(split.train_records)} shards | "
         f"inner-val={len(split.validation_records)} shards | "
-        f"official-test={len(split.official_test_records)}",
+        f"reserved-test={len(split.official_test_records)} shards",
         flush=True,
     )
 
@@ -381,10 +444,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         raise ValueError("data.local_staging.reserve_gib must be non-negative")
     train_stage = LocalArchiveStage(
         catalog.train_records,
-        local_root=local_root
-        / "stages"
-        / stage_cache_id
-        / "official_train",
+        local_root=local_root / "stages" / stage_cache_id / "official_train",
         purpose="official_train",
         expansion_factor=float(expansion_factor),
         reserve_bytes=math.ceil(float(reserve_gib) * 1024**3),
@@ -401,9 +461,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         "dataset_kwargs": {
             "depth_min": float(config["data"]["depth_min_metres"]),
             "depth_max": float(config["data"]["depth_max_metres"]),
-            "detection_min_area": int(
-                config["data"]["detection_min_component_pixels"]
-            ),
+            "detection_min_area": int(config["data"]["detection_min_component_pixels"]),
             "normalize": True,
         },
         "local_stage": train_stage,
@@ -428,7 +486,9 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
     )
 
 
-def model_config(prepared: Prepared, *, pretrained: bool | None = None) -> RepLiteConfig:
+def model_config(
+    prepared: Prepared, *, pretrained: bool | None = None
+) -> RepLiteConfig:
     source = prepared.config["model"]
     return RepLiteConfig(
         tasks=TaskConfig(
@@ -500,9 +560,7 @@ def create_optimizer_schedule(
         backbone_lr_multiplier=float(train["backbone_lr_multiplier"]),
     )
     trainer_config = create_trainer_config(prepared)
-    updates = math.ceil(
-        len(prepared.train_loader) / trainer_config.grad_accum_steps
-    )
+    updates = math.ceil(len(prepared.train_loader) / trainer_config.grad_accum_steps)
     total = updates * trainer_config.epochs
     warmup = min(total, max(0, round(total * float(train["warmup_fraction"]))))
     scheduler = WarmupCosineScheduler(
@@ -532,9 +590,7 @@ def create_metrics(prepared: Prepared) -> MultiTaskMetrics:
         ),
         detection_reg_max=model_config(prepared).detection_reg_max,
         detection_score_threshold=float(metric["detection_score_threshold"]),
-        detection_nms_iou_threshold=float(
-            metric["detection_nms_iou_threshold"]
-        ),
+        detection_nms_iou_threshold=float(metric["detection_nms_iou_threshold"]),
     )
 
 
@@ -578,9 +634,7 @@ def build_train_objects(
         validation_metrics=create_metrics(prepared),
         checkpoint_extra=prepared.checkpoint_extra,
         event_callback=YoloProgressReporter(
-            every_n_steps=int(
-                prepared.config["train"]["progress_every_n_steps"]
-            ),
+            every_n_steps=int(prepared.config["train"]["progress_every_n_steps"]),
             reg_max=model_config(prepared).detection_reg_max,
         ),
     )
@@ -608,15 +662,11 @@ def build_train_objects(
 
 def _parameter_summary(model: nn.Module) -> dict[str, Any]:
     total = sum(item.numel() for item in model.parameters())
-    trainable = sum(
-        item.numel() for item in model.parameters() if item.requires_grad
-    )
+    trainable = sum(item.numel() for item in model.parameters() if item.requires_grad)
     modules = []
     for name, module in model.named_children():
         count = sum(item.numel() for item in module.parameters())
-        active = sum(
-            item.numel() for item in module.parameters() if item.requires_grad
-        )
+        active = sum(item.numel() for item in module.parameters() if item.requires_grad)
         modules.append(
             {
                 "module": name,
@@ -634,25 +684,17 @@ def _parameter_summary(model: nn.Module) -> dict[str, Any]:
     }
 
 
-def _table(
-    title: str, headers: Sequence[str], rows: Sequence[Sequence[Any]]
-) -> None:
+def _table(title: str, headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
     text = [[str(value) for value in row] for row in rows]
     widths = [len(name) for name in headers]
     for row in text:
         for index, value in enumerate(row):
             widths[index] = max(widths[index], len(value))
     print(f"\n========== {title} ==========")
-    print(
-        "  ".join(name.ljust(widths[index]) for index, name in enumerate(headers))
-    )
+    print("  ".join(name.ljust(widths[index]) for index, name in enumerate(headers)))
     print("  ".join("-" * width for width in widths))
     for row in text:
-        print(
-            "  ".join(
-                value.ljust(widths[index]) for index, value in enumerate(row)
-            )
-        )
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
 
 
 def _print_execution_plan(
@@ -664,6 +706,14 @@ def _print_execution_plan(
     accumulate = objects.config.grad_accum_steps
     train_batches = len(prepared.train_loader)
     val_batches = len(prepared.val_loader)
+    batch_size = int(prepared.config["data"]["batch_size"])
+    holdout_samples = sum(
+        item.joint_frames for item in prepared.split.official_test_records
+    )
+    holdout_batches = sum(
+        math.ceil(item.joint_frames / batch_size)
+        for item in prepared.split.official_test_records
+    )
     updates = math.ceil(train_batches / accumulate)
     print("\n========== TRAIN / VALIDATION PLAN ==========")
     print(
@@ -678,6 +728,13 @@ def _print_execution_plan(
         f"optimizer={updates:,} updates/epoch | "
         f"validation={prepared.val_loader.sample_count:,} samples, "
         f"{val_batches:,} batches/epoch"
+    )
+    print(
+        f"sessions fit={len({item.session_id for item in prepared.split.train_records})} | "
+        f"validation={len({item.session_id for item in prepared.split.validation_records})} | "
+        f"official-test holdout={len({item.session_id for item in prepared.split.official_test_records})} "
+        f"({holdout_samples:,} samples, {holdout_batches:,} future batches; "
+        "NOT LOADED during train/validation)"
     )
     print(
         f"campaign optimizer updates={objects.total_steps:,} | "
@@ -699,6 +756,18 @@ def inspection_payload(
         prepared.catalog, prepared.split
     )
     selected_sessions = train_sessions | val_sessions
+    test_sessions = {item.session_id for item in prepared.split.official_test_records}
+    official_test_samples = sum(
+        item.joint_frames for item in prepared.split.official_test_records
+    )
+    batch_size = int(prepared.config["data"]["batch_size"])
+    official_test_batches = sum(
+        math.ceil(item.joint_frames / batch_size)
+        for item in prepared.split.official_test_records
+    )
+    split_manifest = json.loads(
+        prepared.split.manifest_path.read_text(encoding="utf-8")
+    )
     return {
         "schema_version": 1,
         "protocol_id": PROTOCOL_ID,
@@ -714,10 +783,26 @@ def inspection_payload(
             "selected_official_train_session_ids": sorted(selected_sessions),
             "train_session_ids": sorted(train_sessions),
             "validation_session_ids": sorted(val_sessions),
+            "official_test_session_ids_reserved": sorted(test_sessions),
+            "fit_session_count_locked": prepared.config["data"].get(
+                "fit_session_count"
+            ),
+            "validation_session_count_locked": prepared.config["data"].get(
+                "validation_session_count"
+            ),
+            "official_test_session_count_locked": prepared.config["data"].get(
+                "official_test_session_count"
+            ),
             "official_train_session_limit": prepared.config["data"].get(
                 "official_train_session_limit"
             ),
-            "session_selection_ordering": "lexicographic session_id",
+            "session_selection_ordering": split_manifest.get(
+                "session_selection_ordering",
+                split_manifest["ordering"],
+            ),
+            "official_test_selection_ordering": split_manifest.get(
+                "official_test_selection_ordering"
+            ),
             "annotation_policy": prepared.catalog.annotation_policy,
             "detection_config_sha256": prepared.catalog.detection_config_sha256,
             "train_archives": len(prepared.split.train_records),
@@ -725,11 +810,16 @@ def inspection_payload(
             "official_test_archives_reserved": len(
                 prepared.split.official_test_records
             ),
+            "official_test_pool_archives": len(prepared.catalog.test_records),
+            "official_test_pool_sessions": len(
+                {item.session_id for item in prepared.catalog.test_records}
+            ),
             "train_sessions": len(train_sessions),
             "val_sessions": len(val_sessions),
             "train_samples": prepared.train_loader.sample_count,
             "val_samples": prepared.val_loader.sample_count,
-            "official_test_samples_reserved": EXPECTED["test_frames"],
+            "official_test_samples_reserved": official_test_samples,
+            "official_test_batches_reserved": official_test_batches,
             "official_test_used": False,
             "local_stage_cache_id": prepared.config["data"]
             .get("local_staging", {})
@@ -742,8 +832,7 @@ def inspection_payload(
             ],
             "detection_archive_sources": {
                 source: sum(
-                    item.detection_source == source
-                    for item in selected_records
+                    item.detection_source == source for item in selected_records
                 )
                 for source in ("packaged_json", "panoptic_on_load")
             },
@@ -803,7 +892,8 @@ def inspection_payload(
             "archive_policy": (
                 f"stage only {len(selected_records)} selected official-train "
                 "shards from the full 186-shard SSD cache; reuse for fit and "
-                "inner-validation; official-test deferred"
+                "inner-validation; one hash-selected official-test session is "
+                "deferred until the completed campaign"
             ),
             "train_stage": prepared.train_stage.disk_plan(selected_records),
         },
@@ -846,16 +936,18 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
                 "metrics + best",
             ),
             (
-                "official-test",
-                result["data"]["official_test_archives_reserved"],
-                len(
-                    {
-                        item.session_id
-                        for item in prepared.split.official_test_records
-                    }
-                ),
+                "official-test pool",
+                result["data"]["official_test_pool_archives"],
+                result["data"]["official_test_pool_sessions"],
                 EXPECTED["test_frames"],
-                "RESERVED, not opened",
+                "audited source; never used for fit/val/best",
+            ),
+            (
+                "official-test holdout",
+                result["data"]["official_test_archives_reserved"],
+                len({item.session_id for item in prepared.split.official_test_records}),
+                result["data"]["official_test_samples_reserved"],
+                "1 session RESERVED; stage only after training",
             ),
         ),
     )
@@ -865,16 +957,25 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
         tuple(
             (
                 session_id,
-                "train" if session_id in {
-                    item.session_id for item in prepared.split.train_records
-                } else "val",
+                (
+                    "train"
+                    if session_id
+                    in {item.session_id for item in prepared.split.train_records}
+                    else "val"
+                ),
                 sum(
                     item.session_id == session_id
-                    for item in (*prepared.split.train_records, *prepared.split.validation_records)
+                    for item in (
+                        *prepared.split.train_records,
+                        *prepared.split.validation_records,
+                    )
                 ),
                 sum(
                     item.joint_frames
-                    for item in (*prepared.split.train_records, *prepared.split.validation_records)
+                    for item in (
+                        *prepared.split.train_records,
+                        *prepared.split.validation_records,
+                    )
                     if item.session_id == session_id
                 ),
             )
@@ -949,8 +1050,18 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
         "TRAINING PLAN (EXACT)",
         ("item", "value"),
         (
+            ("fit sessions", result["data"]["train_sessions"]),
+            ("validation sessions", result["data"]["val_sessions"]),
+            (
+                "official-test holdout sessions",
+                len({item.session_id for item in prepared.split.official_test_records}),
+            ),
             ("train samples", f"{result['data']['train_samples']:,}"),
             ("validation samples", f"{result['data']['val_samples']:,}"),
+            (
+                "official-test holdout samples",
+                f"{result['data']['official_test_samples_reserved']:,}",
+            ),
             ("micro batch / GPU", schedule["micro_batch_size"]),
             ("gradient accumulation", schedule["grad_accum_steps"]),
             ("effective batch", schedule["effective_batch_size"]),
@@ -960,6 +1071,10 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
                 f"{schedule['optimizer_updates_per_epoch']:,}",
             ),
             ("validation batches / epoch", f"{schedule['val_batches']:,}"),
+            (
+                "official-test future batches",
+                f"{result['data']['official_test_batches_reserved']:,}",
+            ),
             ("epochs", schedule["epochs"]),
             ("total optimizer updates", f"{schedule['total_steps']:,}"),
             ("warmup updates", f"{schedule['warmup_steps']:,}"),
@@ -979,9 +1094,7 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
     print(json.dumps(result["pretrained"], indent=2, ensure_ascii=False))
     print("\nCONTEXT HASHES")
     print(json.dumps(result["context"], indent=2))
-    output = (
-        prepared.local_root / "inspections" / f"{prepared.config['run_id']}.json"
-    )
+    output = prepared.local_root / "inspections" / f"{prepared.config['run_id']}.json"
     _atomic_json(output, result)
     print("\nInspection JSON:", output)
     print(
@@ -1044,6 +1157,27 @@ def _finish_preflight_optimizer_step(
     return stepped, connected, nonfinite, old_scale, new_scale
 
 
+AMP_PREFLIGHT_SAFETY_BACKOFFS = 2
+
+
+def _production_amp_scale(
+    proven_scale: float,
+    *,
+    safety_backoffs: int = AMP_PREFLIGHT_SAFETY_BACKOFFS,
+) -> float:
+    """Apply a recorded power-of-two margin to a one-batch proven scale."""
+
+    if not math.isfinite(float(proven_scale)) or float(proven_scale) < 1.0:
+        raise ValueError("proven AMP scale must be finite and at least one")
+    if (
+        isinstance(safety_backoffs, bool)
+        or not isinstance(safety_backoffs, int)
+        or safety_backoffs < 0
+    ):
+        raise ValueError("AMP safety backoffs must be a non-negative integer")
+    return max(1.0, float(proven_scale) / float(2**safety_backoffs))
+
+
 def disposable_preflight(prepared: Prepared) -> dict[str, Any]:
     """Use a throwaway model so production BN buffers and RNG stay pristine."""
 
@@ -1093,9 +1227,7 @@ def disposable_preflight(prepared: Prepared) -> dict[str, Any]:
         if nonfinite_gradients:
             if not scaler.is_enabled():
                 names = ", ".join(nonfinite_gradients[:8])
-                raise FloatingPointError(
-                    "preflight gradients are non-finite: " + names
-                )
+                raise FloatingPointError("preflight gradients are non-finite: " + names)
             overflow_attempts.append(
                 {
                     "scale": old_scale,
@@ -1120,28 +1252,21 @@ def disposable_preflight(prepared: Prepared) -> dict[str, Any]:
             continue
 
         if scaler.is_enabled() and not stepped:
-            raise RuntimeError(
-                "GradScaler skipped a finite-gradient preflight update"
-            )
+            raise RuntimeError("GradScaler skipped a finite-gradient preflight update")
         # ``old_scale`` is the scale actually proven finite by this attempt;
         # a growth-interval update could make ``new_scale`` larger but untested.
         stable_scale = old_scale
         break
+    production_scale = _production_amp_scale(stable_scale)
     if device.type == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
-    peak = (
-        torch.cuda.max_memory_allocated() / 1024**3
-        if device.type == "cuda"
-        else 0.0
-    )
+    peak = torch.cuda.max_memory_allocated() / 1024**3 if device.type == "cuda" else 0.0
     result = {
         "input_shape": list(inputs.shape),
         "segmentation_shape": list(outputs.segmentation.shape),
         "depth_shape": list(outputs.depth.shape),
-        "detection_levels": [
-            list(item.shape) for item in outputs.detection.cls_logits
-        ],
+        "detection_levels": [list(item.shape) for item in outputs.detection.cls_logits],
         "losses": {
             name: float(value.detach().float().cpu())
             for name, value in losses.items()
@@ -1150,6 +1275,9 @@ def disposable_preflight(prepared: Prepared) -> dict[str, Any]:
         "optimizer_stepped": stepped,
         "amp_initial_scale": initial_scale,
         "amp_stable_scale": stable_scale,
+        "amp_production_scale": production_scale,
+        "amp_safety_backoff_count": AMP_PREFLIGHT_SAFETY_BACKOFFS,
+        "amp_safety_margin_factor": 2**AMP_PREFLIGHT_SAFETY_BACKOFFS,
         "amp_backoff_count": len(overflow_attempts),
         "amp_overflow_attempts": overflow_attempts,
         "elapsed_seconds": elapsed,
@@ -1172,7 +1300,11 @@ def _state_sha256(model: nn.Module) -> str:
         digest.update(name.encode())
         digest.update(str(value.dtype).encode())
         digest.update(str(tuple(value.shape)).encode())
-        digest.update(value.view(torch.uint8).numpy().tobytes())
+        # ``state_dict`` contains scalar integer buffers such as BatchNorm's
+        # ``num_batches_tracked``.  A dtype-changing view of a zero-dimensional
+        # tensor is invalid in PyTorch, so flatten first while preserving the
+        # exact contiguous byte representation used by the digest.
+        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
@@ -1211,9 +1343,7 @@ def _write_reports(
         raise ValueError("epoch record has no full validation result")
     _atomic_json(prepared.local_run / "latest_val_metrics.json", dict(val))
     detection = detection_per_class_rows(val, SANPO_DETECTION_CLASS_NAMES)
-    segmentation = segmentation_per_class_rows(
-        val, SANPO_SEGMENTATION_CLASS_NAMES
-    )
+    segmentation = segmentation_per_class_rows(val, SANPO_SEGMENTATION_CLASS_NAMES)
     _write_csv(
         prepared.local_run / "val_detection_per_class.csv",
         detection,
@@ -1229,20 +1359,14 @@ def _write_reports(
         matrix = _jsonable(matrix)
         fields = (
             "actual_class",
-            *[
-                str(index)
-                for index in range(len(SANPO_SEGMENTATION_CLASS_NAMES))
-            ],
+            *[str(index) for index in range(len(SANPO_SEGMENTATION_CLASS_NAMES))],
         )
         _write_csv(
             prepared.local_run / "val_segmentation_confusion_matrix.csv",
             [
                 {
                     "actual_class": index,
-                    **{
-                        str(column): count
-                        for column, count in enumerate(row)
-                    },
+                    **{str(column): count for column, count in enumerate(row)},
                 }
                 for index, row in enumerate(matrix)
             ],
@@ -1250,9 +1374,7 @@ def _write_reports(
         )
 
 
-def _write_metadata(
-    prepared: Prepared, inspection: Mapping[str, Any]
-) -> None:
+def _write_metadata(prepared: Prepared, inspection: Mapping[str, Any]) -> None:
     prepared.local_run.mkdir(parents=True, exist_ok=True)
     _atomic_json(prepared.local_run / "resolved_config.json", prepared.config)
     _atomic_json(
@@ -1427,11 +1549,7 @@ def _publish_gate(prepared: Prepared, gate: Mapping[str, Any]) -> None:
 def _load_cached_inspection(prepared: Prepared) -> dict[str, Any] | None:
     """Reuse Cell 3's context-bound audit instead of printing it again."""
 
-    path = (
-        prepared.local_root
-        / "inspections"
-        / f"{prepared.config['run_id']}.json"
-    )
+    path = prepared.local_root / "inspections" / f"{prepared.config['run_id']}.json"
     if not path.is_file():
         return None
     try:
@@ -1439,9 +1557,7 @@ def _load_cached_inspection(prepared: Prepared) -> dict[str, Any] | None:
     except (OSError, UnicodeError, json.JSONDecodeError):
         print("Cached inspection is unreadable; rebuilding:", path)
         return None
-    required = {
-        "data", "model_config", "pretrained", "parameters", "schedule"
-    }
+    required = {"data", "model_config", "pretrained", "parameters", "schedule"}
     if (
         not isinstance(value, dict)
         or value.get("schema_version") != 1
@@ -1461,7 +1577,9 @@ def _duration(seconds: float | None) -> str:
     rounded = int(round(seconds))
     hours, remainder = divmod(rounded, 3600)
     minutes, secs = divmod(remainder, 60)
-    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+    return (
+        f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+    )
 
 
 def _progress_bar(fraction: float, width: int = 18) -> str:
@@ -1520,13 +1638,17 @@ class StageProgressReporter:
         newly_ready = max(0, ready_bytes - self.new_ready_start)
         rate = newly_ready / elapsed if elapsed > 0 and newly_ready > 0 else 0.0
         remaining_bytes = max(0, total_bytes - ready_bytes)
-        eta = 0.0 if remaining_bytes == 0 else (
-            remaining_bytes / rate if rate > 0 else None
+        eta = (
+            0.0
+            if remaining_bytes == 0
+            else (remaining_bytes / rate if rate > 0 else None)
         )
         record = payload.get("record")
         current = "-"
         if record is not None:
-            current = f"{record.session_id[:12]}/{record.sensor.removeprefix('camera_')}"
+            current = (
+                f"{record.session_id[:12]}/{record.sensor.removeprefix('camera_')}"
+            )
         phase = str(payload.get("phase") or payload.get("status") or "ready")
         phase_text = phase
         event = payload.get("event")
@@ -1543,7 +1665,11 @@ class StageProgressReporter:
         completed = payload.get("bytes_completed")
         phase_total = payload.get("bytes_total")
         phase_speed = "--"
-        if isinstance(completed, int) and isinstance(phase_total, int) and phase_total > 0:
+        if (
+            isinstance(completed, int)
+            and isinstance(phase_total, int)
+            and phase_total > 0
+        ):
             phase_fraction = min(1.0, completed / phase_total)
             phase_text = f"{phase} {phase_fraction * 100:5.1f}%"
             phase_elapsed = now - self.phase_started
@@ -1616,6 +1742,73 @@ class StageProgressReporter:
             self._print(f"Stage complete in {_duration(now - self.wall_started)}")
 
 
+class PreparedCacheProgressReporter:
+    """Newline-safe progress rows for the one-time CPU preprocessing pass."""
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        interval_seconds: float = 2.0,
+        clock=time.perf_counter,
+    ) -> None:
+        self.label = label
+        self.interval_seconds = float(interval_seconds)
+        self.clock = clock
+        self.started = 0.0
+        self.last_rendered = 0.0
+
+    def __call__(self, payload: Mapping[str, Any]) -> None:
+        event = payload.get("event")
+        now = float(self.clock())
+        if event == "cache_warm_start":
+            self.started = now
+            self.last_rendered = now
+            pending_gib = int(payload["estimated_pending_bytes"]) / 1024**3
+            free_gib = int(payload["available_free_bytes"]) / 1024**3
+            print(
+                f"\nCACHE {self.label} | samples={int(payload['sample_count']):,} | "
+                f"pending≈{pending_gib:.2f} GiB | free={free_gib:.1f} GiB",
+                flush=True,
+            )
+            print(
+                "Cache          Batch    Progress   Samples/s      ETA",
+                flush=True,
+            )
+            return
+        if event == "cache_warm_progress":
+            batch_index = int(payload["batch_index"])
+            total_batches = int(payload["total_batches"])
+            completed = int(payload["completed_samples"])
+            sample_count = int(payload["sample_count"])
+            if (
+                batch_index not in {1, total_batches}
+                and now - self.last_rendered < self.interval_seconds
+            ):
+                return
+            elapsed = max(now - self.started, 1e-9)
+            speed = completed / elapsed
+            remaining = max(sample_count - completed, 0)
+            eta = remaining / speed if speed > 0 else math.inf
+            fraction = completed / max(sample_count, 1)
+            print(
+                f"{self.label:14.14s} {batch_index:4d}/{total_batches:<4d} "
+                f"{fraction * 100:7.1f}% {speed:10.2f} {_duration(eta):>8s}",
+                flush=True,
+            )
+            self.last_rendered = now
+            return
+        if event == "cache_warm_end":
+            elapsed = max(now - self.started, 0.0)
+            cached_gib = int(payload["cached_bytes"]) / 1024**3
+            print(
+                f"CACHE {self.label} READY | "
+                f"{int(payload['ready_samples']):,}/{int(payload['sample_count']):,} "
+                f"samples | {cached_gib:.2f} GiB | {_duration(elapsed)}",
+                flush=True,
+            )
+
+
 def _print_stage_plan(title: str, plan: Mapping[str, Any]) -> None:
     print(f"\n========== {title} ==========")
     print(
@@ -1632,7 +1825,7 @@ def _print_stage_plan(title: str, plan: Mapping[str, Any]) -> None:
 
 
 def stage_official_train(filename: str | os.PathLike[str]) -> dict[str, Any]:
-    """Copy, verify, and extract official-train once for all later epochs."""
+    """Stage and precompute the selected fit/validation samples on local SSD."""
 
     prepared = prepare(filename)
     selected = _selected_official_train_records(prepared.catalog, prepared.split)
@@ -1645,10 +1838,23 @@ def stage_official_train(filename: str | os.PathLike[str]) -> dict[str, Any]:
     if result.get("complete") is not True:
         raise RuntimeError("official-train SSD stage did not complete")
     print(
-        "\nTRAIN STAGE READY | "
+        "\nARCHIVE STAGE READY | "
         f"{result['completed_count']}/{result['record_count']} shards | "
         f"{int(result['completed_extracted_bytes']) / 1024**3:.2f} GiB | "
         f"{prepared.train_stage.local_root}"
+    )
+    train_cache = prepared.train_loader.warm_prepared_cache(
+        on_event=PreparedCacheProgressReporter("fit")
+    )
+    validation_cache = prepared.val_loader.warm_prepared_cache(
+        on_event=PreparedCacheProgressReporter("validation")
+    )
+    print(
+        "\nTRAIN STAGE READY | archives + prepared cache complete | "
+        f"fit={int(train_cache['ready_samples']):,} samples | "
+        f"validation={int(validation_cache['ready_samples']):,} samples | "
+        "pilot will not decode PNG/depth.gz or derive boxes on load",
+        flush=True,
     )
     return result
 
@@ -1658,10 +1864,7 @@ def _official_test_stage(prepared: Prepared) -> LocalArchiveStage:
     stage_cache_id = staging.get("cache_id", prepared.config["run_id"])
     return LocalArchiveStage(
         prepared.split.official_test_records,
-        local_root=prepared.local_root
-        / "stages"
-        / stage_cache_id
-        / "official_test",
+        local_root=prepared.local_root / "stages" / stage_cache_id / "official_test",
         purpose="official_test",
         expansion_factor=float(staging.get("expansion_factor", 1.05)),
         reserve_bytes=math.ceil(float(staging.get("reserve_gib", 4.0)) * 1024**3),
@@ -1738,9 +1941,7 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
         print(json.dumps(existing, indent=2, ensure_ascii=False))
         return existing
     if (prepared.local_run / "checkpoints" / "last.pt").exists():
-        raise FileExistsError(
-            "unpublished local checkpoint exists; use a new RUN_ID"
-        )
+        raise FileExistsError("unpublished local checkpoint exists; use a new RUN_ID")
 
     inspection = _load_cached_inspection(prepared)
     if inspection is None:
@@ -1753,7 +1954,7 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
     _seed_everything(int(prepared.config["train"]["seed"]))
     objects = build_train_objects(
         prepared,
-        amp_initial_scale=float(preflight["amp_stable_scale"]),
+        amp_initial_scale=float(preflight["amp_production_scale"]),
     )
     _print_execution_plan(prepared, objects, start_epoch=0)
     prepared.train_loader.set_epoch(0)
@@ -1792,9 +1993,7 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
         before == _state_sha256(objects.model) and state.next_epoch == 1
     )
     _write_reports(prepared, [record], record)
-    attempted = math.ceil(
-        len(prepared.train_loader) / objects.config.grad_accum_steps
-    )
+    attempted = math.ceil(len(prepared.train_loader) / objects.config.grad_accum_steps)
     val = record.get("val", {})
     reasons = []
     if not _finite_scalars(record):
@@ -1829,9 +2028,7 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
         "checkpoint_roundtrip": checkpoint_roundtrip,
         "gate_reasons": reasons,
         "official_test_used": False,
-        "estimated_remaining_hours": seconds
-        * (objects.config.epochs - 1)
-        / 3600.0,
+        "estimated_remaining_hours": seconds * (objects.config.epochs - 1) / 3600.0,
     }
     _atomic_json(prepared.local_run / "pilot_report.json", report)
     _atomic_json(
@@ -1966,9 +2163,7 @@ def run_main(filename: str | os.PathLike[str], supplied_token: str) -> None:
             {
                 "schema_version": 1,
                 "status": (
-                    "complete"
-                    if epoch + 1 == objects.config.epochs
-                    else "training"
+                    "complete" if epoch + 1 == objects.config.epochs else "training"
                 ),
                 "epoch_completed": epoch,
                 "next_epoch": epoch + 1,
@@ -1998,7 +2193,9 @@ def run_main(filename: str | os.PathLike[str], supplied_token: str) -> None:
     if stage_removed:
         print("Official-train local SSD stage đã được xoá; Drive archives còn nguyên.")
     else:
-        print("Shared official-train SSD stage vẫn được giữ; Drive archives còn nguyên.")
+        print(
+            "Shared official-train SSD stage vẫn được giữ; Drive archives còn nguyên."
+        )
     print("Official-test vẫn chưa được dùng.")
 
 

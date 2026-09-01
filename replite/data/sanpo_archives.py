@@ -14,6 +14,7 @@ current ``drive_root/archives/<split>`` using only the validated basename.
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import hashlib
 import json
@@ -31,9 +32,13 @@ from types import MappingProxyType
 from typing import Any, BinaryIO, Callable, Literal
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Sampler
 
-from .sanpo_joint import SanpoJointDataset, load_sanpo_joint_manifest, sanpo_joint_collate
+from .sanpo_joint import (
+    SanpoJointDataset,
+    load_sanpo_joint_manifest,
+    sanpo_joint_collate,
+)
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -72,15 +77,17 @@ def canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-SANPO_DERIVED_DETECTION_CONFIG: Mapping[str, object] = MappingProxyType({
-    "schema_version": 1,
-    "bbox_format": "XYXY half-open, absolute target-RGB pixels",
-    "component_connectivity": 8,
-    "min_component_pixels": 100,
-    "small_component_policy": "ignore_boxes",
-    "instance_zero_policy": "keep_as_valid_panoptic_instance",
-    "crowd_policy": "none; SANPO does not publish iscrowd",
-})
+SANPO_DERIVED_DETECTION_CONFIG: Mapping[str, object] = MappingProxyType(
+    {
+        "schema_version": 1,
+        "bbox_format": "XYXY half-open, absolute target-RGB pixels",
+        "component_connectivity": 8,
+        "min_component_pixels": 100,
+        "small_component_policy": "ignore_boxes",
+        "instance_zero_policy": "keep_as_valid_panoptic_instance",
+        "crowd_policy": "none; SANPO does not publish iscrowd",
+    }
+)
 SANPO_DERIVED_DETECTION_CONFIG_SHA256 = canonical_json_sha256(
     dict(SANPO_DERIVED_DETECTION_CONFIG)
 )
@@ -174,9 +181,7 @@ def _detection_config_sha256_hint(path: Path) -> str:
     if config is None and declared_raw is None:
         return SANPO_DERIVED_DETECTION_CONFIG_SHA256
     if config is None:
-        declared = _sha256(
-            declared_raw, "derived-detection detection_config_sha256"
-        )
+        declared = _sha256(declared_raw, "derived-detection detection_config_sha256")
         if declared != SANPO_DERIVED_DETECTION_CONFIG_SHA256:
             raise ValueError(
                 "derived-detection metadata is not the locked RepLite policy"
@@ -184,16 +189,12 @@ def _detection_config_sha256_hint(path: Path) -> str:
         return declared
     if not isinstance(config, Mapping):
         raise ValueError("derived-detection detection_config must be a mapping")
-    declared = _sha256(
-        declared_raw, "derived-detection detection_config_sha256"
-    )
+    declared = _sha256(declared_raw, "derived-detection detection_config_sha256")
     actual = canonical_json_sha256(dict(config))
     if actual != declared:
         raise ValueError("derived-detection config SHA-256 does not match its content")
     if declared != SANPO_DERIVED_DETECTION_CONFIG_SHA256:
-        raise ValueError(
-            "derived-detection metadata is not the locked RepLite policy"
-        )
+        raise ValueError("derived-detection metadata is not the locked RepLite policy")
     return declared
 
 
@@ -305,9 +306,7 @@ def _ledger_identity(
     )
     if annotation_policy != expected_annotation_policy:
         raise ValueError("archive annotation_policy disagrees with selection")
-    selection_sha256 = _sha256(
-        raw.get("selection_sha256"), "archive selection_sha256"
-    )
+    selection_sha256 = _sha256(raw.get("selection_sha256"), "archive selection_sha256")
     has_detection_config = "detection_config_sha256" in raw
     has_package = "package_sha256" in raw
     if has_detection_config != has_package:
@@ -320,9 +319,7 @@ def _ledger_identity(
             raw.get("detection_config_sha256"),
             "archive detection_config_sha256",
         )
-        package_sha256 = _sha256(
-            raw.get("package_sha256"), "archive package_sha256"
-        )
+        package_sha256 = _sha256(raw.get("package_sha256"), "archive package_sha256")
         expected_package_sha256 = _package_sha256(
             selection_sha256, detection_config_sha256
         )
@@ -418,10 +415,14 @@ def _ledger_record(
 
 
 def _validate_sidecars(record: SanpoArchiveRecord) -> None:
-    manifest_path = record.archive_path.with_name(record.archive_path.name + ".manifest.json")
+    manifest_path = record.archive_path.with_name(
+        record.archive_path.name + ".manifest.json"
+    )
     if manifest_path.exists():
         payload = _read_json_object(manifest_path, "SANPO archive sidecar")
-        if payload.get("schema_version") != 1 or not isinstance(payload.get("entry"), Mapping):
+        if payload.get("schema_version") != 1 or not isinstance(
+            payload.get("entry"), Mapping
+        ):
             raise ValueError(f"unsupported SANPO archive sidecar: {manifest_path}")
         entry = payload["entry"]
         comparisons = {
@@ -449,7 +450,9 @@ def _validate_sidecars(record: SanpoArchiveRecord) -> None:
                     )
         for name, expected in comparisons.items():
             if entry.get(name) != expected:
-                raise ValueError(f"archive sidecar field {name!r} disagrees with ledger")
+                raise ValueError(
+                    f"archive sidecar field {name!r} disagrees with ledger"
+                )
 
     sha_path = record.archive_path.with_name(record.archive_path.name + ".sha256")
     if sha_path.exists():
@@ -528,8 +531,7 @@ def load_archive_catalog(
         raise ValueError("SANPO archive ledger archives must be a mapping")
 
     selected = [
-        _selection_record(raw, index)
-        for index, raw in enumerate(selection["records"])
+        _selection_record(raw, index) for index, raw in enumerate(selection["records"])
     ]
     selected_keys = [
         (item["split"], item["session_id"], item["sensor"], item["selection_sha256"])
@@ -537,9 +539,8 @@ def load_archive_catalog(
     ]
     if len(selected_keys) != len(set(selected_keys)):
         raise ValueError("SANPO download selection contains duplicate join keys")
-    if (
-        "session_camera_count" in selection
-        and selection["session_camera_count"] != len(selected)
+    if "session_camera_count" in selection and selection["session_camera_count"] != len(
+        selected
     ):
         raise ValueError("selection session_camera_count does not match records")
     if "joint_target_count" in selection and selection["joint_target_count"] != sum(
@@ -552,9 +553,7 @@ def load_archive_catalog(
         str,
         dict[tuple[str, str, str, str], list[LedgerCandidate]],
     ] = {}
-    legacy_by_key: dict[
-        tuple[str, str, str, str], list[LedgerCandidate]
-    ] = {}
+    legacy_by_key: dict[tuple[str, str, str, str], list[LedgerCandidate]] = {}
     for ledger_key, raw in ledger["archives"].items():
         # The ledger is append-only and can retain records from older download
         # selections.  Resolve/stat only entries that can join the current
@@ -605,8 +604,7 @@ def load_archive_catalog(
     for item, key in zip(selected, selected_keys):
         matches = ledger_by_key.get(key, [])
         distinct = {
-            canonical_json_sha256(_record_id(record)): record
-            for record in matches
+            canonical_json_sha256(_record_id(record)): record for record in matches
         }
         if len(distinct) != 1:
             raise ValueError(
@@ -616,7 +614,9 @@ def load_archive_catalog(
             )
         record = next(iter(distinct.values()))
         if record.joint_frames != item["joint_frames"]:
-            raise ValueError(f"selection and ledger joint_frames disagree for {key[:3]}")
+            raise ValueError(
+                f"selection and ledger joint_frames disagree for {key[:3]}"
+            )
         if validate_sidecars:
             _validate_sidecars(record)
         joined.append(record)
@@ -649,7 +649,7 @@ def load_archive_catalog(
 
 @dataclass(frozen=True)
 class ArchiveGroupSplit:
-    """A frozen official-train split plus untouched official-test records."""
+    """A frozen official-train split plus a reserved official-test holdout."""
 
     train_records: tuple[SanpoArchiveRecord, ...]
     validation_records: tuple[SanpoArchiveRecord, ...]
@@ -667,27 +667,25 @@ def _group_split_payload(
     seed: int,
     validation_fraction: float,
     session_limit: int | None = None,
-) -> tuple[dict[str, object], set[str], set[str]]:
-    train_sessions = sorted({record.session_id for record in catalog.train_records})
-    if len(train_sessions) < 2:
+    validation_session_count: int | None = None,
+    official_test_session_limit: int | None = None,
+) -> tuple[dict[str, object], set[str], set[str], set[str]]:
+    all_train_sessions = sorted({record.session_id for record in catalog.train_records})
+    if len(all_train_sessions) < 2:
         raise ValueError("at least two official-train sessions are required")
     if session_limit is not None:
         if (
             isinstance(session_limit, bool)
             or not isinstance(session_limit, int)
             or session_limit < 2
-            or session_limit > len(train_sessions)
+            or session_limit > len(all_train_sessions)
         ):
             raise ValueError(
                 "session_limit must be between two and the available "
                 "official-train session count"
             )
-        # Catalog order is stable and is also the order used by persistent
-        # staging, so a small campaign naturally reuses the earliest shards
-        # already copied before an interrupted full-corpus stage.
-        train_sessions = train_sessions[:session_limit]
-    ordered = sorted(
-        train_sessions,
+    deterministic_train_order = sorted(
+        all_train_sessions,
         key=lambda session_id: (
             hashlib.sha256(
                 f"replite-sanpo-split-v1:{seed}:{session_id}".encode()
@@ -695,15 +693,76 @@ def _group_split_payload(
             session_id,
         ),
     )
-    validation_count = max(
-        1,
-        min(len(ordered) - 1, round(len(ordered) * validation_fraction)),
-    )
+    if session_limit is None:
+        ordered = deterministic_train_order
+        selected_train_sessions = sorted(ordered)
+        session_selection_ordering = None
+    elif validation_session_count is not None:
+        # A clean subset campaign must not depend on which prefix happened to
+        # be staged in an earlier ephemeral Colab runtime.  Freeze the sample
+        # from the entire official-train pool using the same seed-bound hash
+        # ordering that assigns fit versus inner-validation sessions.
+        ordered = deterministic_train_order[:session_limit]
+        selected_train_sessions = sorted(ordered)
+        session_selection_ordering = "sha256(replite-sanpo-split-v1:seed:session_id)"
+    else:
+        # Preserve the legacy prefix-selection contract for old immutable
+        # manifests that used session_limit together with a fraction.
+        selected_train_sessions = all_train_sessions[:session_limit]
+        selected_set = set(selected_train_sessions)
+        ordered = [
+            session_id
+            for session_id in deterministic_train_order
+            if session_id in selected_set
+        ]
+        session_selection_ordering = "lexicographic session_id"
+    if validation_session_count is None:
+        validation_count = max(
+            1,
+            min(len(ordered) - 1, round(len(ordered) * validation_fraction)),
+        )
+    else:
+        if (
+            isinstance(validation_session_count, bool)
+            or not isinstance(validation_session_count, int)
+            or validation_session_count < 1
+            or validation_session_count >= len(ordered)
+        ):
+            raise ValueError(
+                "validation_session_count must be between one and one less "
+                "than the selected official-train session count"
+            )
+        validation_count = validation_session_count
     validation_sessions = set(ordered[:validation_count])
     fit_sessions = set(ordered[validation_count:])
-    test_sessions = sorted({record.session_id for record in catalog.test_records})
-    if (fit_sessions | validation_sessions) & set(test_sessions):
+    all_test_sessions = sorted({record.session_id for record in catalog.test_records})
+    if (fit_sessions | validation_sessions) & set(all_test_sessions):
         raise ValueError("official test session_id overlaps official train")
+    if official_test_session_limit is not None:
+        if (
+            isinstance(official_test_session_limit, bool)
+            or not isinstance(official_test_session_limit, int)
+            or official_test_session_limit < 1
+            or official_test_session_limit > len(all_test_sessions)
+        ):
+            raise ValueError(
+                "official_test_session_limit must be between one and the "
+                "available official-test session count"
+            )
+        deterministic_test_order = sorted(
+            all_test_sessions,
+            key=lambda session_id: (
+                hashlib.sha256(
+                    f"replite-sanpo-test-holdout-v1:{seed}:{session_id}".encode()
+                ).hexdigest(),
+                session_id,
+            ),
+        )
+        selected_test_sessions = set(
+            deterministic_test_order[:official_test_session_limit]
+        )
+    else:
+        selected_test_sessions = set(all_test_sessions)
     payload: dict[str, object] = {
         "schema_version": 1,
         "dataset": "SANPO-Real-v0-joint",
@@ -714,7 +773,7 @@ def _group_split_payload(
         "catalog_sha256": catalog.catalog_sha256,
         "train_session_ids": sorted(fit_sessions),
         "validation_session_ids": sorted(validation_sessions),
-        "official_test_session_ids": test_sessions,
+        "official_test_session_ids": sorted(selected_test_sessions),
         "protocol_note": "Official test is excluded from training, validation, and selection.",
     }
     if session_limit is not None:
@@ -722,12 +781,30 @@ def _group_split_payload(
             {
                 "subset_schema_version": 1,
                 "session_limit": session_limit,
-                "session_selection_ordering": "lexicographic session_id",
-                "selected_official_train_session_ids": train_sessions,
+                "session_selection_ordering": session_selection_ordering,
+                "selected_official_train_session_ids": selected_train_sessions,
+            }
+        )
+    if validation_session_count is not None:
+        payload.update(
+            {
+                "fit_session_count": len(fit_sessions),
+                "validation_session_count": validation_count,
+            }
+        )
+    if official_test_session_limit is not None:
+        payload.update(
+            {
+                "official_test_session_limit": official_test_session_limit,
+                "official_test_pool_session_count": len(all_test_sessions),
+                "selected_official_test_session_ids": sorted(selected_test_sessions),
+                "official_test_selection_ordering": (
+                    "sha256(replite-sanpo-test-holdout-v1:seed:session_id)"
+                ),
             }
         )
     payload["manifest_sha256"] = canonical_json_sha256(payload)
-    return payload, fit_sessions, validation_sessions
+    return payload, fit_sessions, validation_sessions, selected_test_sessions
 
 
 def _write_json_immutable(path: Path, payload: Mapping[str, object]) -> None:
@@ -753,6 +830,8 @@ def create_or_load_group_split(
     seed: int = 42,
     validation_fraction: float = 0.15,
     session_limit: int | None = None,
+    validation_session_count: int | None = None,
+    official_test_session_limit: int | None = None,
 ) -> ArchiveGroupSplit:
     """Create or verify an immutable, deterministic session-level split."""
 
@@ -766,23 +845,41 @@ def create_or_load_group_split(
     ):
         raise ValueError("validation_fraction must be finite and between zero and one")
     fraction = float(validation_fraction)
-    payload, train_sessions, validation_sessions = _group_split_payload(
+    (
+        payload,
+        train_sessions,
+        validation_sessions,
+        official_test_sessions,
+    ) = _group_split_payload(
         catalog,
         seed=seed,
         validation_fraction=fraction,
         session_limit=session_limit,
+        validation_session_count=validation_session_count,
+        official_test_session_limit=official_test_session_limit,
     )
     path = Path(manifest_path).expanduser().resolve()
     _write_json_immutable(path, payload)
 
     train_records = tuple(
-        record for record in catalog.train_records if record.session_id in train_sessions
+        record
+        for record in catalog.train_records
+        if record.session_id in train_sessions
     )
     validation_records = tuple(
-        record for record in catalog.train_records if record.session_id in validation_sessions
+        record
+        for record in catalog.train_records
+        if record.session_id in validation_sessions
+    )
+    official_test_records = tuple(
+        record
+        for record in catalog.test_records
+        if record.session_id in official_test_sessions
     )
     if not train_records or not validation_records:
-        raise ValueError("session grouping produced an empty training or validation set")
+        raise ValueError(
+            "session grouping produced an empty training or validation set"
+        )
     if {record.session_id for record in train_records} & {
         record.session_id for record in validation_records
     }:
@@ -790,7 +887,7 @@ def create_or_load_group_split(
     return ArchiveGroupSplit(
         train_records=train_records,
         validation_records=validation_records,
-        official_test_records=catalog.test_records,
+        official_test_records=official_test_records,
         seed=seed,
         validation_fraction=fraction,
         catalog_sha256=catalog.catalog_sha256,
@@ -816,7 +913,9 @@ def _copy_verified(
         target.flush()
         os.fsync(target.fileno())
     if size != record.archive_bytes or digest.hexdigest() != record.archive_sha256:
-        raise ValueError(f"SANPO archive failed byte/SHA verification: {record.archive_path}")
+        raise ValueError(
+            f"SANPO archive failed byte/SHA verification: {record.archive_path}"
+        )
 
 
 @contextlib.contextmanager
@@ -882,7 +981,9 @@ def _extract_tar_zst_safely(
                     target.parent.mkdir(parents=True, exist_ok=True)
                     source = tar.extractfile(member)
                     if source is None:
-                        raise ValueError(f"cannot read regular tar member: {member.name!r}")
+                        raise ValueError(
+                            f"cannot read regular tar member: {member.name!r}"
+                        )
                     with source, target.open("xb") as output:
                         while block := source.read(16 * 1024 * 1024):
                             output.write(block)
@@ -951,9 +1052,7 @@ def _referenced_payload_signature(
         if record.detection_source == "packaged_json":
             detection = sample.get("detection_path")
             if not isinstance(detection, str) or not detection:
-                raise ValueError(
-                    "packaged SANPO manifest sample has no detection_path"
-                )
+                raise ValueError("packaged SANPO manifest sample has no detection_path")
             required.add(detection)
 
     sizes: list[tuple[str, int]] = []
@@ -1049,9 +1148,13 @@ class ArchiveMaterializer:
         try:
             marker_payload = _read_json_object(marker, "owned SANPO stage marker")
         except ValueError as exc:
-            raise RuntimeError(f"refusing to clean an unowned SANPO stage: {stage}") from exc
+            raise RuntimeError(
+                f"refusing to clean an unowned SANPO stage: {stage}"
+            ) from exc
         if marker_payload.get("archive_sha256") != self.record.archive_sha256:
-            raise RuntimeError(f"refusing to clean a SANPO stage with a foreign marker: {stage}")
+            raise RuntimeError(
+                f"refusing to clean a SANPO stage with a foreign marker: {stage}"
+            )
         shutil.rmtree(stage)
         self._stage = None
 
@@ -1142,12 +1245,15 @@ class LocalArchiveStage:
         self.purpose: StagePurpose = purpose
         self.expansion_factor = float(expansion_factor)
         self.reserve_bytes = reserve_bytes
-        ordered = sorted((_record_id(record) for record in self.records), key=lambda x: (
-            str(x["split"]),
-            str(x["session_id"]),
-            str(x["sensor"]),
-            str(x["archive_sha256"]),
-        ))
+        ordered = sorted(
+            (_record_id(record) for record in self.records),
+            key=lambda x: (
+                str(x["split"]),
+                str(x["session_id"]),
+                str(x["sensor"]),
+                str(x["archive_sha256"]),
+            ),
+        )
         self.stage_sha256 = canonical_json_sha256(
             {
                 "schema_version": 1,
@@ -1207,9 +1313,10 @@ class LocalArchiveStage:
     def _ensure_owned_root(self) -> None:
         self.local_root.mkdir(parents=True, exist_ok=True)
         if self.marker_path.exists():
-            if _read_json_object(
-                self.marker_path, "persistent SANPO stage marker"
-            ) != self._marker_payload():
+            if (
+                _read_json_object(self.marker_path, "persistent SANPO stage marker")
+                != self._marker_payload()
+            ):
                 raise RuntimeError(
                     "local SANPO stage belongs to a different record selection"
                 )
@@ -1235,9 +1342,10 @@ class LocalArchiveStage:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 self._ensure_owned_root()
-                if _read_json_object(
-                    self.marker_path, "persistent SANPO stage marker"
-                ) != self._marker_payload():
+                if (
+                    _read_json_object(self.marker_path, "persistent SANPO stage marker")
+                    != self._marker_payload()
+                ):
                     raise RuntimeError("local SANPO stage marker changed while waiting")
                 yield
             finally:
@@ -1288,13 +1396,17 @@ class LocalArchiveStage:
         if not isinstance(relative_raw, str):
             raise RuntimeError("completed SANPO shard has no manifest path")
         relative = PurePosixPath(relative_raw)
-        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
             raise RuntimeError("completed SANPO shard manifest path is unsafe")
         manifest = root.joinpath(*relative.parts)
         try:
             manifest.resolve().relative_to(root.resolve())
         except ValueError as exc:
-            raise RuntimeError("completed SANPO shard manifest escapes its root") from exc
+            raise RuntimeError(
+                "completed SANPO shard manifest escapes its root"
+            ) from exc
         if not manifest.is_file():
             raise RuntimeError("completed SANPO shard manifest is missing")
         validated = _validate_manifest_identity(record, manifest)
@@ -1317,12 +1429,8 @@ class LocalArchiveStage:
         return manifest
 
     def _write_status(self) -> dict[str, object]:
-        expected = {
-            self._record_stage_id(record): record for record in self.records
-        }
-        observed = {
-            path.name for path in self._shards_root.iterdir() if path.is_dir()
-        }
+        expected = {self._record_stage_id(record): record for record in self.records}
+        observed = {path.name for path in self._shards_root.iterdir() if path.is_dir()}
         foreign = observed - set(expected)
         if foreign:
             raise RuntimeError(
@@ -1405,7 +1513,9 @@ class LocalArchiveStage:
                 partial / _STAGE_MARKER, "partial SANPO stage marker"
             )
             if marker.get("stage_sha256") != self.stage_sha256:
-                raise RuntimeError(f"refusing to remove foreign SANPO partial: {partial}")
+                raise RuntimeError(
+                    f"refusing to remove foreign SANPO partial: {partial}"
+                )
             shutil.rmtree(partial)
 
     def _estimated_unpacked_bytes(self, record: SanpoArchiveRecord) -> int:
@@ -1421,9 +1531,7 @@ class LocalArchiveStage:
     ) -> dict[str, int | float]:
         selected = self._select_records(records)
         pending = [
-            record
-            for record in selected
-            if self._existing_manifest(record) is None
+            record for record in selected if self._existing_manifest(record) is None
         ]
         archive_bytes = sum(record.archive_bytes for record in pending)
         exact_source_bytes = sum(record.source_bytes or 0 for record in pending)
@@ -1609,9 +1717,7 @@ class LocalArchiveStage:
             self._remove_owned_partials()
             plan = self._assert_disk_capacity(selected)
         total = len(selected)
-        total_bytes = sum(
-            self._estimated_unpacked_bytes(record) for record in selected
-        )
+        total_bytes = sum(self._estimated_unpacked_bytes(record) for record in selected)
         ready_records = 0
         ready_bytes = 0
         if on_event is not None:
@@ -1625,9 +1731,7 @@ class LocalArchiveStage:
                     "ready_bytes": ready_bytes,
                 }
             )
-        existing_by_key: dict[
-            tuple[str, str, str, str, str], Path | None
-        ] = {}
+        existing_by_key: dict[tuple[str, str, str, str, str], Path | None] = {}
         for index, record in enumerate(selected, start=1):
             existing = self._existing_manifest(record, verify_payloads=True)
             existing_by_key[record.key] = existing
@@ -1809,14 +1913,79 @@ def _seed_from_parts(*parts: object) -> int:
     return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big") % (2**63)
 
 
+class _CombinedSanpoDataset(Dataset[tuple[torch.Tensor, dict[str, Any]]]):
+    """One map-style index space spanning immutable staged SANPO shards."""
+
+    def __init__(self, datasets: Sequence[Dataset]) -> None:
+        self.datasets = tuple(datasets)
+        if not self.datasets:
+            raise ValueError("combined SANPO dataset requires at least one shard")
+        cumulative: list[int] = []
+        total = 0
+        for dataset in self.datasets:
+            length = len(dataset)
+            if length <= 0:
+                raise ValueError("combined SANPO dataset contains an empty shard")
+            total += length
+            cumulative.append(total)
+        self.cumulative_sizes = tuple(cumulative)
+
+    def __len__(self) -> int:
+        return self.cumulative_sizes[-1]
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, Any]]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError("combined SANPO sample index is out of range")
+        shard_index = bisect.bisect_right(self.cumulative_sizes, index)
+        previous = 0 if shard_index == 0 else self.cumulative_sizes[shard_index - 1]
+        return self.datasets[shard_index][index - previous]
+
+
+class _EpochIndexSampler(Sampler[int]):
+    """Stateless epoch-bound permutation for exact epoch-boundary resume."""
+
+    def __init__(self, size: int, *, seed: int, shuffle: bool) -> None:
+        if size <= 0:
+            raise ValueError("epoch sampler size must be positive")
+        self.size = size
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __iter__(self) -> Iterator[int]:
+        if not self.shuffle:
+            yield from range(self.size)
+            return
+        generator = torch.Generator().manual_seed(
+            _seed_from_parts(
+                "replite-sanpo-global-samples-v1",
+                self.seed,
+                self.epoch,
+            )
+        )
+        yield from torch.randperm(self.size, generator=generator).tolist()
+
+
 class ArchiveShardLoader:
     """Iterable of batches backed by verified local archive extraction.
 
-    ``len(loader)`` is exact for the per-archive batching policy.  With
-    ``drop_last=True`` each shard drops its own incomplete final batch.
-    Without ``local_stage`` each shard is removed when its iterator finishes.
-    With a :class:`LocalArchiveStage`, extracted shards persist across epochs.
-    ``persistent_workers`` remains ``False`` for deterministic resume.
+    A persistent :class:`LocalArchiveStage` uses one global map-style dataset,
+    one sampler, and one DataLoader across all selected shards. Consequently,
+    batches cross session boundaries, there is only one tail batch per split,
+    and worker processes persist safely because preprocessing is deterministic.
+    The epoch sampler is stateless and seed-bound, so setting the resumed epoch
+    recreates exactly the same global sample order without saving worker state.
+
+    The non-persistent materializer fallback retains per-shard streaming so it
+    never expands every archive onto local disk at the same time.
     """
 
     def __init__(
@@ -1884,15 +2053,20 @@ class ArchiveShardLoader:
             raise ValueError(
                 "use_packaged_detection is selected from archive provenance"
             )
+        if "prepared_cache_dir" in self.dataset_kwargs:
+            raise ValueError(
+                "prepared_cache_dir is owned by the persistent local stage"
+            )
         detection_min_area = self.dataset_kwargs.get("detection_min_area", 100)
-        if detection_min_area != SANPO_DERIVED_DETECTION_CONFIG[
-            "min_component_pixels"
-        ]:
+        if detection_min_area != SANPO_DERIVED_DETECTION_CONFIG["min_component_pixels"]:
             raise ValueError(
                 "archive loading requires the locked 100-pixel detection policy"
             )
         self._epoch = 0
         self._iterating = False
+        self._staged_dataset: _CombinedSanpoDataset | None = None
+        self._staged_sampler: _EpochIndexSampler | None = None
+        self._staged_loader: DataLoader | None = None
 
     @property
     def sample_count(self) -> int:
@@ -1903,23 +2077,214 @@ class ArchiveShardLoader:
         return self._epoch
 
     def __len__(self) -> int:
+        if self.local_stage is not None:
+            if self.drop_last:
+                return self.sample_count // self.batch_size
+            return math.ceil(self.sample_count / self.batch_size)
         if self.drop_last:
-            return sum(record.joint_frames // self.batch_size for record in self.records)
-        return sum(math.ceil(record.joint_frames / self.batch_size) for record in self.records)
+            return sum(
+                record.joint_frames // self.batch_size for record in self.records
+            )
+        return sum(
+            math.ceil(record.joint_frames / self.batch_size) for record in self.records
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """Select the deterministic shard and sample ordering for an epoch."""
 
         if self._iterating:
-            raise RuntimeError("cannot change epoch during ArchiveShardLoader iteration")
+            raise RuntimeError(
+                "cannot change epoch during ArchiveShardLoader iteration"
+            )
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ValueError("epoch must be a non-negative integer")
         self._epoch = epoch
+        if self._staged_sampler is not None:
+            self._staged_sampler.set_epoch(epoch)
+
+    @property
+    def persistent_workers(self) -> bool:
+        """Whether the global staged loader keeps its workers across epochs."""
+
+        return self.local_stage is not None and self.num_workers > 0
+
+    def _fixed_records(self) -> tuple[SanpoArchiveRecord, ...]:
+        return tuple(sorted(self.records, key=lambda record: record.key))
+
+    def _ensure_staged_loader(self) -> DataLoader:
+        if self.local_stage is None:
+            raise RuntimeError("global staged loader requires LocalArchiveStage")
+        if self._staged_loader is not None:
+            return self._staged_loader
+
+        datasets: list[Dataset] = []
+        prepared_root = self.local_stage.local_root / "prepared_samples"
+        for record in self._fixed_records():
+            manifest_path = self.local_stage.materialize(record)
+            dataset = SanpoJointDataset(
+                manifest_path,
+                image_size=self.image_size,
+                use_packaged_detection=(record.detection_source == "packaged_json"),
+                prepared_cache_dir=(
+                    prepared_root / self.local_stage._record_stage_id(record)
+                ),
+                **self.dataset_kwargs,
+            )
+            if len(dataset) != record.joint_frames:
+                raise ValueError(
+                    "materialized dataset length disagrees with archive record"
+                )
+            datasets.append(dataset)
+
+        combined = _CombinedSanpoDataset(datasets)
+        if len(combined) != self.sample_count:
+            raise RuntimeError("global SANPO dataset length is inconsistent")
+        sampler = _EpochIndexSampler(
+            len(combined),
+            seed=self.seed,
+            shuffle=self.shuffle,
+        )
+        sampler.set_epoch(self._epoch)
+        kwargs: dict[str, object] = {}
+        if self.num_workers > 0:
+            kwargs["prefetch_factor"] = self.prefetch_factor
+        worker_generator = torch.Generator().manual_seed(
+            _seed_from_parts("replite-sanpo-workers-v1", self.seed)
+        )
+        loader = DataLoader(
+            combined,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=self.drop_last,
+            persistent_workers=self.persistent_workers,
+            collate_fn=sanpo_joint_collate,
+            generator=worker_generator,
+            **kwargs,
+        )
+        self._staged_dataset = combined
+        self._staged_sampler = sampler
+        self._staged_loader = loader
+        return loader
+
+    def prepared_cache_plan(self) -> dict[str, object]:
+        """Return cache readiness and local-SSD bytes before a warm pass."""
+
+        if self.local_stage is None:
+            raise RuntimeError("prepared sample cache requires LocalArchiveStage")
+        self._ensure_staged_loader()
+        assert self._staged_dataset is not None
+        statuses = [
+            dataset.prepared_cache_status()
+            for dataset in self._staged_dataset.datasets
+            if isinstance(dataset, SanpoJointDataset)
+        ]
+        if len(statuses) != len(self._staged_dataset.datasets):
+            raise RuntimeError("staged SANPO dataset does not support prepared caching")
+        pending_bytes = sum(int(status["estimated_pending_bytes"]) for status in statuses)
+        max_sample_bytes = max(
+            (int(status["estimated_sample_bytes"]) for status in statuses),
+            default=0,
+        )
+        ready_samples = sum(int(status["ready_samples"]) for status in statuses)
+        pending_samples = sum(int(status["pending_samples"]) for status in statuses)
+        cached_bytes = sum(int(status["cached_bytes"]) for status in statuses)
+        usage = shutil.disk_usage(self.local_stage.local_root)
+        required_free_bytes = (
+            pending_bytes + max_sample_bytes + self.local_stage.reserve_bytes
+        )
+        return {
+            "schema_version": 1,
+            "sample_count": self.sample_count,
+            "ready_samples": ready_samples,
+            "pending_samples": pending_samples,
+            "cached_bytes": cached_bytes,
+            "estimated_pending_bytes": pending_bytes,
+            "largest_atomic_sample_bytes": max_sample_bytes,
+            "reserve_bytes": self.local_stage.reserve_bytes,
+            "required_free_bytes": required_free_bytes,
+            "available_free_bytes": usage.free,
+            "complete_by_count": pending_samples == 0,
+        }
+
+    def warm_prepared_cache(
+        self,
+        *,
+        on_event: _StageProgressCallback | None = None,
+    ) -> dict[str, object]:
+        """Build/verify local resized samples once before a measured epoch.
+
+        The pass uses the same global DataLoader and worker pool as training,
+        but never touches CUDA. Official-test data remains absent unless a
+        caller explicitly constructs and warms an official-test loader.
+        """
+
+        plan = self.prepared_cache_plan()
+        total_batches = len(self)
+        if on_event is not None:
+            on_event(
+                {
+                    "event": "cache_warm_start",
+                    "total_batches": total_batches,
+                    **plan,
+                }
+            )
+        if bool(plan["complete_by_count"]):
+            result = {**plan, "cache_reused": True}
+            if on_event is not None:
+                on_event(
+                    {
+                        "event": "cache_warm_end",
+                        "total_batches": total_batches,
+                        "completed_samples": self.sample_count,
+                        **result,
+                    }
+                )
+            return result
+        if int(plan["available_free_bytes"]) < int(plan["required_free_bytes"]):
+            raise OSError(
+                "insufficient local SSD for SANPO prepared cache: "
+                f"need {int(plan['required_free_bytes']) / 1024**3:.2f} GiB free, "
+                f"have {int(plan['available_free_bytes']) / 1024**3:.2f} GiB; "
+                "free /content space or reduce the selected session count"
+            )
+        completed_samples = 0
+        for batch_index, (inputs, _) in enumerate(self, start=1):
+            completed_samples += int(inputs.shape[0])
+            if on_event is not None:
+                on_event(
+                    {
+                        "event": "cache_warm_progress",
+                        "batch_index": batch_index,
+                        "total_batches": total_batches,
+                        "completed_samples": completed_samples,
+                        "sample_count": self.sample_count,
+                    }
+                )
+        result = {**self.prepared_cache_plan(), "cache_reused": False}
+        if (
+            int(result["ready_samples"]) != self.sample_count
+            or int(result["pending_samples"]) != 0
+        ):
+            raise RuntimeError("SANPO prepared cache warm pass is incomplete")
+        if on_event is not None:
+            on_event(
+                {
+                    "event": "cache_warm_end",
+                    "total_batches": total_batches,
+                    "completed_samples": completed_samples,
+                    **result,
+                }
+            )
+        return result
 
     def _ordered_records(self) -> tuple[SanpoArchiveRecord, ...]:
         if not self.shuffle:
             return tuple(
-                sorted(self.records, key=lambda record: (record.session_id, record.sensor))
+                sorted(
+                    self.records, key=lambda record: (record.session_id, record.sensor)
+                )
             )
         return tuple(
             sorted(
@@ -1938,18 +2303,18 @@ class ArchiveShardLoader:
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, dict[str, Any]]]:
         if self._iterating:
-            raise RuntimeError("ArchiveShardLoader does not support concurrent iteration")
+            raise RuntimeError(
+                "ArchiveShardLoader does not support concurrent iteration"
+            )
         self._iterating = True
         try:
+            if self.local_stage is not None:
+                yield from self._ensure_staged_loader()
+                return
             for record in self._ordered_records():
-                if self.local_stage is not None:
-                    manifest_context = contextlib.nullcontext(
-                        self.local_stage.materialize(record)
-                    )
-                else:
-                    manifest_context = ArchiveMaterializer(
-                        record, local_root=self.local_root
-                    )
+                manifest_context = ArchiveMaterializer(
+                    record, local_root=self.local_root
+                )
                 with manifest_context as manifest_path:
                     dataset = SanpoJointDataset(
                         manifest_path,
@@ -1960,7 +2325,9 @@ class ArchiveShardLoader:
                         **self.dataset_kwargs,
                     )
                     if len(dataset) != record.joint_frames:
-                        raise ValueError("materialized dataset length disagrees with archive record")
+                        raise ValueError(
+                            "materialized dataset length disagrees with archive record"
+                        )
                     generator = torch.Generator().manual_seed(
                         _seed_from_parts(
                             "replite-sanpo-samples-v1",
