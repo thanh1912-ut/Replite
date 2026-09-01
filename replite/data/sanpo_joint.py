@@ -158,7 +158,9 @@ def load_sanpo_joint_manifest(
                 f"samples[{index}].rgb_context_paths[{context_index}]",
             )
         for key in required_paths:
-            _safe_relative_path(session_root, sample.get(key), f"samples[{index}].{key}")
+            _safe_relative_path(
+                session_root, sample.get(key), f"samples[{index}].{key}"
+            )
         # Archives created before detection targets were packaged contain the
         # same official panoptic supervision but no detection_path.  That is a
         # supported legacy representation; malformed paths that are present
@@ -216,12 +218,16 @@ def _read_detection_target(path: Path) -> dict[str, Any]:
         raise ValueError(f"unexpected detection box format: {path}")
     boxes = np.asarray(payload.get("boxes"), dtype=np.float32).reshape(-1, 4)
     labels = np.asarray(payload.get("labels"), dtype=np.int64).reshape(-1)
-    ignore_boxes = np.asarray(payload.get("ignore_boxes", ()), dtype=np.float32).reshape(-1, 4)
+    ignore_boxes = np.asarray(
+        payload.get("ignore_boxes", ()), dtype=np.float32
+    ).reshape(-1, 4)
     if boxes.shape[0] != labels.shape[0]:
         raise ValueError(f"detection boxes/labels length mismatch: {path}")
     if not np.isfinite(boxes).all() or not np.isfinite(ignore_boxes).all():
         raise ValueError(f"detection target contains non-finite boxes: {path}")
-    if labels.size and (labels.min() < 0 or labels.max() >= len(SANPO_DETECTION_CLASS_NAMES)):
+    if labels.size and (
+        labels.min() < 0 or labels.max() >= len(SANPO_DETECTION_CLASS_NAMES)
+    ):
         raise ValueError(f"detection target label is outside [0,14]: {path}")
     source_hw = _positive_hw(payload.get("valid_size"), "detection valid_size")
     for name, array in (("boxes", boxes), ("ignore_boxes", ignore_boxes)):
@@ -242,7 +248,9 @@ def _read_detection_target(path: Path) -> dict[str, Any]:
     }
 
 
-def _scale_boxes(boxes: np.ndarray, source_hw: tuple[int, int], output_hw: tuple[int, int]) -> Tensor:
+def _scale_boxes(
+    boxes: np.ndarray, source_hw: tuple[int, int], output_hw: tuple[int, int]
+) -> Tensor:
     result = torch.as_tensor(boxes, dtype=torch.float32).clone()
     if result.numel():
         result[:, (0, 2)] *= output_hw[1] / source_hw[1]
@@ -264,6 +272,7 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
         depth_max: float = 80.0,
         detection_min_area: int = 100,
         use_packaged_detection: bool = True,
+        include_detection: bool = True,
         normalize: bool = True,
         prepared_cache_dir: str | PathLike[str] | None = None,
     ) -> None:
@@ -294,12 +303,17 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             raise ValueError("detection_min_area must be non-negative")
         if not isinstance(use_packaged_detection, bool):
             raise TypeError("use_packaged_detection must be a boolean")
+        if not isinstance(include_detection, bool):
+            raise TypeError("include_detection must be a boolean")
         self.depth_min = float(depth_min)
         self.depth_max = float(depth_max)
         self.detection_min_area = int(detection_min_area)
         self.use_packaged_detection = use_packaged_detection
+        self.include_detection = include_detection
         self.normalize = normalize
-        self._mean = torch.tensor(IMAGENET_RGB_MEAN, dtype=torch.float32).reshape(3, 1, 1)
+        self._mean = torch.tensor(IMAGENET_RGB_MEAN, dtype=torch.float32).reshape(
+            3, 1, 1
+        )
         self._std = torch.tensor(IMAGENET_RGB_STD, dtype=torch.float32).reshape(3, 1, 1)
         self._prepared_cache_key = self._make_prepared_cache_key()
         self._prepared_sample_estimates: dict[int, int] = {}
@@ -339,6 +353,11 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             "detection_classes": list(SANPO_DETECTION_CLASS_NAMES),
             "segmentation_classes": list(SANPO_SEGMENTATION_CLASS_NAMES),
         }
+        # Preserve the established full-task cache identity. Dense-only mode
+        # needs a distinct key because its tensor schema intentionally omits
+        # boxes and labels.
+        if not self.include_detection:
+            contract["include_detection"] = False
         encoded = json.dumps(
             contract,
             allow_nan=False,
@@ -360,7 +379,9 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             try:
                 observed = json.loads(marker.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(f"cannot read SANPO prepared-cache marker: {marker}") from exc
+                raise RuntimeError(
+                    f"cannot read SANPO prepared-cache marker: {marker}"
+                ) from exc
             if observed != expected:
                 raise RuntimeError(f"SANPO prepared-cache marker mismatch: {marker}")
             return
@@ -400,7 +421,9 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
     def prepared_cache_status(self) -> dict[str, int | bool | str | None]:
         """Return a cheap local-cache count and conservative disk estimate."""
 
-        estimates = [self._estimated_prepared_sample_bytes(index) for index in range(len(self))]
+        estimates = [
+            self._estimated_prepared_sample_bytes(index) for index in range(len(self))
+        ]
         estimated_sample_bytes = max(estimates, default=0)
         if self.prepared_cache_dir is None:
             return {
@@ -452,28 +475,28 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
         # Three RGB uint8 frames (9), segmentation uint8 (1), float16 depth
         # (2), and depth validity (1) use exactly 13 bytes per output pixel.
         fixed_tensors = 13 * target_pixels
-        detection_relative = (
-            sample.get("detection_path") if self.use_packaged_detection else None
-        )
-        if detection_relative is not None:
-            detection = _read_detection_target(
-                self._path(detection_relative, "detection_path")
+        detection_bytes = 0
+        if self.include_detection:
+            detection_relative = (
+                sample.get("detection_path") if self.use_packaged_detection else None
             )
-            detection_bytes = (
-                int(detection["boxes"].shape[0]) * (4 * 4 + 8)
-                + int(detection["ignore_boxes"].shape[0]) * (4 * 4)
-            )
-        else:
-            panoptic_path = self._path(sample["panoptic_path"], "panoptic_path")
-            with Image.open(panoptic_path) as image:
-                source_width, source_height = image.size
-            # With 8-connectivity, isolated components occupy at most every
-            # second row and column. A positive component uses four float32 box
-            # values plus one int64 label (24 bytes); ignore components use less.
-            component_upper_bound = math.ceil(source_height / 2) * math.ceil(
-                source_width / 2
-            )
-            detection_bytes = component_upper_bound * 24
+            if detection_relative is not None:
+                detection = _read_detection_target(
+                    self._path(detection_relative, "detection_path")
+                )
+                detection_bytes = int(detection["boxes"].shape[0]) * (4 * 4 + 8) + int(
+                    detection["ignore_boxes"].shape[0]
+                ) * (4 * 4)
+            else:
+                panoptic_path = self._path(sample["panoptic_path"], "panoptic_path")
+                with Image.open(panoptic_path) as image:
+                    source_width, source_height = image.size
+                # With 8-connectivity, isolated components occupy at most every
+                # second row and column. Positive components use at most 24 B.
+                component_upper_bound = math.ceil(source_height / 2) * math.ceil(
+                    source_width / 2
+                )
+                detection_bytes = component_upper_bound * 24
         # The fixed allowance covers tensor metadata, zip records, alignment,
         # filesystem allocation and the small identity payload.
         estimate = fixed_tensors + detection_bytes + 64 * 1024
@@ -502,10 +525,9 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             "segmentation_uint8",
             "depth_float16",
             "depth_valid",
-            "boxes",
-            "labels",
-            "ignore_boxes",
         }
+        if self.include_detection:
+            required.update(("boxes", "labels", "ignore_boxes"))
         if set(tensors) != required or any(
             not isinstance(tensors[name], Tensor) for name in required
         ):
@@ -522,23 +544,24 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             value = checked[name]
             if value.dtype != dtype or tuple(value.shape) != shape:
                 raise ValueError(f"prepared sample {name} shape/dtype mismatch")
-        boxes = checked["boxes"]
-        labels = checked["labels"]
-        ignore_boxes = checked["ignore_boxes"]
-        if (
-            boxes.dtype != torch.float32
-            or boxes.ndim != 2
-            or boxes.shape[1:] != (4,)
-            or labels.dtype != torch.int64
-            or labels.ndim != 1
-            or labels.shape[0] != boxes.shape[0]
-            or ignore_boxes.dtype != torch.float32
-            or ignore_boxes.ndim != 2
-            or ignore_boxes.shape[1:] != (4,)
-            or not bool(torch.isfinite(boxes).all())
-            or not bool(torch.isfinite(ignore_boxes).all())
-        ):
-            raise ValueError("prepared sample detection tensors are invalid")
+        if self.include_detection:
+            boxes = checked["boxes"]
+            labels = checked["labels"]
+            ignore_boxes = checked["ignore_boxes"]
+            if (
+                boxes.dtype != torch.float32
+                or boxes.ndim != 2
+                or boxes.shape[1:] != (4,)
+                or labels.dtype != torch.int64
+                or labels.ndim != 1
+                or labels.shape[0] != boxes.shape[0]
+                or ignore_boxes.dtype != torch.float32
+                or ignore_boxes.ndim != 2
+                or ignore_boxes.shape[1:] != (4,)
+                or not bool(torch.isfinite(boxes).all())
+                or not bool(torch.isfinite(ignore_boxes).all())
+            ):
+                raise ValueError("prepared sample detection tensors are invalid")
         return checked
 
     def _read_prepared_sample(self, path: Path, *, index: int) -> dict[str, Tensor]:
@@ -550,7 +573,13 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
                 mmap=True,
             )
             return self._validate_prepared_sample(payload, index=index)
-        except (OSError, RuntimeError, ValueError, EOFError, pickle.UnpicklingError) as exc:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            EOFError,
+            pickle.UnpicklingError,
+        ) as exc:
             raise ValueError(f"cannot read SANPO prepared sample: {path}") from exc
 
     def _write_prepared_sample(
@@ -626,36 +655,47 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
         ).astype(bool, copy=False)
         depth[~depth_valid] = 0.0
 
-        detection_relative = (
-            sample.get("detection_path")
-            if self.use_packaged_detection
-            else None
-        )
-        if detection_relative is None:
-            detection = sanpo_panoptic_to_detection(
-                panoptic_rgb,
-                min_area=self.detection_min_area,
-            )
-        else:
-            detection_path = self._path(detection_relative, "detection_path")
-            detection = _read_detection_target(detection_path)
-        if tuple(semantic.shape) != detection["valid_size"]:
-            raise ValueError(
-                "panoptic mask and derived detection target have different source sizes"
-            )
-        return {
+        prepared = {
             "rgb_uint8": rgb_uint8,
             "segmentation_uint8": torch.from_numpy(segmentation),
             # SANPO source values are float16. Nearest-neighbour resize only
             # selects those exact values, so float16 cache storage is lossless.
             "depth_float16": torch.from_numpy(depth).to(torch.float16).unsqueeze(0),
             "depth_valid": torch.from_numpy(depth_valid.copy()).unsqueeze(0),
-            "boxes": _scale_boxes(detection["boxes"], detection["valid_size"], self.image_size),
-            "labels": torch.as_tensor(detection["labels"], dtype=torch.int64),
-            "ignore_boxes": _scale_boxes(
-                detection["ignore_boxes"], detection["valid_size"], self.image_size
-            ),
         }
+        if self.include_detection:
+            detection_relative = (
+                sample.get("detection_path") if self.use_packaged_detection else None
+            )
+            if detection_relative is None:
+                detection = sanpo_panoptic_to_detection(
+                    panoptic_rgb,
+                    min_area=self.detection_min_area,
+                )
+            else:
+                detection_path = self._path(detection_relative, "detection_path")
+                detection = _read_detection_target(detection_path)
+            if tuple(semantic.shape) != detection["valid_size"]:
+                raise ValueError(
+                    "panoptic mask and derived detection target have different "
+                    "source sizes"
+                )
+            prepared.update(
+                {
+                    "boxes": _scale_boxes(
+                        detection["boxes"],
+                        detection["valid_size"],
+                        self.image_size,
+                    ),
+                    "labels": torch.as_tensor(detection["labels"], dtype=torch.int64),
+                    "ignore_boxes": _scale_boxes(
+                        detection["ignore_boxes"],
+                        detection["valid_size"],
+                        self.image_size,
+                    ),
+                }
+            )
+        return prepared
 
     def _prepared_sample(self, index: int) -> dict[str, Tensor]:
         cache_path = self._prepared_cache_path(index)
@@ -678,20 +718,19 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             clip = (clip - self._mean) / self._std
         segmentation = tensors["segmentation_uint8"].to(torch.int64)
         segmentation_valid = segmentation != SANPO_SEGMENTATION_IGNORE_INDEX
-        detection_target = {
-            "boxes": tensors["boxes"],
-            "labels": tensors["labels"],
-            "valid_size": self.image_size,
-            "ignore_boxes": tensors["ignore_boxes"],
-        }
-
         targets: dict[str, Any] = {
-            "detection": detection_target,
             "segmentation": segmentation,
             "segmentation_valid": segmentation_valid,
             "depth": tensors["depth_float16"].to(torch.float32),
             "depth_valid": tensors["depth_valid"],
         }
+        if self.include_detection:
+            targets["detection"] = {
+                "boxes": tensors["boxes"],
+                "labels": tensors["labels"],
+                "valid_size": self.image_size,
+                "ignore_boxes": tensors["ignore_boxes"],
+            }
         return clip, targets
 
     def sample_provenance(self, index: int) -> dict[str, Any]:
@@ -708,13 +747,13 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
             "depth_path": sample["depth_path"],
             "detection_path": sample.get("detection_path"),
             "detection_source": self._detection_source(sample),
+            "detection_included": self.include_detection,
         }
 
     def _detection_source(self, sample: Mapping[str, Any]) -> str:
         return (
             "packaged_json"
-            if self.use_packaged_detection
-            and sample.get("detection_path") is not None
+            if self.use_packaged_detection and sample.get("detection_path") is not None
             else "panoptic_on_load"
         )
 
@@ -722,7 +761,7 @@ class SanpoJointDataset(Dataset[tuple[Tensor, dict[str, Any]]]):
 def sanpo_joint_collate(
     batch: Sequence[tuple[Tensor, Mapping[str, Any]]],
 ) -> tuple[Tensor, dict[str, Any]]:
-    """Collate variable-length detection targets without padding boxes."""
+    """Collate dense targets and optional variable-length detection targets."""
 
     if not batch:
         raise ValueError("cannot collate an empty SANPO batch")
@@ -730,16 +769,26 @@ def sanpo_joint_collate(
     if any(not isinstance(clip, Tensor) or clip.ndim != 4 for clip in clips):
         raise ValueError("each SANPO clip must have shape T,C,H,W")
     inputs = torch.stack(clips)
-    required = {"detection", "segmentation", "segmentation_valid", "depth", "depth_valid"}
-    if any(not isinstance(target, Mapping) or not required.issubset(target) for target in targets):
+    required = {"segmentation", "segmentation_valid", "depth", "depth_valid"}
+    if any(
+        not isinstance(target, Mapping) or not required.issubset(target)
+        for target in targets
+    ):
         raise ValueError("each SANPO target mapping is incomplete")
-    return inputs, {
-        "detection": [target["detection"] for target in targets],
+    detection_presence = tuple("detection" in target for target in targets)
+    if any(detection_presence) and not all(detection_presence):
+        raise ValueError("SANPO batch mixes detection-enabled and dense-only targets")
+    result = {
         "segmentation": torch.stack([target["segmentation"] for target in targets]),
-        "segmentation_valid": torch.stack([target["segmentation_valid"] for target in targets]),
+        "segmentation_valid": torch.stack(
+            [target["segmentation_valid"] for target in targets]
+        ),
         "depth": torch.stack([target["depth"] for target in targets]),
         "depth_valid": torch.stack([target["depth_valid"] for target in targets]),
     }
+    if all(detection_presence):
+        result["detection"] = [target["detection"] for target in targets]
+    return inputs, result
 
 
 __all__ = [

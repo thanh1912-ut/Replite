@@ -47,8 +47,9 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         "PREFETCH_FACTOR = 2",
         "AMP_INITIAL_SCALE = 1024.0",
         'DRIVE_BASE_ROOT = Path("/content/drive/MyDrive/nckh1m_data")',
-        'RUN_ID = "replite_sanpo_mnv4convs_20fit_1val_1test_seed42_v1"',
+        'RUN_ID = "replite_sanpo_mnv4convs_20fit_1val_1test_segdepth_seed42_v1"',
         "LOCAL_STAGE_CACHE_ID = RUN_ID",
+        '"active_tasks": ["segmentation", "depth"]',
         "FIT_SESSION_COUNT = 20",
         "VALIDATION_SESSION_COUNT = 1",
         "OFFICIAL_TEST_SESSION_COUNT = 1",
@@ -75,10 +76,13 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         "Stage đúng 20 fit + 1 val session lên SSD",
     ):
         assert marker in source
-    assert (
-        "tiền xử lý một lần RGB/mask/depth/box vào cache SSD"
-        in NOTEBOOK.read_text(encoding="utf-8")
+    assert "tiền xử lý một lần RGB/mask/depth vào cache SSD" in NOTEBOOK.read_text(
+        encoding="utf-8"
     )
+    assert "DETECTION_MIN_COMPONENT_PIXELS" not in source
+    assert '"detection_head_channels"' not in source
+    assert '"detection_score_threshold"' not in source
+    assert "mAP50" not in NOTEBOOK.read_text(encoding="utf-8")
 
 
 def test_main_notebook_delegates_audited_streaming_and_never_downloads() -> None:

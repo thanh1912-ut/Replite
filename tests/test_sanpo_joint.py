@@ -85,9 +85,7 @@ def _build_session(tmp_path: Path, *, include_detection: bool = True) -> Path:
         "depth_path": f"{sensor}/left/depth_maps/000010.float16.gz",
     }
     if include_detection:
-        sample["detection_path"] = (
-            f"{sensor}/left/detection_boxes/000010.json"
-        )
+        sample["detection_path"] = f"{sensor}/left/detection_boxes/000010.json"
     manifest = {
         "schema_version": 2,
         "dataset": "SANPO-Real-v0-joint",
@@ -193,6 +191,7 @@ def test_joint_dataset_emits_synchronized_replite_contract(tmp_path: Path) -> No
     assert provenance["session_id"] == "session-alpha"
     assert provenance["target_frame"] == 10
     assert provenance["detection_source"] == "packaged_json"
+    assert provenance["detection_included"] is True
 
 
 def test_legacy_joint_dataset_derives_detection_from_panoptic_per_sample(
@@ -278,16 +277,12 @@ def test_legacy_catalog_policy_can_force_panoptic_over_unversioned_json(
 def test_locked_threshold_and_packaged_on_load_detection_are_equivalent(
     tmp_path: Path,
 ) -> None:
-    legacy_manifest = _build_session(
-        tmp_path / "legacy", include_detection=False
-    )
+    legacy_manifest = _build_session(tmp_path / "legacy", include_detection=False)
     packaged_manifest = _build_session(tmp_path / "packaged")
     _write_detection_threshold_case(legacy_manifest)
     _write_detection_threshold_case(packaged_manifest)
 
-    legacy = SanpoJointDataset(
-        legacy_manifest, image_size=(20, 25), normalize=False
-    )
+    legacy = SanpoJointDataset(legacy_manifest, image_size=(20, 25), normalize=False)
     packaged = SanpoJointDataset(
         packaged_manifest, image_size=(20, 25), normalize=False
     )
@@ -332,6 +327,111 @@ def test_use_packaged_detection_is_validated_early(tmp_path: Path) -> None:
         )
 
 
+def test_include_detection_is_validated_early(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="include_detection"):
+        SanpoJointDataset(
+            _build_session(tmp_path),
+            include_detection=1,  # type: ignore[arg-type]
+        )
+
+
+def test_dense_only_dataset_never_builds_or_caches_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _build_session(tmp_path / "source", include_detection=False)
+    monkeypatch.setattr(
+        sanpo_joint_module,
+        "sanpo_panoptic_to_detection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("detection conversion must be disabled")
+        ),
+    )
+    dataset = SanpoJointDataset(
+        manifest,
+        image_size=(8, 16),
+        include_detection=False,
+        normalize=False,
+        prepared_cache_dir=tmp_path / "prepared",
+    )
+
+    _, targets = dataset[0]
+
+    assert set(targets) == {
+        "segmentation",
+        "segmentation_valid",
+        "depth",
+        "depth_valid",
+    }
+    provenance = dataset.sample_provenance(0)
+    assert provenance["detection_source"] == "panoptic_on_load"
+    assert provenance["detection_included"] is False
+    cache_file = next(dataset.prepared_cache_dir.glob("*.pt"))  # type: ignore[union-attr]
+    payload = torch.load(cache_file, map_location="cpu", weights_only=True)
+    assert set(payload["tensors"]) == {
+        "rgb_uint8",
+        "segmentation_uint8",
+        "depth_float16",
+        "depth_valid",
+    }
+
+
+def test_dense_only_packaged_sample_never_reads_detection_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _build_session(tmp_path / "source", include_detection=True)
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("dense-only mode must not read or derive detection")
+
+    monkeypatch.setattr(sanpo_joint_module, "_read_detection_target", forbidden)
+    monkeypatch.setattr(
+        sanpo_joint_module,
+        "sanpo_panoptic_to_detection",
+        forbidden,
+    )
+    dataset = SanpoJointDataset(
+        manifest,
+        image_size=(8, 16),
+        include_detection=False,
+        normalize=False,
+        prepared_cache_dir=tmp_path / "prepared",
+    )
+
+    status = dataset.prepared_cache_status()
+    _, targets = dataset[0]
+
+    assert status["estimated_sample_bytes"] == 13 * 8 * 16 + 64 * 1024
+    assert "detection" not in targets
+    provenance = dataset.sample_provenance(0)
+    assert provenance["detection_source"] == "packaged_json"
+    assert provenance["detection_included"] is False
+
+
+def test_detection_enabled_cache_key_remains_legacy_compatible(
+    tmp_path: Path,
+) -> None:
+    manifest = _build_session(tmp_path)
+    common = {
+        "image_size": (8, 16),
+        "detection_min_area": 1,
+        "normalize": False,
+    }
+    implicit = SanpoJointDataset(manifest, **common)
+    explicit = SanpoJointDataset(manifest, include_detection=True, **common)
+    dense_only = SanpoJointDataset(
+        manifest,
+        include_detection=False,
+        **common,
+    )
+
+    # This digest was produced by the cache contract before include_detection
+    # existed. Detection-enabled jobs must continue to reuse those cache files.
+    legacy_key = "73c24e96d118213c777b715b10f41f01bb69967399bdbaccdaa14e36f0385e88"
+    assert implicit._prepared_cache_key == legacy_key
+    assert explicit._prepared_cache_key == legacy_key
+    assert dense_only._prepared_cache_key != legacy_key
+
+
 def test_collate_keeps_detection_targets_as_list(tmp_path: Path) -> None:
     dataset = SanpoJointDataset(_build_session(tmp_path), image_size=(8, 16))
     batch = sanpo_joint_collate([dataset[0], dataset[0]])
@@ -341,6 +441,27 @@ def test_collate_keeps_detection_targets_as_list(tmp_path: Path) -> None:
     assert len(targets["detection"]) == 2
     assert targets["segmentation"].shape == (2, 8, 16)
     assert targets["depth"].shape == (2, 1, 8, 16)
+
+
+def test_collate_supports_dense_only_targets(tmp_path: Path) -> None:
+    dataset = SanpoJointDataset(
+        _build_session(tmp_path),
+        image_size=(8, 16),
+        include_detection=False,
+    )
+    inputs, targets = sanpo_joint_collate([dataset[0], dataset[0]])
+    assert inputs.shape == (2, 3, 3, 8, 16)
+    assert "detection" not in targets
+    assert targets["segmentation"].shape == (2, 8, 16)
+    assert targets["depth"].shape == (2, 1, 8, 16)
+
+
+def test_collate_rejects_mixed_detection_modes(tmp_path: Path) -> None:
+    manifest = _build_session(tmp_path)
+    detection = SanpoJointDataset(manifest, image_size=(8, 16))[0]
+    dense = SanpoJointDataset(manifest, image_size=(8, 16), include_detection=False)[0]
+    with pytest.raises(ValueError, match="mixes detection-enabled"):
+        sanpo_joint_collate([detection, dense])
 
 
 def _assert_joint_sample_equal(

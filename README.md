@@ -358,14 +358,18 @@ validation, and one official-test session for holdout. The holdout is catalogued
 for provenance but is never extracted or passed to training, validation,
 early stopping, or checkpoint selection.
 
-The Drive ledger may contain 237 entries because the three pilot sessions were
-repackaged after versioned detection JSON was introduced. Catalog resolution
-still produces exactly 234 source shards: it prefers those three packages and
-uses the 231 source-keyed legacy archives for the remainder. Legacy shards do
-not need to be downloaded or repacked again; their boxes are derived from the
-already-loaded panoptic mask with the same locked 8-connected, 100-pixel,
-half-open-XYXY policy. The catalog fingerprint records which representation
-was used for every shard.
+The main SANPO campaign activates only **semantic segmentation and metric
+depth**. Detection is deliberately disabled because this experiment does not
+treat panoptic components as a reliable detection benchmark: the loader does
+not read or derive boxes, the model physically omits the detection head/PAN/C5
+path, and validation does not decode boxes or report mAP. Detection remains a
+supported RepLite task for other datasets and the earlier detection smoke
+workflow remains available; it is not deleted from the library.
+
+The Drive ledger may contain 237 entries because three pilot sessions were
+repackaged. Catalog resolution still produces exactly 234 source shards and
+records their immutable provenance, but any packaged detection payload is
+ignored by this dense-only campaign.
 
 Run the notebook cells in order. Cell 3 prints the resolved architecture,
 MobileNet feature stages, ImageNet-1K weight provenance, parameter counts,
@@ -395,12 +399,13 @@ optimizer updates, warmup updates, workers, prefetch, and log cadence. During
 SSD staging it reports ready/total shards, overall GiB and percentage, current
 session-camera, copy/extract/verify phase, throughput, ETA, and remaining SSD
 space. Train and validation rows include current/total batch, percentage,
-iterations per second, ETA, task losses, VRAM, instances, resolution, and LR.
+iterations per second, ETA, total/segmentation/depth losses, VRAM, resolution,
+and LR.
 Wrapper keepalives appear only after 30 seconds with no child output, so they do
 not obscure real progress. `console.log` contains only the current/latest
 command for `tail -F`; immutable per-invocation logs live below `logs/`. Every
-validation writes detection mAP50/mAP50--95 and per-class AP,
-segmentation mIoU/pixel accuracy/per-class IoU, and depth AbsRel/RMSE/delta1.
+validation writes segmentation mIoU/pixel accuracy/per-class IoU and depth
+AbsRel/RMSE/delta1.
 Each completed epoch publishes a versioned SHA-256 snapshot containing the
 checkpoint, history, metrics, resolved configuration, and split metadata.
 After a Colab disconnect, rerun setup/config and Cell 4 because `/content` is
@@ -418,17 +423,15 @@ identity, and referenced payload signatures before reuse.
 The staged loader reuses one global map-style dataset and one persistent worker
 pool across all selected shards, so batches can cross session boundaries and
 there is only one tail batch per split. Cell 4 also builds an atomic, versioned
-local cache of resized RGB, segmentation, lossless float16 depth, valid masks,
-and exact detection boxes. Later epochs therefore do not reread Drive,
-re-extract archives, decode PNG/depth gzip, or rerun connected components. Both
+local cache of resized RGB, segmentation, lossless float16 depth, and valid
+masks. Later epochs therefore do not reread Drive, re-extract archives, or
+decode PNG/depth gzip. Both
 archive staging and cache warming are resumable and print progress, throughput,
 ETA, and disk planning. Capacity planning uses the downloader's exact selected-
 file byte totals plus a configurable allowance. After full
 campaign completion, Cell 8 may reclaim that private train/val cache and stage
 only the single frozen official-test session. It is blocked before full
-campaign completion, and staging alone does not evaluate the holdout. Derived
-detection boxes remain an internal panoptic-to-box protocol,
-not an official SANPO detection benchmark.
+campaign completion, and staging alone does not evaluate the holdout.
 
 This is explicitly a 20-session limited-data experiment. Its metrics must not
 be reported as full-corpus SANPO results; the selected session IDs and policy

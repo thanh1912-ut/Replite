@@ -98,6 +98,114 @@ def test_plain_reporter_emits_deterministic_batch_progress_speed_and_eta() -> No
     assert last[TRAIN_PROGRESS_COLUMNS.index("ETA")] == "00:00"
 
 
+def test_dense_only_reporter_omits_detection_columns_and_metrics() -> None:
+    stream = StringIO()
+    ticks = iter((0.0, 2.0))
+    reporter = YoloProgressReporter(
+        every_n_steps=20,
+        reg_max=0,
+        active_tasks=("segmentation", "depth"),
+        stream=stream,
+        use_tqdm=False,
+        clock=lambda: next(ticks),
+    )
+    reporter(
+        "train_epoch_start",
+        {"epoch": 0, "total_epochs": 1, "total_batches": 1},
+    )
+    reporter(
+        "train_batch_end",
+        {
+            "epoch": 0,
+            "total_epochs": 1,
+            "total_batches": 1,
+            "batches_completed": 1,
+            "running_losses": {
+                "total": 1.25,
+                "segmentation": 0.75,
+                "depth": 0.5,
+            },
+            "instances": 99,
+            "image_size": (288, 512),
+            "lr": [0.001],
+            "gpu_memory_bytes": 1024**3,
+        },
+    )
+    reporter(
+        "validation_end",
+        {
+            "result": {
+                "segmentation/miou": 0.42,
+                "segmentation/pixel_accuracy": 0.88,
+                "depth/abs_rel": 0.14,
+                "depth/rmse": 2.4,
+                "depth/delta1": 0.81,
+            }
+        },
+    )
+
+    lines = stream.getvalue().splitlines()
+    train_columns = lines[0].split("\t")
+    assert train_columns == [
+        "Epoch",
+        "GPU_mem",
+        "Batch",
+        "Progress",
+        "Speed",
+        "ETA",
+        "total",
+        "seg",
+        "depth",
+        "Size",
+        "lr",
+    ]
+    assert not {"box", "cls", "qual", "dfl", "Inst"} & set(train_columns)
+    assert lines[1].split("\t") == [
+        "1/1",
+        "1.00G",
+        "1/1",
+        "100.0%",
+        "0.50it/s",
+        "00:00",
+        "1.2500",
+        "0.7500",
+        "0.5000",
+        "288x512",
+        "0.001000",
+    ]
+    validation_columns = lines[2].split("\t")
+    assert validation_columns == [
+        "Task",
+        "mIoU",
+        "pixel accuracy",
+        "AbsRel",
+        "RMSE(m)",
+        "delta1",
+    ]
+    assert not {"Images", "Targets", "mAP50", "mAP50-95"} & set(validation_columns)
+    assert lines[3] == "all\t0.4200\t0.8800\t0.1400\t2.4000\t0.8100"
+
+
+def test_explicit_active_tasks_are_validated_and_use_stable_task_order() -> None:
+    reporter = YoloProgressReporter(
+        active_tasks=["depth", "detection", "segmentation"],
+        stream=StringIO(),
+        use_tqdm=False,
+    )
+    assert reporter.active_tasks == ("detection", "segmentation", "depth")
+    assert reporter.train_progress_columns == TRAIN_PROGRESS_COLUMNS
+    assert reporter.validation_columns == VALIDATION_COLUMNS
+
+    with pytest.raises(TypeError, match="sequence"):
+        YoloProgressReporter(active_tasks="segmentation")
+    with pytest.raises(ValueError, match="must not be empty"):
+        YoloProgressReporter(active_tasks=[])
+    with pytest.raises(ValueError, match="duplicates"):
+        YoloProgressReporter(active_tasks=["depth", "depth"])
+    with pytest.raises(ValueError, match="unknown active_tasks"):
+        YoloProgressReporter(active_tasks=["optical_flow"])
+
+
 def test_validation_progress_reports_first_cadence_last_and_metrics() -> None:
     stream = StringIO()
     ticks = iter((10.0, 12.0, 14.0, 20.0))
@@ -159,7 +267,10 @@ def test_validation_end_prints_all_task_metrics() -> None:
     reporter("validation_end", {"result": _validation_result()})
     lines = stream.getvalue().splitlines()
     assert lines[0] == "\t".join(VALIDATION_COLUMNS)
-    assert lines[1] == "all\t12\t34\t0.6100\t0.4200\t0.5300\t0.9100\t0.1200\t2.5000\t0.8300"
+    assert (
+        lines[1]
+        == "all\t12\t34\t0.6100\t0.4200\t0.5300\t0.9100\t0.1200\t2.5000\t0.8300"
+    )
 
 
 def test_flatten_epoch_record_has_stable_complete_schema() -> None:

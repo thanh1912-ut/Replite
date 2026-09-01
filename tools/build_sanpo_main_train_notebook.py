@@ -32,7 +32,7 @@ def code(source: str) -> dict[str, object]:
 cells = [
     markdown(
         r"""
-        # RepLite × SANPO-Real — 20 fit + 1 val + 1 test holdout
+        # RepLite × SANPO-Real — segmentation + depth, 20 fit + 1 val + 1 test holdout
 
         Notebook này **không tải lại data**. Nó dùng 234 archive đã có trên Drive,
         audit đủ `186 official-train + 48 official-test`, rồi dùng seed 42 + SHA-256
@@ -49,7 +49,7 @@ cells = [
         4. kiểm cache, copy + SHA + giải nén chỉ các shard thuộc **20 fit + 1 val**
            lên SSD `/content`, có disk preflight và resume;
         5. preflight bằng model dùng một lần, sau đó chạy đúng **epoch 1** trên toàn bộ
-           train/val với log kiểu YOLO và metric mAP/mIoU/depth;
+           train/val với log kiểu YOLO và metric segmentation/depth;
         6. chỉ khi gate epoch 1 đạt và bạn nhập approval token, strict-resume epoch 2
            để chạy hết campaign.
 
@@ -59,10 +59,9 @@ cells = [
         hoàn tất; đúng 1 official-test holdout chỉ được stage sau đó bằng cell riêng. Snapshot versioned có
         SHA-256 được mirror lên Drive sau từng epoch.
 
-        `archive_manifest.json` có thể có 237 entry vì ba pilot đã được đóng gói lại.
-        Audit sẽ chọn đúng 234 source shard: ưu tiên ba package mới, còn 231 archive cũ
-        sinh box trực tiếp từ panoptic theo cùng policy khóa ở ngưỡng 100 pixel; không
-        tải lại hay repack dữ liệu cũ.
+        Campaign này cố ý **tắt detection cho SANPO**: không đọc/sinh box, không dựng
+        detection head và không tính mAP. Khả năng detection vẫn được giữ nguyên trong
+        thư viện RepLite để dùng với dataset khác có detection taxonomy phù hợp.
 
         Log staging hiển thị shard/GiB/phase/speed/ETA/free SSD. Trước train, bảng
         `TRAINING PLAN (EXACT)` cho biết chính xác train batches/epoch, optimizer
@@ -157,7 +156,7 @@ cells = [
         LOCAL_WORK_ROOT = Path("/content/replite_sanpo_main")
         DRIVE_RUNS_ROOT = DRIVE_DATA_ROOT / "main_runs"
 
-        RUN_ID = "replite_sanpo_mnv4convs_20fit_1val_1test_seed42_v1"  #@param {type:"string"}
+        RUN_ID = "replite_sanpo_mnv4convs_20fit_1val_1test_segdepth_seed42_v1"  #@param {type:"string"}
         # Cache riêng của campaign. Sau khi train đủ epoch, Cell 8 có thể xóa
         # 21 official-train shard rồi stage đúng một official-test holdout.
         LOCAL_STAGE_CACHE_ID = RUN_ID
@@ -169,7 +168,6 @@ cells = [
         BATCH_SIZE = 16  #@param {type:"integer"}
         NUM_WORKERS = 4  #@param {type:"integer"}
         PREFETCH_FACTOR = 2  #@param {type:"integer"}
-        DETECTION_MIN_COMPONENT_PIXELS = 100
         SEED = 42  #@param {type:"integer"}
         FIT_SESSION_COUNT = 20
         VALIDATION_SESSION_COUNT = 1
@@ -262,6 +260,7 @@ cells = [
             "drive_runs_root": str(DRIVE_RUNS_ROOT),
             "local_work_root": str(LOCAL_WORK_ROOT),
             "model": {
+                "active_tasks": ["segmentation", "depth"],
                 "backbone_name": BACKBONE_NAME,
                 "pretrained_in1k": PRETRAINED_IN1K,
                 "recurrence_steps": 3,
@@ -270,9 +269,6 @@ cells = [
                 "neck_channels": 48,
                 "dense_channels": 32,
                 "task_adapter_channels": 32,
-                "detection_head_channels": 48,
-                "detection_head_blocks": 2,
-                "detection_reg_max": 0,
                 "use_sppf": False,
             },
             "data": {
@@ -281,7 +277,6 @@ cells = [
                 "batch_size": BATCH_SIZE,
                 "num_workers": NUM_WORKERS,
                 "prefetch_factor": PREFETCH_FACTOR,
-                "detection_min_component_pixels": DETECTION_MIN_COMPONENT_PIXELS,
                 "fit_session_count": FIT_SESSION_COUNT,
                 "validation_session_count": VALIDATION_SESSION_COUNT,
                 "official_test_session_count": OFFICIAL_TEST_SESSION_COUNT,
@@ -312,11 +307,7 @@ cells = [
                 "monitor_mode": "min",
                 "max_peak_vram_gib": MAX_PEAK_VRAM_GIB,
             },
-            "metrics": {
-                "detection_score_threshold": 0.001,
-                "detection_nms_iou_threshold": 0.6,
-                "detection_max_detections": 300,
-            },
+            "metrics": {},
         }
         CONFIG_DIR = LOCAL_WORK_ROOT / "configs"
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -479,9 +470,9 @@ cells = [
         (20 fit + 1 inner-val):
         kiểm dung lượng, copy từng archive từ Drive trong khi tính SHA-256, giải nén vào
         thư mục tạm rồi publish atomically. Archive nén local được xoá ngay sau khi shard
-        giải nén xong. Sau đó cell tiền xử lý một lần RGB/mask/depth/box vào cache SSD
+        giải nén xong. Sau đó cell tiền xử lý một lần RGB/mask/depth vào cache SSD
         có progress, tốc độ và ETA; pilot/main chỉ đọc cache này thay vì lặp lại PNG,
-        `depth.gz` và connected-components mỗi epoch. Nếu cell ngắt, chạy lại sẽ bỏ qua
+        `depth.gz` mỗi epoch. Nếu cell ngắt, chạy lại sẽ bỏ qua
         shard và sample cache đã hoàn tất.
 
         Pilot và main train sẽ bị từ chối nếu subset đã chọn chưa stage đủ. Các shard
@@ -503,13 +494,12 @@ cells = [
         nên model production không bị đổi BatchNorm hay RNG. Sau đó nó train epoch 1 trên
         toàn train split, validation trên toàn val split, in log kiểu YOLO và lưu:
 
-        - detection: mAP50, mAP50–95 và AP từng lớp;
         - segmentation: mIoU, pixel accuracy và IoU từng lớp;
         - depth: AbsRel, RMSE (m) và δ1;
         - `last.pt`, `best.pt`, history, resolved config và snapshot SHA-256 trên Drive.
 
-        Dữ liệu detection của SANPO ở đây là box **dẫn xuất từ panoptic**, nên metric là
-        metric nội bộ của protocol này, không được gọi là official SANPO detection benchmark.
+        Detection bị tắt vật lý cho campaign này. Notebook không tạo box, không chạy
+        FCOS/NMS và không ghi mAP; model chỉ giữ nhánh segmentation + depth.
         """
     ),
     code(

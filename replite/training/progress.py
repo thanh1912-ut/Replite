@@ -36,6 +36,24 @@ TRAIN_PROGRESS_COLUMNS = (
     "lr",
 )
 
+_TASK_ORDER = ("detection", "segmentation", "depth", "classification")
+_TRAIN_PROGRESS_PREFIX = (
+    "Epoch",
+    "GPU_mem",
+    "Batch",
+    "Progress",
+    "Speed",
+    "ETA",
+    "total",
+)
+_TRAIN_TASK_COLUMNS = {
+    "detection": ("box", "cls", "qual", "dfl"),
+    "segmentation": ("seg",),
+    "depth": ("depth",),
+    "classification": ("class",),
+}
+_TRAIN_PROGRESS_SUFFIX = ("Size", "lr")
+
 VALIDATION_COLUMNS = (
     "Task",
     "Images",
@@ -48,6 +66,13 @@ VALIDATION_COLUMNS = (
     "RMSE(m)",
     "delta1",
 )
+
+_VALIDATION_TASK_COLUMNS = {
+    "detection": ("Images", "Targets", "mAP50", "mAP50-95"),
+    "segmentation": ("mIoU", "pixel accuracy"),
+    "depth": ("AbsRel", "RMSE(m)", "delta1"),
+    "classification": ("Samples", "top1 accuracy"),
+}
 
 VALIDATION_PROGRESS_COLUMNS = ("Val", "Batch", "Progress", "Speed", "ETA")
 
@@ -125,7 +150,9 @@ def _metric(result: Mapping[str, Any], name: str) -> int | float | None:
     return _as_optional_number(result.get(name), name=name)
 
 
-def validation_summary(result: Mapping[str, Any]) -> dict[str, int | float | str | None]:
+def validation_summary(
+    result: Mapping[str, Any],
+) -> dict[str, int | float | str | None]:
     """Return the single compact multi-task validation row used by the UI."""
 
     if not isinstance(result, Mapping):
@@ -160,17 +187,82 @@ def _format_duration(seconds: float | None) -> str:
     rounded = int(round(seconds))
     hours, remainder = divmod(rounded, 3600)
     minutes, secs = divmod(remainder, 60)
-    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+    return (
+        f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+    )
 
 
-def format_validation_table(result: Mapping[str, Any]) -> str:
+def _normalize_active_tasks(
+    active_tasks: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    """Validate and canonicalize an optional active-task selection.
+
+    ``None`` intentionally preserves the historical all-task progress schema.
+    Explicit task selections are emitted in the same stable order as
+    :class:`~replite.multitask.config.TaskConfig`, irrespective of caller
+    ordering.
+    """
+
+    if active_tasks is None:
+        return None
+    if isinstance(active_tasks, (str, bytes)) or not isinstance(active_tasks, Sequence):
+        raise TypeError("active_tasks must be a non-empty sequence or None")
+    requested = tuple(active_tasks)
+    if not requested:
+        raise ValueError("active_tasks must not be empty")
+    if any(not isinstance(task, str) for task in requested):
+        raise TypeError("active_tasks entries must be strings")
+    if len(set(requested)) != len(requested):
+        raise ValueError("active_tasks must not contain duplicates")
+    unknown = sorted(set(requested) - set(_TASK_ORDER))
+    if unknown:
+        raise ValueError("unknown active_tasks: " + ", ".join(unknown))
+    selected = set(requested)
+    return tuple(task for task in _TASK_ORDER if task in selected)
+
+
+def _train_progress_columns(active_tasks: tuple[str, ...] | None) -> tuple[str, ...]:
+    if active_tasks is None:
+        return TRAIN_PROGRESS_COLUMNS
+    columns = list(_TRAIN_PROGRESS_PREFIX)
+    for task in active_tasks:
+        columns.extend(_TRAIN_TASK_COLUMNS[task])
+    if "detection" in active_tasks:
+        columns.append("Inst")
+    columns.extend(_TRAIN_PROGRESS_SUFFIX)
+    return tuple(columns)
+
+
+def _validation_columns(active_tasks: tuple[str, ...] | None) -> tuple[str, ...]:
+    if active_tasks is None:
+        return VALIDATION_COLUMNS
+    columns = ["Task"]
+    for task in active_tasks:
+        columns.extend(_VALIDATION_TASK_COLUMNS[task])
+    return tuple(columns)
+
+
+def format_validation_table(
+    result: Mapping[str, Any],
+    *,
+    active_tasks: Sequence[str] | None = None,
+) -> str:
     """Format validation metrics as a tab-separated, YOLO-like task table."""
 
+    normalized_tasks = _normalize_active_tasks(active_tasks)
     row = validation_summary(result)
+    if normalized_tasks is not None and "classification" in normalized_tasks:
+        row.update(
+            {
+                "Samples": _metric(result, "classification/num_samples"),
+                "top1 accuracy": _metric(result, "classification/top1_accuracy"),
+            }
+        )
+    columns = _validation_columns(normalized_tasks)
     return "\n".join(
         (
-            "\t".join(VALIDATION_COLUMNS),
-            "\t".join(_format_cell(row[name]) for name in VALIDATION_COLUMNS),
+            "\t".join(columns),
+            "\t".join(_format_cell(row[name]) for name in columns),
         )
     )
 
@@ -334,6 +426,7 @@ class YoloProgressReporter:
         *,
         every_n_steps: int = 20,
         reg_max: int = 0,
+        active_tasks: Sequence[str] | None = None,
         stream: TextIO | None = None,
         use_tqdm: bool | None = None,
         clock: Any = time.monotonic,
@@ -344,12 +437,19 @@ class YoloProgressReporter:
             or every_n_steps <= 0
         ):
             raise ValueError("every_n_steps must be a positive integer")
-        if isinstance(reg_max, bool) or not isinstance(reg_max, Integral) or reg_max < 0:
+        if (
+            isinstance(reg_max, bool)
+            or not isinstance(reg_max, Integral)
+            or reg_max < 0
+        ):
             raise ValueError("reg_max must be a non-negative integer")
         if use_tqdm is not None and not isinstance(use_tqdm, bool):
             raise TypeError("use_tqdm must be a boolean or None")
         self.every_n_steps = int(every_n_steps)
         self.reg_max = int(reg_max)
+        self.active_tasks = _normalize_active_tasks(active_tasks)
+        self.train_progress_columns = _train_progress_columns(self.active_tasks)
+        self.validation_columns = _validation_columns(self.active_tasks)
         self.stream = sys.stdout if stream is None else stream
         self.use_tqdm = use_tqdm
         if not callable(clock):
@@ -384,11 +484,18 @@ class YoloProgressReporter:
             losses = {}
         epoch = int(payload.get("epoch", 0)) + 1
         total_epochs = payload.get("total_epochs")
-        epoch_text = f"{epoch}/{total_epochs}" if total_epochs is not None else str(epoch)
+        epoch_text = (
+            f"{epoch}/{total_epochs}" if total_epochs is not None else str(epoch)
+        )
 
         def loss(name: str) -> str:
             value = losses.get(name)
-            if value is None and name == "detection_dfl" and self.reg_max == 0:
+            if (
+                value is None
+                and name == "detection_dfl"
+                and self.reg_max == 0
+                and (self.active_tasks is None or "detection" in self.active_tasks)
+            ):
                 value = 0.0
             try:
                 checked = _as_optional_number(value, name=name)
@@ -408,7 +515,9 @@ class YoloProgressReporter:
         raw_lr = payload.get("lr")
         if isinstance(raw_lr, Sequence) and not isinstance(raw_lr, (str, bytes)):
             raw_lr = raw_lr[0] if raw_lr else None
-        checked_lr = _as_optional_number(raw_lr, name="lr") if raw_lr is not None else None
+        checked_lr = (
+            _as_optional_number(raw_lr, name="lr") if raw_lr is not None else None
+        )
         completed = int(payload.get("batches_completed", 0))
         total_batches_raw = payload.get("total_batches")
         total_batches = (
@@ -444,13 +553,16 @@ class YoloProgressReporter:
             "dfl": loss("detection_dfl"),
             "seg": loss("segmentation"),
             "depth": loss("depth"),
+            "class": loss("classification"),
             "Inst": _format_cell(payload.get("instances")),
             "Size": size,
             "lr": _format_cell(checked_lr, digits=6),
         }
 
     @staticmethod
-    def _validation_progress_values(payload: Mapping[str, Any], elapsed: float) -> dict[str, str]:
+    def _validation_progress_values(
+        payload: Mapping[str, Any], elapsed: float
+    ) -> dict[str, str]:
         epoch = payload.get("epoch")
         total_epochs = payload.get("total_epochs")
         val = "-" if epoch is None else str(int(epoch) + 1)
@@ -484,7 +596,7 @@ class YoloProgressReporter:
         if event == "train_epoch_start":
             self._close_bar()
             self._phase_started = float(self.clock())
-            self._print("\t".join(TRAIN_PROGRESS_COLUMNS))
+            self._print("\t".join(self.train_progress_columns))
             if self._wants_tqdm():
                 try:
                     from tqdm.auto import tqdm
@@ -506,9 +618,7 @@ class YoloProgressReporter:
             total_batches = payload.get("total_batches")
             last = total_batches is not None and completed >= int(total_batches)
             should_render = (
-                completed == 1
-                or completed % self.every_n_steps == 0
-                or last
+                completed == 1 or completed % self.every_n_steps == 0 or last
             )
             if self._bar is not None:
                 delta = max(0, completed - self._bar_completed)
@@ -518,11 +628,16 @@ class YoloProgressReporter:
                 if should_render:
                     values = self._progress_values(payload)
                     self._bar.set_postfix_str(
-                        " ".join(f"{name}={values[name]}" for name in TRAIN_PROGRESS_COLUMNS)
+                        " ".join(
+                            f"{name}={values[name]}"
+                            for name in self.train_progress_columns
+                        )
                     )
             elif should_render:
                 values = self._progress_values(payload)
-                self._print("\t".join(values[name] for name in TRAIN_PROGRESS_COLUMNS))
+                self._print(
+                    "\t".join(values[name] for name in self.train_progress_columns)
+                )
             return
 
         if event == "train_epoch_end":
@@ -553,7 +668,7 @@ class YoloProgressReporter:
             result = payload.get("result", {})
             if not isinstance(result, Mapping):
                 raise TypeError("validation_end result must be a mapping")
-            self._print(format_validation_table(result))
+            self._print(format_validation_table(result, active_tasks=self.active_tasks))
 
 
 __all__ = [

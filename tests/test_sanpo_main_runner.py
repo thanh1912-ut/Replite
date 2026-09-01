@@ -23,10 +23,20 @@ def _config(tmp_path: Path) -> dict[str, object]:
         "drive_data_root": str(tmp_path / "data"),
         "drive_runs_root": str(tmp_path / "runs"),
         "local_work_root": str(tmp_path / "local"),
-        "model": {},
+        "model": {
+            "active_tasks": ["segmentation", "depth"],
+            "backbone_name": "mobilenetv4_conv_small",
+            "pretrained_in1k": False,
+            "recurrence_steps": 3,
+            "recurrent_c4_channels": 48,
+            "recurrent_c5_channels": 64,
+            "neck_channels": 48,
+            "dense_channels": 32,
+            "task_adapter_channels": 32,
+            "use_sppf": False,
+        },
         "data": {
             "image_size": [288, 512],
-            "detection_min_component_pixels": 100,
         },
         "train": {"epochs": 50},
         "metrics": {},
@@ -55,6 +65,40 @@ def test_load_campaign_accepts_locked_twenty_one_one_subset(
     path.write_text(json.dumps(expected), encoding="utf-8")
     _, actual = runner.load_campaign(path)
     assert actual["data"]["fit_session_count"] == 20
+
+
+def test_sanpo_model_loss_and_metrics_are_dense_only(tmp_path: Path) -> None:
+    prepared = SimpleNamespace(config=_config(tmp_path))
+    prepared.config["data"].update(  # type: ignore[union-attr]
+        depth_min_metres=0.1,
+        depth_max_metres=80.0,
+    )
+
+    config = runner.model_config(prepared, pretrained=False)
+    criterion = runner.create_criterion(prepared)
+
+    assert config.active_tasks == ("segmentation", "depth")
+    assert config.tasks.detection_classes is None
+    assert criterion.detection_criterion is None
+
+    metrics = runner.create_metrics(prepared)
+    assert metrics.detection is None
+    assert metrics.segmentation is not None
+    assert metrics.depth is not None
+
+
+def test_sanpo_dense_only_model_physically_prunes_detection_path(
+    tmp_path: Path,
+) -> None:
+    prepared = SimpleNamespace(config=_config(tmp_path))
+    model = runner.create_replite_model(runner.model_config(prepared, pretrained=False))
+
+    assert model.active_tasks == ("segmentation", "depth")
+    assert model.backbone.out_indices == (0, 1, 2)
+    assert not hasattr(model, "detection_head")
+    assert not hasattr(model.neck, "detection_path")
+    assert not hasattr(model.neck, "recurrent5")
+    assert sum(parameter.numel() for parameter in model.parameters()) == 363_969
 
 
 @pytest.mark.parametrize(
@@ -93,12 +137,14 @@ def test_load_campaign_rejects_incomplete_or_invalid_subset_counts(
         (lambda value: value["train"].update(epochs=1), "epochs"),
         (lambda value: value["data"].update(image_size=[287, 512]), "image_size"),
         (
-            lambda value: value["data"].update(detection_min_component_pixels=101),
-            "detection_min_component_pixels",
+            lambda value: value["model"].update(
+                active_tasks=["detection", "segmentation", "depth"]
+            ),
+            "active_tasks",
         ),
         (
-            lambda value: value["data"].update(detection_min_component_pixels=100.0),
-            "detection_min_component_pixels",
+            lambda value: value["model"].update(active_tasks=["depth", "segmentation"]),
+            "active_tasks",
         ),
     ),
 )
@@ -221,11 +267,10 @@ def test_disposable_preflight_reports_proven_amp_scale(monkeypatch) -> None:
 
         def forward(self, inputs):
             value = inputs * self.weight
-            detection = SimpleNamespace(cls_logits=(value, value, value))
             return SimpleNamespace(
                 segmentation=value,
                 depth=value,
-                detection=detection,
+                detection=None,
             )
 
     class ToyCriterion(nn.Module):
@@ -254,6 +299,8 @@ def test_disposable_preflight_reports_proven_amp_scale(monkeypatch) -> None:
     assert result["amp_safety_margin_factor"] == 4
     assert result["amp_backoff_count"] == len(result["amp_overflow_attempts"])
     assert result["production_model_mutated"] is False
+    assert result["active_tasks"] == ["segmentation", "depth"]
+    assert result["detection_disabled"] is True
 
 
 def test_catalog_contract_locks_full_download_and_no_split_overlap() -> None:
@@ -291,9 +338,31 @@ def test_runner_never_builds_a_loader_from_official_test() -> None:
     assert "ArchiveShardLoader(split.official_test_records" not in source
     assert '"official_test_used": False' in source
     assert "stop_after_epoch=1" in source
+    assert '"include_detection": False' in source
     assert "publish_epoch_snapshot(" in source
     assert "restore_latest_snapshot(" in source
-    assert '"DETECTION LABEL SOURCE"' in source
+    assert '"ACTIVE TASKS"' in source
+    assert '"DETECTION LABEL SOURCE"' not in source
+
+
+def test_dense_only_reports_never_publish_detection_csv(tmp_path: Path) -> None:
+    prepared = SimpleNamespace(local_run=tmp_path)
+    latest = {
+        "epoch": 0,
+        "val": {
+            "total": 1.0,
+            "segmentation/per_class_iou": [],
+            "segmentation/present_classes": [],
+            "segmentation/num_pixels": 1,
+            "depth/num_pixels": 1,
+        },
+    }
+
+    runner._write_reports(prepared, [latest], latest)
+
+    assert (tmp_path / "val_segmentation_per_class.csv").is_file()
+    assert not (tmp_path / "val_detection_per_class.csv").exists()
+    assert "val_detection_per_class.csv" not in runner._snapshot_files(tmp_path)
 
 
 def test_cli_requires_explicit_approval_for_main() -> None:

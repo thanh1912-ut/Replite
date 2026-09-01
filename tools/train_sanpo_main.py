@@ -31,9 +31,6 @@ from replite.data import (
     ArchiveGroupSplit,
     ArchiveShardLoader,
     LocalArchiveStage,
-    SANPO_DERIVED_DETECTION_CONFIG,
-    SANPO_DERIVED_DETECTION_CONFIG_SHA256,
-    SANPO_DETECTION_CLASS_NAMES,
     SANPO_SEGMENTATION_CLASS_NAMES,
     SANPO_SEGMENTATION_IGNORE_INDEX,
     SanpoArchiveRecord,
@@ -45,7 +42,6 @@ from replite.multitask import RepLiteConfig, TaskConfig, create_replite_model
 from replite.training import (
     CheckpointManager,
     DepthMetrics,
-    DetectionMAP,
     MultiTaskCriterion,
     MultiTaskMetrics,
     SegmentationMetrics,
@@ -56,7 +52,6 @@ from replite.training import (
     WarmupCosineScheduler,
     YoloProgressReporter,
     create_adamw,
-    detection_per_class_rows,
     flatten_epoch_record,
     move_to_device,
     publish_epoch_snapshot,
@@ -72,11 +67,9 @@ EXPECTED = {
     "train_frames": 14_718,
     "test_frames": 3_803,
 }
-PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v5"
-APPROVAL_KIND = "replite-sanpo-main-epoch1-approval-v4"
-DETECTION_MIN_COMPONENT_PIXELS = int(
-    SANPO_DERIVED_DETECTION_CONFIG["min_component_pixels"]
-)
+PROTOCOL_ID = "replite-sanpo-real-human-v0-segdepth-session-split-v6"
+APPROVAL_KIND = "replite-sanpo-main-segdepth-epoch1-approval-v5"
+ACTIVE_TASKS = ("segmentation", "depth")
 
 
 def _jsonable(value: Any) -> Any:
@@ -159,6 +152,12 @@ def load_campaign(filename: str | os.PathLike[str]) -> tuple[Path, dict[str, Any
         token in value["run_id"] for token in ("/", "\\")
     ):
         raise ValueError("run_id must be a plain directory name")
+    active_tasks = value["model"].get("active_tasks")
+    if active_tasks != list(ACTIVE_TASKS):
+        raise ValueError(
+            "model.active_tasks must be exactly ['segmentation', 'depth'] "
+            "for the SANPO dense-only protocol"
+        )
     epochs = value["train"].get("epochs")
     if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 2:
         raise ValueError("train.epochs must be at least two")
@@ -175,16 +174,6 @@ def load_campaign(filename: str | os.PathLike[str]) -> tuple[Path, dict[str, Any
         )
     ):
         raise ValueError("data.image_size must be two positive multiples of 32")
-    detection_min_area = value["data"].get("detection_min_component_pixels")
-    if (
-        isinstance(detection_min_area, bool)
-        or not isinstance(detection_min_area, int)
-        or detection_min_area != DETECTION_MIN_COMPONENT_PIXELS
-    ):
-        raise ValueError(
-            "data.detection_min_component_pixels must be 100 for the locked "
-            "SANPO derived-detection protocol"
-        )
     subset_fields = (
         "fit_session_count",
         "validation_session_count",
@@ -268,7 +257,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
     if not data_root.is_dir():
         raise FileNotFoundError(f"SANPO data root is missing: {data_root}")
     print(
-        "[prepare] 1/3 metadata catalog từ Drive " "(không stat 234 archive/sidecar)",
+        "[prepare] 1/3 metadata catalog từ Drive (không stat 234 archive/sidecar)",
         flush=True,
     )
     catalog = load_archive_catalog(
@@ -276,11 +265,6 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         validate_archive_files=False,
         validate_sidecars=False,
     )
-    if catalog.detection_config_sha256 != SANPO_DERIVED_DETECTION_CONFIG_SHA256:
-        raise ValueError(
-            "archive catalog detection policy differs from the locked main "
-            "training protocol"
-        )
     _assert_catalog(catalog)
     print(
         f"[prepare] 2/3 catalog OK | {len(catalog.records)} archives | "
@@ -411,6 +395,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         **context.as_dict(),
         "run_id": config["run_id"],
         "protocol_id": PROTOCOL_ID,
+        "active_tasks": list(ACTIVE_TASKS),
         "official_test_used": False,
     }
     local_root = Path(config["local_work_root"]).expanduser().resolve()
@@ -461,7 +446,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         "dataset_kwargs": {
             "depth_min": float(config["data"]["depth_min_metres"]),
             "depth_max": float(config["data"]["depth_max_metres"]),
-            "detection_min_area": int(config["data"]["detection_min_component_pixels"]),
+            "include_detection": False,
             "normalize": True,
         },
         "local_stage": train_stage,
@@ -492,7 +477,7 @@ def model_config(
     source = prepared.config["model"]
     return RepLiteConfig(
         tasks=TaskConfig(
-            detection_classes=len(SANPO_DETECTION_CLASS_NAMES),
+            detection_classes=None,
             segmentation_classes=len(SANPO_SEGMENTATION_CLASS_NAMES),
             depth=True,
             gated_dense_fusion=True,
@@ -507,9 +492,6 @@ def model_config(
         neck_channels=int(source["neck_channels"]),
         dense_channels=int(source["dense_channels"]),
         task_adapter_channels=int(source["task_adapter_channels"]),
-        detection_head_channels=int(source["detection_head_channels"]),
-        detection_head_blocks=int(source["detection_head_blocks"]),
-        detection_reg_max=int(source["detection_reg_max"]),
         use_sppf=bool(source["use_sppf"]),
     )
 
@@ -524,8 +506,6 @@ def create_model(prepared: Prepared) -> nn.Module:
 def create_criterion(prepared: Prepared) -> MultiTaskCriterion:
     data = prepared.config["data"]
     return MultiTaskCriterion(
-        detection_num_classes=len(SANPO_DETECTION_CLASS_NAMES),
-        detection_reg_max=model_config(prepared).detection_reg_max,
         segmentation_ignore_index=SANPO_SEGMENTATION_IGNORE_INDEX,
         depth_loss_type="log_l1_silog",
         depth_min=float(data["depth_min_metres"]),
@@ -573,13 +553,8 @@ def create_optimizer_schedule(
 
 
 def create_metrics(prepared: Prepared) -> MultiTaskMetrics:
-    metric = prepared.config["metrics"]
     data = prepared.config["data"]
     return MultiTaskMetrics(
-        detection=DetectionMAP(
-            len(SANPO_DETECTION_CLASS_NAMES),
-            max_detections=int(metric["detection_max_detections"]),
-        ),
         segmentation=SegmentationMetrics(
             len(SANPO_SEGMENTATION_CLASS_NAMES),
             ignore_index=SANPO_SEGMENTATION_IGNORE_INDEX,
@@ -588,9 +563,6 @@ def create_metrics(prepared: Prepared) -> MultiTaskMetrics:
             min_depth=float(data["depth_min_metres"]),
             max_depth=float(data["depth_max_metres"]),
         ),
-        detection_reg_max=model_config(prepared).detection_reg_max,
-        detection_score_threshold=float(metric["detection_score_threshold"]),
-        detection_nms_iou_threshold=float(metric["detection_nms_iou_threshold"]),
     )
 
 
@@ -635,7 +607,7 @@ def build_train_objects(
         checkpoint_extra=prepared.checkpoint_extra,
         event_callback=YoloProgressReporter(
             every_n_steps=int(prepared.config["train"]["progress_every_n_steps"]),
-            reg_max=model_config(prepared).detection_reg_max,
+            active_tasks=ACTIVE_TASKS,
         ),
     )
     trainer.scaler = torch.amp.GradScaler(
@@ -771,6 +743,7 @@ def inspection_payload(
     return {
         "schema_version": 1,
         "protocol_id": PROTOCOL_ID,
+        "active_tasks": list(ACTIVE_TASKS),
         "context": prepared.context.as_dict(),
         "data": {
             "catalog_records": len(prepared.catalog.records),
@@ -804,7 +777,6 @@ def inspection_payload(
                 "official_test_selection_ordering"
             ),
             "annotation_policy": prepared.catalog.annotation_policy,
-            "detection_config_sha256": prepared.catalog.detection_config_sha256,
             "train_archives": len(prepared.split.train_records),
             "val_archives": len(prepared.split.validation_records),
             "official_test_archives_reserved": len(
@@ -826,16 +798,7 @@ def inspection_payload(
             .get("cache_id", prepared.config["run_id"]),
             "image_size": prepared.config["data"]["image_size"],
             "clip_frames": ["t-2", "t-1", "t"],
-            "detection_classes": list(SANPO_DETECTION_CLASS_NAMES),
-            "detection_min_component_pixels": prepared.config["data"][
-                "detection_min_component_pixels"
-            ],
-            "detection_archive_sources": {
-                source: sum(
-                    item.detection_source == source for item in selected_records
-                )
-                for source in ("packaged_json", "panoptic_on_load")
-            },
+            "detection_included": False,
             "segmentation_classes": list(SANPO_SEGMENTATION_CLASS_NAMES),
             "depth_range_metres": [
                 prepared.config["data"]["depth_min_metres"],
@@ -983,23 +946,15 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
         ),
     )
     _table(
-        "DETECTION LABEL SOURCE",
-        ("source", "archives", "policy"),
+        "ACTIVE TASKS",
+        ("task", "target", "validation"),
         (
-            (
-                "packaged_json",
-                result["data"]["detection_archive_sources"]["packaged_json"],
-                "versioned JSON inside archive",
-            ),
-            (
-                "panoptic_on_load",
-                result["data"]["detection_archive_sources"]["panoptic_on_load"],
-                "8-connected, min area 100",
-            ),
+            ("segmentation", "SANPO panoptic semantic mask", "mIoU + per-class IoU"),
+            ("depth", "SANPO metric depth", "AbsRel + RMSE + delta1"),
         ),
     )
     _table(
-        "BACKBONE C2-C5",
+        "BACKBONE FEATURES",
         ("stage", "module", "channels", "stride"),
         tuple(
             (
@@ -1262,11 +1217,14 @@ def disposable_preflight(prepared: Prepared) -> dict[str, Any]:
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
     peak = torch.cuda.max_memory_allocated() / 1024**3 if device.type == "cuda" else 0.0
+    if outputs.detection is not None:
+        raise AssertionError("SANPO dense-only preflight produced detection output")
     result = {
+        "active_tasks": list(ACTIVE_TASKS),
         "input_shape": list(inputs.shape),
         "segmentation_shape": list(outputs.segmentation.shape),
         "depth_shape": list(outputs.depth.shape),
-        "detection_levels": [list(item.shape) for item in outputs.detection.cls_logits],
+        "detection_disabled": outputs.detection is None,
         "losses": {
             name: float(value.detach().float().cpu())
             for name, value in losses.items()
@@ -1342,13 +1300,7 @@ def _write_reports(
     if not isinstance(val, Mapping):
         raise ValueError("epoch record has no full validation result")
     _atomic_json(prepared.local_run / "latest_val_metrics.json", dict(val))
-    detection = detection_per_class_rows(val, SANPO_DETECTION_CLASS_NAMES)
     segmentation = segmentation_per_class_rows(val, SANPO_SEGMENTATION_CLASS_NAMES)
-    _write_csv(
-        prepared.local_run / "val_detection_per_class.csv",
-        detection,
-        ("class_id", "class_name", "map50_95", "present"),
-    )
     _write_csv(
         prepared.local_run / "val_segmentation_per_class.csv",
         segmentation,
@@ -1428,7 +1380,6 @@ def _snapshot_files(run: Path) -> tuple[str, ...]:
         "history.json",
         "history.csv",
         "latest_val_metrics.json",
-        "val_detection_per_class.csv",
         "val_segmentation_per_class.csv",
         "val_segmentation_confusion_matrix.csv",
         "run_status.json",
@@ -1659,7 +1610,9 @@ class StageProgressReporter:
             eta = (
                 (total_records - index) / scan_speed
                 if scan_speed > 0 and index < total_records
-                else 0.0 if index >= total_records else None
+                else 0.0
+                if index >= total_records
+                else None
             )
             phase_text = f"{phase} {index}/{total_records}"
         completed = payload.get("bytes_completed")
@@ -1853,7 +1806,7 @@ def stage_official_train(filename: str | os.PathLike[str]) -> dict[str, Any]:
         "\nTRAIN STAGE READY | archives + prepared cache complete | "
         f"fit={int(train_cache['ready_samples']):,} samples | "
         f"validation={int(validation_cache['ready_samples']):,} samples | "
-        "pilot will not decode PNG/depth.gz or derive boxes on load",
+        "pilot will read only cached RGB/segmentation/depth tensors",
         flush=True,
     )
     return result
@@ -2006,8 +1959,6 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
         reasons.append("amp_skip_in_epoch_1")
     if peak > float(prepared.config["train"]["max_peak_vram_gib"]):
         reasons.append("peak_vram_budget_exceeded")
-    if val.get("detection/num_images") != prepared.val_loader.sample_count:
-        reasons.append("validation_image_count_mismatch")
     if int(val.get("segmentation/num_pixels", 0)) <= 0:
         reasons.append("segmentation_valid_pixels_missing")
     if int(val.get("depth/num_pixels", 0)) <= 0:
