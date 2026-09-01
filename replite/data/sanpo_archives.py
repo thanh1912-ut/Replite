@@ -3,8 +3,9 @@
 The SANPO download notebook stores one ``.tar.zst`` archive per
 ``(official split, session, camera)`` on Google Drive.  This module joins the
 selection manifest to the append-only archive ledger, freezes a leak-free
-train/validation split by *session*, and feeds one verified archive at a time
-to :class:`~replite.data.sanpo_joint.SanpoJointDataset`.
+train/validation split by *session*, and either feeds one verified archive at a
+time or persistently stages a complete official split on local SSD for
+:class:`~replite.data.sanpo_joint.SanpoJointDataset`.
 
 Absolute archive paths recorded by Colab are deliberately treated as
 provenance only.  A catalog always resolves an archive below the caller's
@@ -22,11 +23,12 @@ import re
 import shutil
 import tarfile
 import tempfile
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Callable, Literal
 
 import torch
 from torch.utils.data import DataLoader
@@ -39,8 +41,11 @@ _ARCHIVE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.tar\.zst")
 _SPLITS = frozenset({"train", "test"})
 _SENSORS = frozenset({"camera_head", "camera_chest"})
 _STAGE_MARKER = ".replite_owned_sanpo_stage.json"
+_PERSISTENT_STAGE_MARKER = ".replite_sanpo_persistent_stage.json"
+_PERSISTENT_SHARD_COMPLETE = ".replite_sanpo_shard_complete.json"
 
 DetectionSource = Literal["packaged_json", "panoptic_on_load"]
+StagePurpose = Literal["official_train", "official_test"]
 LedgerCandidate = tuple[str, Mapping[str, object]]
 
 
@@ -207,6 +212,7 @@ class SanpoArchiveRecord:
     archive_bytes: int
     archive_sha256: str
     joint_frames: int
+    source_bytes: int | None = None
 
     @property
     def selection_key(self) -> tuple[str, str, str, str]:
@@ -392,6 +398,11 @@ def _ledger_record(
         archive_bytes=_positive_int(raw.get("archive_bytes"), "archive_bytes"),
         archive_sha256=_sha256(raw.get("archive_sha256"), "archive_sha256"),
         joint_frames=_positive_int(raw.get("joint_frames"), "archive joint_frames"),
+        source_bytes=(
+            _positive_int(raw.get("source_bytes"), "source_bytes")
+            if raw.get("source_bytes") is not None
+            else None
+        ),
     )
     if not record.archive_path.is_file():
         raise FileNotFoundError(f"SANPO archive is missing: {record.archive_path}")
@@ -417,6 +428,8 @@ def _validate_sidecars(record: SanpoArchiveRecord) -> None:
             "archive_sha256": record.archive_sha256,
             "joint_frames": record.joint_frames,
         }
+        if record.source_bytes is not None:
+            comparisons["source_bytes"] = record.source_bytes
         if record.detection_source == "packaged_json":
             comparisons.update(
                 detection_config_sha256=record.detection_config_sha256,
@@ -823,6 +836,124 @@ def _extract_tar_zst_safely(archive: Path, destination: Path) -> int:
     return member_count
 
 
+def _validate_manifest_identity(
+    record: SanpoArchiveRecord,
+    manifest_path: Path,
+) -> Path:
+    """Validate one known manifest against its immutable archive record."""
+
+    manifest, info = load_sanpo_joint_manifest(manifest_path)
+    manifest_policy = manifest.get("annotation_policy")
+    policy_matches = manifest_policy == record.annotation_policy
+    if record.detection_source == "panoptic_on_load" and manifest_policy is None:
+        # Legacy manifests predate this redundant descriptive field.  The
+        # selected sample set remains bound by selection_sha256.
+        policy_matches = True
+    if (
+        info.official_split != record.split
+        or info.session_id != record.session_id
+        or info.sensor != record.sensor
+        or info.sample_count != record.joint_frames
+        or not policy_matches
+        or manifest.get("selection_sha256") != record.selection_sha256
+    ):
+        raise ValueError("extracted SANPO manifest disagrees with archive catalog")
+    if record.detection_source == "packaged_json":
+        detection = manifest.get("detection")
+        if (
+            not isinstance(detection, Mapping)
+            or detection.get("config_sha256") != record.detection_config_sha256
+        ):
+            raise ValueError(
+                "extracted SANPO detection provenance disagrees with archive catalog"
+            )
+    return manifest_path
+
+
+def _referenced_payload_signature(
+    record: SanpoArchiveRecord,
+    manifest_path: Path,
+) -> dict[str, int | str]:
+    """Validate referenced files and bind their relative paths and byte sizes."""
+
+    payload, info = load_sanpo_joint_manifest(manifest_path)
+    required: set[str] = set()
+    for sample in payload["samples"]:
+        assert isinstance(sample, Mapping)
+        context = sample["rgb_context_paths"]
+        assert isinstance(context, list)
+        required.update(str(item) for item in context)
+        required.add(str(sample["panoptic_path"]))
+        required.add(str(sample["depth_path"]))
+        if record.detection_source == "packaged_json":
+            detection = sample.get("detection_path")
+            if not isinstance(detection, str) or not detection:
+                raise ValueError(
+                    "packaged SANPO manifest sample has no detection_path"
+                )
+            required.add(detection)
+
+    sizes: list[tuple[str, int]] = []
+    for relative in sorted(required):
+        path = info.session_root.joinpath(*PurePosixPath(relative).parts)
+        if not path.is_file():
+            raise ValueError(
+                f"extracted SANPO archive is missing referenced file: {relative}"
+            )
+        size = path.stat().st_size
+        if size <= 0:
+            raise ValueError(
+                f"extracted SANPO archive has empty referenced file: {relative}"
+            )
+        sizes.append((relative, size))
+    return {
+        "referenced_file_count": len(sizes),
+        "referenced_file_bytes": sum(size for _, size in sizes),
+        "referenced_file_sizes_sha256": canonical_json_sha256(sizes),
+    }
+
+
+def _validate_materialized_manifest(
+    record: SanpoArchiveRecord,
+    extracted: Path,
+) -> Path:
+    """Find the sole manifest and verify every selected payload file exists."""
+
+    manifests = list(extracted.rglob("_sanpo_joint_manifest.json"))
+    if len(manifests) != 1:
+        raise ValueError(
+            "each SANPO archive must contain exactly one _sanpo_joint_manifest.json"
+        )
+    manifest_path = _validate_manifest_identity(record, manifests[0])
+    _referenced_payload_signature(record, manifest_path)
+    return manifest_path
+
+
+def _atomic_json_file(path: Path, payload: Mapping[str, object]) -> None:
+    encoded = (
+        json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _tree_file_bytes(root: Path) -> int:
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+
+
 class ArchiveMaterializer:
     """Copy, verify, and safely extract exactly one SANPO archive.
 
@@ -885,42 +1016,7 @@ class ArchiveMaterializer:
             extracted.mkdir()
             _extract_tar_zst_safely(local_archive, extracted)
             local_archive.unlink()
-            manifests = list(extracted.rglob("_sanpo_joint_manifest.json"))
-            if len(manifests) != 1:
-                raise ValueError(
-                    "each SANPO archive must contain exactly one _sanpo_joint_manifest.json"
-                )
-            manifest, info = load_sanpo_joint_manifest(manifests[0])
-            manifest_policy = manifest.get("annotation_policy")
-            policy_matches = manifest_policy == self.record.annotation_policy
-            if (
-                self.record.detection_source == "panoptic_on_load"
-                and manifest_policy is None
-            ):
-                # Legacy manifests predate this redundant descriptive field.
-                # The selected sample set is still bound by selection_sha256,
-                # whose source payload includes the annotation policy.
-                policy_matches = True
-            if (
-                info.official_split != self.record.split
-                or info.session_id != self.record.session_id
-                or info.sensor != self.record.sensor
-                or info.sample_count != self.record.joint_frames
-                or not policy_matches
-                or manifest.get("selection_sha256") != self.record.selection_sha256
-            ):
-                raise ValueError("extracted SANPO manifest disagrees with archive catalog")
-            if self.record.detection_source == "packaged_json":
-                detection = manifest.get("detection")
-                if (
-                    not isinstance(detection, Mapping)
-                    or detection.get("config_sha256")
-                    != self.record.detection_config_sha256
-                ):
-                    raise ValueError(
-                        "extracted SANPO detection provenance disagrees with archive catalog"
-                    )
-            return manifests[0]
+            return _validate_materialized_manifest(self.record, extracted)
         except BaseException:
             self._cleanup()
             raise
@@ -929,18 +1025,457 @@ class ArchiveMaterializer:
         self._cleanup()
 
 
+class LocalArchiveStage:
+    """Persistent, verified extraction of one leak-safe SANPO split on local SSD.
+
+    Each archive is copied from Drive exactly once, hashing while copying, then
+    extracted into an owned temporary directory.  A completed shard is
+    atomically renamed into place and reused for every later epoch.  An
+    interrupted stage therefore resumes at the first incomplete archive.
+
+    ``official_train`` accepts only official-train records (both fit and
+    inner-validation groups).  ``official_test`` accepts only official-test
+    records, which lets the campaign runner keep the holdout entirely absent
+    from local disk until an explicit final-evaluation action.
+    """
+
+    def __init__(
+        self,
+        records: Sequence[SanpoArchiveRecord],
+        *,
+        local_root: str | os.PathLike[str],
+        purpose: StagePurpose,
+        expansion_factor: float = 1.05,
+        reserve_bytes: int = 4 * 1024**3,
+    ) -> None:
+        self.records = tuple(records)
+        if not self.records or any(
+            not isinstance(record, SanpoArchiveRecord) for record in self.records
+        ):
+            raise ValueError("a local SANPO stage requires archive records")
+        if len({record.key for record in self.records}) != len(self.records):
+            raise ValueError("local SANPO stage records contain duplicate keys")
+        if purpose not in {"official_train", "official_test"}:
+            raise ValueError("invalid local SANPO stage purpose")
+        expected_split = "train" if purpose == "official_train" else "test"
+        if any(record.split != expected_split for record in self.records):
+            raise ValueError(
+                f"{purpose} stage may contain only official-{expected_split} archives"
+            )
+        if (
+            isinstance(expansion_factor, bool)
+            or not isinstance(expansion_factor, (int, float))
+            or not math.isfinite(float(expansion_factor))
+            or float(expansion_factor) < 1.0
+        ):
+            raise ValueError("expansion_factor must be finite and at least one")
+        if (
+            isinstance(reserve_bytes, bool)
+            or not isinstance(reserve_bytes, int)
+            or reserve_bytes < 0
+        ):
+            raise ValueError("reserve_bytes must be a non-negative integer")
+        self.local_root = Path(local_root).expanduser().resolve()
+        self.purpose: StagePurpose = purpose
+        self.expansion_factor = float(expansion_factor)
+        self.reserve_bytes = reserve_bytes
+        ordered = sorted((_record_id(record) for record in self.records), key=lambda x: (
+            str(x["split"]),
+            str(x["session_id"]),
+            str(x["sensor"]),
+            str(x["archive_sha256"]),
+        ))
+        self.stage_sha256 = canonical_json_sha256(
+            {
+                "schema_version": 1,
+                "purpose": purpose,
+                "records": ordered,
+            }
+        )
+        self._records_by_key = {record.key: record for record in self.records}
+
+    @property
+    def marker_path(self) -> Path:
+        return self.local_root / _PERSISTENT_STAGE_MARKER
+
+    @property
+    def status_path(self) -> Path:
+        return self.local_root / "stage_manifest.json"
+
+    @property
+    def _lock_path(self) -> Path:
+        # Keep the lock outside the deletable stage tree so cleanup and a
+        # concurrent direct CLI invocation can never lock different inodes.
+        return self.local_root.parent / (
+            f".{self.local_root.name}.{self.stage_sha256[:16]}.lock"
+        )
+
+    @property
+    def _shards_root(self) -> Path:
+        return self.local_root / "shards"
+
+    @property
+    def _partials_root(self) -> Path:
+        return self.local_root / "partials"
+
+    def _marker_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "stage_sha256": self.stage_sha256,
+            "purpose": self.purpose,
+            "record_count": len(self.records),
+        }
+
+    def _ensure_owned_root(self) -> None:
+        self.local_root.mkdir(parents=True, exist_ok=True)
+        if self.marker_path.exists():
+            if _read_json_object(
+                self.marker_path, "persistent SANPO stage marker"
+            ) != self._marker_payload():
+                raise RuntimeError(
+                    "local SANPO stage belongs to a different record selection"
+                )
+        else:
+            if any(self.local_root.iterdir()):
+                raise RuntimeError(
+                    "refusing to claim a non-empty unowned SANPO stage directory"
+                )
+            _atomic_json_file(self.marker_path, self._marker_payload())
+        self._shards_root.mkdir(exist_ok=True)
+        self._partials_root.mkdir(exist_ok=True)
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        try:
+            import fcntl
+        except ImportError as exc:  # pragma: no cover - Colab/Linux path
+            raise RuntimeError(
+                "persistent SANPO SSD staging requires POSIX file locking"
+            ) from exc
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock_path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                self._ensure_owned_root()
+                if _read_json_object(
+                    self.marker_path, "persistent SANPO stage marker"
+                ) != self._marker_payload():
+                    raise RuntimeError("local SANPO stage marker changed while waiting")
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _record_stage_id(record: SanpoArchiveRecord) -> str:
+        return canonical_json_sha256(_record_id(record))
+
+    def _record_root(self, record: SanpoArchiveRecord) -> Path:
+        return self._shards_root / self._record_stage_id(record)
+
+    def _complete_payload(
+        self,
+        record: SanpoArchiveRecord,
+        *,
+        manifest_relative_path: str,
+        extracted_bytes: int,
+        payload_signature: Mapping[str, int | str],
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "stage_sha256": self.stage_sha256,
+            "record": _record_id(record),
+            "manifest_relative_path": manifest_relative_path,
+            "extracted_bytes": extracted_bytes,
+            **dict(payload_signature),
+        }
+
+    def _existing_manifest(
+        self,
+        record: SanpoArchiveRecord,
+        *,
+        verify_payloads: bool = False,
+    ) -> Path | None:
+        root = self._record_root(record)
+        if not root.exists():
+            return None
+        complete_path = root / _PERSISTENT_SHARD_COMPLETE
+        complete = _read_json_object(complete_path, "completed SANPO shard marker")
+        if (
+            complete.get("schema_version") != 1
+            or complete.get("stage_sha256") != self.stage_sha256
+            or complete.get("record") != _record_id(record)
+        ):
+            raise RuntimeError(f"persistent SANPO shard has foreign identity: {root}")
+        relative_raw = complete.get("manifest_relative_path")
+        if not isinstance(relative_raw, str):
+            raise RuntimeError("completed SANPO shard has no manifest path")
+        relative = PurePosixPath(relative_raw)
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            raise RuntimeError("completed SANPO shard manifest path is unsafe")
+        manifest = root.joinpath(*relative.parts)
+        try:
+            manifest.resolve().relative_to(root.resolve())
+        except ValueError as exc:
+            raise RuntimeError("completed SANPO shard manifest escapes its root") from exc
+        if not manifest.is_file():
+            raise RuntimeError("completed SANPO shard manifest is missing")
+        validated = _validate_manifest_identity(record, manifest)
+        if validated.resolve() != manifest.resolve():
+            raise RuntimeError("completed SANPO shard points at the wrong manifest")
+        signature_fields = {
+            "referenced_file_count",
+            "referenced_file_bytes",
+            "referenced_file_sizes_sha256",
+        }
+        if not signature_fields.issubset(complete):
+            raise RuntimeError("completed SANPO shard has no payload signature")
+        if verify_payloads:
+            observed = _referenced_payload_signature(record, manifest)
+            expected = {name: complete[name] for name in signature_fields}
+            if observed != expected:
+                raise RuntimeError(
+                    f"completed SANPO shard payload signature changed: {root}"
+                )
+        return manifest
+
+    def _write_status(self) -> dict[str, object]:
+        expected = {
+            self._record_stage_id(record): record for record in self.records
+        }
+        observed = {
+            path.name for path in self._shards_root.iterdir() if path.is_dir()
+        }
+        foreign = observed - set(expected)
+        if foreign:
+            raise RuntimeError(
+                "persistent SANPO stage contains foreign shard directories"
+            )
+        completed_ids = sorted(observed)
+        extracted_bytes = 0
+        for record_id in completed_ids:
+            complete = _read_json_object(
+                self._shards_root / record_id / _PERSISTENT_SHARD_COMPLETE,
+                "completed SANPO shard marker",
+            )
+            value = complete.get("extracted_bytes")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(
+                    "completed SANPO shard has invalid extracted byte count"
+                )
+            extracted_bytes += value
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "stage_sha256": self.stage_sha256,
+            "purpose": self.purpose,
+            "record_count": len(self.records),
+            "completed_count": len(completed_ids),
+            "complete": len(completed_ids) == len(self.records),
+            "completed_record_ids": completed_ids,
+            "completed_extracted_bytes": extracted_bytes,
+        }
+        _atomic_json_file(self.status_path, payload)
+        return payload
+
+    def _remove_owned_partials(self) -> None:
+        for partial in self._partials_root.iterdir():
+            if not partial.is_dir():
+                raise RuntimeError(f"unexpected file in SANPO partial area: {partial}")
+            marker = _read_json_object(
+                partial / _STAGE_MARKER, "partial SANPO stage marker"
+            )
+            if marker.get("stage_sha256") != self.stage_sha256:
+                raise RuntimeError(f"refusing to remove foreign SANPO partial: {partial}")
+            shutil.rmtree(partial)
+
+    def _estimated_unpacked_bytes(self, record: SanpoArchiveRecord) -> int:
+        # Downloader ledgers bind the exact byte sum of selected RGB,
+        # panoptic, and depth objects.  The archive-ratio allowance covers the
+        # small generated manifests/detection JSON and filesystem overhead.
+        ratio_estimate = math.ceil(record.archive_bytes * self.expansion_factor)
+        return max(ratio_estimate, record.source_bytes or 0)
+
+    def _disk_plan_unlocked(self) -> dict[str, int | float]:
+        pending = [
+            record
+            for record in self.records
+            if self._existing_manifest(record) is None
+        ]
+        archive_bytes = sum(record.archive_bytes for record in pending)
+        exact_source_bytes = sum(record.source_bytes or 0 for record in pending)
+        source_bytes_records = sum(
+            record.source_bytes is not None for record in pending
+        )
+        unpacked_estimate = sum(
+            self._estimated_unpacked_bytes(record) for record in pending
+        )
+        largest_temporary_archive = max(
+            (record.archive_bytes for record in pending), default=0
+        )
+        required = unpacked_estimate + largest_temporary_archive + self.reserve_bytes
+        usage = shutil.disk_usage(self.local_root)
+        return {
+            "pending_records": len(pending),
+            "archive_bytes": archive_bytes,
+            "exact_source_bytes": exact_source_bytes,
+            "source_bytes_records": source_bytes_records,
+            "estimated_unpacked_bytes": unpacked_estimate,
+            "largest_temporary_archive_bytes": largest_temporary_archive,
+            "reserve_bytes": self.reserve_bytes,
+            "required_free_bytes": required,
+            "available_free_bytes": usage.free,
+            "expansion_factor": self.expansion_factor,
+        }
+
+    def disk_plan(self) -> dict[str, int | float]:
+        """Return capacity bytes needed to finish all missing shards."""
+
+        with self._locked():
+            return self._disk_plan_unlocked()
+
+    def _assert_disk_capacity(self) -> dict[str, int | float]:
+        plan = self._disk_plan_unlocked()
+        if int(plan["available_free_bytes"]) < int(plan["required_free_bytes"]):
+            raise OSError(
+                "insufficient local SSD for SANPO stage: "
+                f"need {int(plan['required_free_bytes']) / 1024**3:.2f} GiB free, "
+                f"have {int(plan['available_free_bytes']) / 1024**3:.2f} GiB; "
+                "free /content space or lower the selected dataset size"
+            )
+        return plan
+
+    def materialize(self, record: SanpoArchiveRecord) -> Path:
+        """Return a persistent manifest, extracting atomically if necessary."""
+
+        selected = self._records_by_key.get(record.key)
+        if selected != record:
+            raise ValueError("record does not belong to this local SANPO stage")
+        with self._locked():
+            existing = self._existing_manifest(record)
+            if existing is not None:
+                return existing
+            self._remove_owned_partials()
+            usage = shutil.disk_usage(self.local_root)
+            per_record_required = (
+                self._estimated_unpacked_bytes(record)
+                + record.archive_bytes
+                + self.reserve_bytes
+            )
+            if usage.free < per_record_required:
+                raise OSError(
+                    "insufficient local SSD to materialize next SANPO archive: "
+                    f"need {per_record_required / 1024**3:.2f} GiB free, "
+                    f"have {usage.free / 1024**3:.2f} GiB"
+                )
+            partial = self._partials_root / (
+                f".{self._record_stage_id(record)}.{uuid.uuid4().hex}.partial"
+            )
+            partial.mkdir()
+            _atomic_json_file(
+                partial / _STAGE_MARKER,
+                {
+                    "schema_version": 1,
+                    "stage_sha256": self.stage_sha256,
+                    "record": _record_id(record),
+                },
+            )
+            try:
+                local_archive = partial / record.archive_path.name
+                _copy_verified(record, local_archive)
+                extracted = partial / "extracted"
+                extracted.mkdir()
+                _extract_tar_zst_safely(local_archive, extracted)
+                local_archive.unlink()
+                manifest = _validate_materialized_manifest(record, extracted)
+                relative = manifest.relative_to(partial).as_posix()
+                payload_signature = _referenced_payload_signature(record, manifest)
+                complete = self._complete_payload(
+                    record,
+                    manifest_relative_path=relative,
+                    extracted_bytes=_tree_file_bytes(extracted),
+                    payload_signature=payload_signature,
+                )
+                _atomic_json_file(partial / _PERSISTENT_SHARD_COMPLETE, complete)
+                final = self._record_root(record)
+                if final.exists():
+                    raise RuntimeError(f"SANPO shard appeared concurrently: {final}")
+                os.replace(partial, final)
+                self._write_status()
+                return final.joinpath(*PurePosixPath(relative).parts)
+            except BaseException:
+                if partial.exists():
+                    shutil.rmtree(partial)
+                raise
+
+    def prepare_all(
+        self,
+        progress: Callable[[int, int, SanpoArchiveRecord, str], None] | None = None,
+    ) -> dict[str, object]:
+        """Preflight disk, resume missing shards, and return the stage manifest."""
+
+        with self._locked():
+            self._remove_owned_partials()
+            plan = self._assert_disk_capacity()
+        total = len(self.records)
+        for index, record in enumerate(self.records, start=1):
+            existing = self._existing_manifest(record, verify_payloads=True)
+            status = "cached" if existing is not None else "extract"
+            if progress is not None:
+                progress(index, total, record, status)
+            if existing is None:
+                self.materialize(record)
+        with self._locked():
+            for record in self.records:
+                self._existing_manifest(record, verify_payloads=True)
+            payload = self._write_status()
+        return {**payload, "disk_plan": plan}
+
+    def status(self) -> dict[str, object]:
+        """Validate completed shards and return the resumable stage status."""
+
+        with self._locked():
+            for record in self.records:
+                self._existing_manifest(record, verify_payloads=True)
+            return self._write_status()
+
+    def require_complete(self) -> dict[str, object]:
+        """Reject training until every selected archive is present on SSD."""
+
+        payload = self.status()
+        if payload.get("complete") is not True:
+            raise RuntimeError(
+                "local SANPO stage is incomplete: "
+                f"{payload['completed_count']}/{payload['record_count']} shards; "
+                "run the stage-train command first"
+            )
+        return payload
+
+    def cleanup(self) -> None:
+        """Delete only this exact owned stage; archives on Drive are untouched."""
+
+        if not self.local_root.exists():
+            return
+        with self._locked():
+            marker = _read_json_object(
+                self.marker_path, "persistent SANPO stage marker"
+            )
+            if marker != self._marker_payload():
+                raise RuntimeError("refusing to clean a foreign SANPO stage")
+            shutil.rmtree(self.local_root)
+
+
 def _seed_from_parts(*parts: object) -> int:
     encoded = ":".join(str(part) for part in parts).encode("utf-8")
     return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big") % (2**63)
 
 
 class ArchiveShardLoader:
-    """Iterable of batches backed by one verified archive at a time.
+    """Iterable of batches backed by verified local archive extraction.
 
     ``len(loader)`` is exact for the per-archive batching policy.  With
     ``drop_last=True`` each shard drops its own incomplete final batch.
-    ``persistent_workers`` is intentionally fixed to ``False`` so an archive
-    can be removed as soon as its iterator finishes.
+    Without ``local_stage`` each shard is removed when its iterator finishes.
+    With a :class:`LocalArchiveStage`, extracted shards persist across epochs.
+    ``persistent_workers`` remains ``False`` for deterministic resume.
     """
 
     def __init__(
@@ -957,6 +1492,7 @@ class ArchiveShardLoader:
         drop_last: bool = False,
         prefetch_factor: int = 2,
         dataset_kwargs: Mapping[str, object] | None = None,
+        local_stage: LocalArchiveStage | None = None,
     ) -> None:
         self.records = tuple(records)
         if any(not isinstance(record, SanpoArchiveRecord) for record in self.records):
@@ -990,6 +1526,17 @@ class ArchiveShardLoader:
         self.drop_last = bool(drop_last)
         self.prefetch_factor = _positive_int(prefetch_factor, "prefetch_factor")
         self.dataset_kwargs = dict(dataset_kwargs or {})
+        if local_stage is not None:
+            if not isinstance(local_stage, LocalArchiveStage):
+                raise TypeError("local_stage must be a LocalArchiveStage")
+            missing = [
+                record.key
+                for record in self.records
+                if local_stage._records_by_key.get(record.key) != record
+            ]
+            if missing:
+                raise ValueError("loader records are absent from its local SANPO stage")
+        self.local_stage = local_stage
         if "image_size" in self.dataset_kwargs:
             raise ValueError("pass image_size directly, not through dataset_kwargs")
         if "use_packaged_detection" in self.dataset_kwargs:
@@ -1054,7 +1601,15 @@ class ArchiveShardLoader:
         self._iterating = True
         try:
             for record in self._ordered_records():
-                with ArchiveMaterializer(record, local_root=self.local_root) as manifest_path:
+                if self.local_stage is not None:
+                    manifest_context = contextlib.nullcontext(
+                        self.local_stage.materialize(record)
+                    )
+                else:
+                    manifest_context = ArchiveMaterializer(
+                        record, local_root=self.local_root
+                    )
+                with manifest_context as manifest_path:
                     dataset = SanpoJointDataset(
                         manifest_path,
                         image_size=self.image_size,
@@ -1102,6 +1657,7 @@ __all__ = [
     "ArchiveGroupSplit",
     "ArchiveMaterializer",
     "ArchiveShardLoader",
+    "LocalArchiveStage",
     "SANPO_DERIVED_DETECTION_CONFIG",
     "SANPO_DERIVED_DETECTION_CONFIG_SHA256",
     "SanpoArchiveRecord",

@@ -8,6 +8,7 @@ import io
 import json
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ import replite.data.sanpo_archives as archives_module
 from replite.data import (
     ArchiveMaterializer,
     ArchiveShardLoader,
+    LocalArchiveStage,
     SanpoArchiveRecord,
     canonical_json_sha256,
     create_or_load_group_split,
@@ -113,6 +115,7 @@ def _catalog_fixture(tmp_path: Path):
             "archive": f"/content/drive/old-root/{name}",
             "archive_bytes": archive.stat().st_size,
             "archive_sha256": archive_sha,
+            "source_bytes": archive.stat().st_size,
             "joint_frames": frames,
         }
         ledger_entries[_ledger_key(entry)] = entry
@@ -555,6 +558,22 @@ def _write_tar_archive(
         info = tarfile.TarInfo(name)
         info.size = len(payload)
         tar.addfile(info, io.BytesIO(payload))
+        if unsafe_name is None:
+            manifest = json.loads(payload)
+            referenced: set[str] = set()
+            for sample in manifest["samples"]:
+                referenced.update(sample["rgb_context_paths"])
+                referenced.add(sample["panoptic_path"])
+                referenced.add(sample["depth_path"])
+                if "detection_path" in sample:
+                    referenced.add(sample["detection_path"])
+            for relative in sorted(referenced):
+                content = b"fixture"
+                member = tarfile.TarInfo(
+                    f"sanpo-real/{session_id}/{relative}"
+                )
+                member.size = len(content)
+                tar.addfile(member, io.BytesIO(content))
     return SanpoArchiveRecord(
         split=split,
         session_id=session_id,
@@ -716,6 +735,234 @@ def test_materializer_rejects_tar_traversal_and_cleans(
             pass
     assert list(local_root.iterdir()) == []
     assert not (tmp_path / "escape.txt").exists()
+
+
+def test_persistent_stage_extracts_once_resumes_and_cleans_owned_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    records = (
+        _write_tar_archive(
+            tmp_path / "source" / "first.tar.zst",
+            session_id="session-a",
+            sensor="camera_head",
+            selection_sha=_sha("stage-a"),
+        ),
+        _write_tar_archive(
+            tmp_path / "source" / "second.tar.zst",
+            session_id="session-b",
+            sensor="camera_chest",
+            selection_sha=_sha("stage-b"),
+        ),
+    )
+    copied: list[str] = []
+    original_copy = archives_module._copy_verified
+
+    def counted_copy(record, destination):
+        copied.append(record.session_id)
+        return original_copy(record, destination)
+
+    monkeypatch.setattr(archives_module, "_copy_verified", counted_copy)
+    root = tmp_path / "ssd-stage"
+    stage = LocalArchiveStage(
+        records,
+        local_root=root,
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=0,
+    )
+    progress: list[tuple[int, str]] = []
+    first = stage.prepare_all(
+        lambda index, total, record, status: progress.append((index, status))
+    )
+
+    assert first["complete"] is True
+    assert first["completed_count"] == 2
+    assert first["completed_extracted_bytes"] > 0
+    assert copied == ["session-a", "session-b"]
+    assert progress == [(1, "extract"), (2, "extract")]
+    assert stage.require_complete()["record_count"] == 2
+    for record in records:
+        assert stage.materialize(record).is_file()
+
+    progress.clear()
+    second = stage.prepare_all(
+        lambda index, total, record, status: progress.append((index, status))
+    )
+    assert second["complete"] is True
+    assert copied == ["session-a", "session-b"]
+    assert progress == [(1, "cached"), (2, "cached")]
+
+    stage.cleanup()
+    assert not root.exists()
+    assert all(record.archive_path.is_file() for record in records)
+
+
+def test_persistent_stage_enforces_official_split_and_complete_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    train = _write_tar_archive(
+        tmp_path / "source" / "train.tar.zst",
+        selection_sha=_sha("train-stage"),
+    )
+    test = _write_tar_archive(
+        tmp_path / "source" / "test.tar.zst",
+        split="test",
+        session_id="test-session",
+        selection_sha=_sha("test-stage"),
+    )
+    with pytest.raises(ValueError, match="official-test"):
+        LocalArchiveStage(
+            (train,),
+            local_root=tmp_path / "wrong-test",
+            purpose="official_test",
+        )
+    with pytest.raises(ValueError, match="official-train"):
+        LocalArchiveStage(
+            (test,),
+            local_root=tmp_path / "wrong-train",
+            purpose="official_train",
+        )
+
+    stage = LocalArchiveStage(
+        (train,),
+        local_root=tmp_path / "incomplete",
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=0,
+    )
+    with pytest.raises(RuntimeError, match="stage-train"):
+        stage.require_complete()
+
+
+def test_persistent_stage_gate_detects_changed_payload_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    record = _write_tar_archive(
+        tmp_path / "source" / "integrity.tar.zst",
+        selection_sha=_sha("integrity-stage"),
+    )
+    stage = LocalArchiveStage(
+        (record,),
+        local_root=tmp_path / "integrity-stage",
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=0,
+    )
+    stage.prepare_all()
+    manifest = stage.materialize(record)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    changed = manifest.parents[2] / payload["samples"][0]["rgb_context_paths"][0]
+    changed.write_bytes(b"x")
+
+    with pytest.raises(RuntimeError, match="payload signature changed"):
+        stage.require_complete()
+
+
+def test_persistent_stage_disk_plan_uses_exact_source_bytes(
+    tmp_path: Path,
+) -> None:
+    original = _write_tar_archive(
+        tmp_path / "source" / "source-size.tar.zst",
+        selection_sha=_sha("source-size-stage"),
+    )
+    record = SanpoArchiveRecord(
+        **{**original.__dict__, "source_bytes": original.archive_bytes * 4}
+    )
+    stage = LocalArchiveStage(
+        (record,),
+        local_root=tmp_path / "source-size-stage",
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=0,
+    )
+    plan = stage.disk_plan()
+    assert plan["source_bytes_records"] == 1
+    assert plan["exact_source_bytes"] == record.source_bytes
+    assert plan["estimated_unpacked_bytes"] == record.source_bytes
+
+
+def test_persistent_stage_checks_aggregate_disk_before_copying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    record = _write_tar_archive(
+        tmp_path / "source" / "disk.tar.zst",
+        selection_sha=_sha("disk-stage"),
+    )
+    copied = False
+
+    def unexpected_copy(record, destination):
+        nonlocal copied
+        copied = True
+
+    monkeypatch.setattr(archives_module, "_copy_verified", unexpected_copy)
+    monkeypatch.setattr(
+        archives_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=100, used=99, free=1),
+    )
+    stage = LocalArchiveStage(
+        (record,),
+        local_root=tmp_path / "too-small",
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=1,
+    )
+    with pytest.raises(OSError, match="insufficient local SSD"):
+        stage.prepare_all()
+    assert copied is False
+
+
+def test_persistent_stage_cleanup_refuses_foreign_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    record = _write_tar_archive(
+        tmp_path / "source" / "owned.tar.zst",
+        selection_sha=_sha("owned-stage"),
+    )
+    root = tmp_path / "owned-stage"
+    stage = LocalArchiveStage(
+        (record,),
+        local_root=root,
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=0,
+    )
+    stage.prepare_all()
+    marker = json.loads(stage.marker_path.read_text(encoding="utf-8"))
+    marker["stage_sha256"] = "0" * 64
+    stage.marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="different record selection"):
+        stage.cleanup()
+    assert root.exists()
+
+
+def test_persistent_stage_never_claims_nonempty_unowned_directory(
+    tmp_path: Path,
+) -> None:
+    record = _write_tar_archive(
+        tmp_path / "source" / "unowned.tar.zst",
+        selection_sha=_sha("unowned-stage"),
+    )
+    root = tmp_path / "unowned"
+    root.mkdir()
+    sentinel = root / "user-file.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    stage = LocalArchiveStage(
+        (record,),
+        local_root=root,
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=0,
+    )
+    with pytest.raises(RuntimeError, match="non-empty unowned"):
+        stage.disk_plan()
+    assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
 class _FakeDataset(Dataset):

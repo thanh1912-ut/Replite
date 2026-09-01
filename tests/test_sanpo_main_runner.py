@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
+from torch import nn
 
 from replite.training import SnapshotContext
 from tools import train_sanpo_main as runner
@@ -91,6 +93,103 @@ def test_approval_token_is_deterministic_and_context_bound() -> None:
     assert token != runner.approval_token(changed, "e" * 64, "f" * 64)
 
 
+def test_preflight_amp_overflow_backs_off_without_mutating_model() -> None:
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = torch.amp.GradScaler(
+        "cpu", enabled=True, init_scale=8.0, growth_interval=100
+    )
+    before = model.weight.detach().clone()
+
+    # The unscaled forward loss is finite, but scaling makes its gradient
+    # overflow. This is the exact recoverable state the CUDA preflight sees.
+    loss = model(torch.ones(1, 1)).sum() * 1e38
+    assert bool(torch.isfinite(loss))
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    stepped, connected, nonfinite, old_scale, new_scale = (
+        runner._finish_preflight_optimizer_step(model, optimizer, scaler)
+    )
+
+    assert not stepped
+    assert connected == 1
+    assert nonfinite == ("weight",)
+    assert (old_scale, new_scale) == (8.0, 4.0)
+    torch.testing.assert_close(model.weight, before)
+
+    optimizer.zero_grad(set_to_none=True)
+    stable_loss = model(torch.ones(1, 1)).sum()
+    scaler.scale(stable_loss).backward()
+    scaler.unscale_(optimizer)
+    stepped, connected, nonfinite, old_scale, new_scale = (
+        runner._finish_preflight_optimizer_step(model, optimizer, scaler)
+    )
+    assert stepped
+    assert connected == 1
+    assert nonfinite == ()
+    assert (old_scale, new_scale) == (4.0, 4.0)
+    assert not torch.equal(model.weight, before)
+
+
+def test_preflight_gradient_health_distinguishes_missing_and_nonfinite() -> None:
+    model = nn.Linear(2, 1)
+    assert runner._gradient_health(model) == (0, ())
+    model(torch.ones(1, 2)).sum().backward()
+    assert runner._gradient_health(model) == (2, ())
+    model.weight.grad[0, 0] = torch.inf
+    assert runner._gradient_health(model) == (2, ("weight",))
+
+
+def test_disposable_preflight_reports_proven_amp_scale(monkeypatch) -> None:
+    class OneBatch:
+        def set_epoch(self, epoch: int) -> None:
+            assert epoch == 0
+
+        def __iter__(self):
+            yield torch.ones(1, 1, 2, 2), {}
+
+    class ToyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+
+        def forward(self, inputs):
+            value = inputs * self.weight
+            detection = SimpleNamespace(cls_logits=(value, value, value))
+            return SimpleNamespace(
+                segmentation=value,
+                depth=value,
+                detection=detection,
+            )
+
+    class ToyCriterion(nn.Module):
+        def forward(self, outputs, targets):
+            loss = outputs.segmentation.square().mean()
+            return {"total": loss, "toy": loss}
+
+    monkeypatch.setattr(runner, "create_model", lambda prepared: ToyModel())
+    monkeypatch.setattr(
+        runner, "create_criterion", lambda prepared: ToyCriterion()
+    )
+
+    def schedule(prepared, model):
+        return torch.optim.SGD(model.parameters(), lr=0.1), None, 1, 0
+
+    monkeypatch.setattr(runner, "create_optimizer_schedule", schedule)
+    prepared = SimpleNamespace(
+        config={"train": {"seed": 42, "amp_initial_scale": 4096.0}},
+        train_loader=OneBatch(),
+    )
+    result = runner.disposable_preflight(prepared)
+    assert result["optimizer_stepped"] is True
+    assert result["amp_stable_scale"] >= 1.0
+    assert result["amp_backoff_count"] == len(
+        result["amp_overflow_attempts"]
+    )
+    assert result["production_model_mutated"] is False
+
+
 def test_catalog_contract_locks_full_download_and_no_split_overlap() -> None:
     def records(count: int, frames: int, prefix: str):
         base, remainder = divmod(frames, count)
@@ -141,3 +240,180 @@ def test_cli_requires_explicit_approval_for_main() -> None:
         ["train", "--config", "x.json", "--approval-token", "token"]
     )
     assert train.approval_token == "token"
+    assert parser.parse_args(["stage-train", "--config", "x.json"]).command == (
+        "stage-train"
+    )
+    assert parser.parse_args(["stage-test", "--config", "x.json"]).command == (
+        "stage-test"
+    )
+
+
+def _stage_plan() -> dict[str, int | float]:
+    return {
+        "pending_records": 1,
+        "archive_bytes": 10,
+        "exact_source_bytes": 9,
+        "source_bytes_records": 1,
+        "estimated_unpacked_bytes": 11,
+        "largest_temporary_archive_bytes": 10,
+        "reserve_bytes": 0,
+        "required_free_bytes": 21,
+        "available_free_bytes": 100,
+        "expansion_factor": 1.05,
+    }
+
+
+def test_stage_train_prepares_complete_official_train(monkeypatch) -> None:
+    class Stage:
+        local_root = Path("/content/unit-stage")
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def disk_plan(self):
+            self.calls.append("plan")
+            return _stage_plan()
+
+        def prepare_all(self, progress):
+            self.calls.append("prepare")
+            return {
+                "complete": True,
+                "completed_count": 186,
+                "record_count": 186,
+                "completed_extracted_bytes": 123,
+            }
+
+    stage = Stage()
+    monkeypatch.setattr(
+        runner, "prepare", lambda filename: SimpleNamespace(train_stage=stage)
+    )
+    result = runner.stage_official_train("config.json")
+    assert result["complete"] is True
+    assert stage.calls == ["plan", "prepare"]
+
+
+def test_stage_test_requires_complete_campaign_then_cleans_train(
+    tmp_path: Path, monkeypatch
+) -> None:
+    events: list[str] = []
+
+    class TrainStage:
+        def cleanup(self) -> None:
+            events.append("cleanup-train")
+
+    class TestStage:
+        local_root = tmp_path / "test-stage"
+
+        def disk_plan(self):
+            events.append("plan-test")
+            return _stage_plan()
+
+        def prepare_all(self, progress):
+            events.append("prepare-test")
+            return {
+                "complete": True,
+                "completed_count": 48,
+                "record_count": 48,
+                "completed_extracted_bytes": 456,
+            }
+
+    local_run = tmp_path / "run"
+    local_run.mkdir()
+    (local_run / "run_status.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "epoch_completed": 49,
+                "official_test_used": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = SimpleNamespace(
+        local_run=local_run,
+        train_stage=TrainStage(),
+        config={"train": {"epochs": 50}},
+    )
+    monkeypatch.setattr(runner, "prepare", lambda filename: prepared)
+    monkeypatch.setattr(
+        runner,
+        "_restore",
+        lambda value: SimpleNamespace(epoch_completed=49),
+    )
+    monkeypatch.setattr(runner, "_official_test_stage", lambda value: TestStage())
+
+    result = runner.stage_official_test("config.json")
+    assert result["complete"] is True
+    assert events == ["cleanup-train", "plan-test", "prepare-test"]
+
+
+def test_stage_test_does_not_delete_train_before_full_campaign(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cleaned = False
+
+    class TrainStage:
+        def cleanup(self) -> None:
+            nonlocal cleaned
+            cleaned = True
+
+    local_run = tmp_path / "run"
+    local_run.mkdir()
+    (local_run / "run_status.json").write_text(
+        json.dumps(
+            {
+                "status": "training",
+                "epoch_completed": 12,
+                "official_test_used": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = SimpleNamespace(
+        local_run=local_run,
+        train_stage=TrainStage(),
+        config={"train": {"epochs": 50}},
+    )
+    monkeypatch.setattr(runner, "prepare", lambda filename: prepared)
+    monkeypatch.setattr(
+        runner,
+        "_restore",
+        lambda value: SimpleNamespace(epoch_completed=12),
+    )
+    with pytest.raises(PermissionError, match="full checksum-valid"):
+        runner.stage_official_test("config.json")
+    assert cleaned is False
+
+
+def test_cached_inspection_is_reused_only_when_context_matches(
+    tmp_path: Path,
+) -> None:
+    context = SnapshotContext(
+        source_sha256="a" * 64,
+        config_sha256="b" * 64,
+        catalog_sha256="c" * 64,
+        split_sha256="d" * 64,
+    )
+    prepared = SimpleNamespace(
+        local_root=tmp_path,
+        config={"run_id": "unit_seed42"},
+        context=context,
+    )
+    path = tmp_path / "inspections" / "unit_seed42.json"
+    path.parent.mkdir(parents=True)
+    payload = {
+        "schema_version": 1,
+        "protocol_id": runner.PROTOCOL_ID,
+        "context": context.as_dict(),
+        "data": {},
+        "model_config": {},
+        "pretrained": {},
+        "parameters": {},
+        "schedule": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert runner._load_cached_inspection(prepared) == payload
+
+    payload["context"]["source_sha256"] = "0" * 64
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert runner._load_cached_inspection(prepared) is None

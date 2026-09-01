@@ -45,15 +45,18 @@ cells = [
         2. khóa cấu hình campaign;
         3. audit data/split, dựng model và in backbone, feature stages, pretrained SHA,
            cấu hình neck/head, số parameter, optimizer/scheduler **trước khi train**;
-        4. preflight bằng model dùng một lần, sau đó chạy đúng **epoch 1** trên toàn bộ
+        4. copy + kiểm SHA + giải nén **186 official-train archive** đúng một lần lên
+           SSD `/content` (gồm cả fit và inner-val), có disk preflight và resume;
+        5. preflight bằng model dùng một lần, sau đó chạy đúng **epoch 1** trên toàn bộ
            train/val với log kiểu YOLO và metric mAP/mIoU/depth;
-        5. chỉ khi gate epoch 1 đạt và bạn nhập approval token, strict-resume epoch 2
+        6. chỉ khi gate epoch 1 đạt và bạn nhập approval token, strict-resume epoch 2
            để chạy hết campaign.
 
         Epoch 1 dùng ngay config/scheduler của toàn campaign; không phải một schedule
-        1-epoch khác. Mỗi archive được stream-extract riêng lên SSD `/content`, train xong
-        shard nào dọn shard đó, nên không cần giải nén đồng thời khoảng 187 GiB. Snapshot
-        versioned có SHA-256 được mirror lên Drive sau từng epoch.
+        1-epoch khác. Train và inner-val đọc lại trực tiếp từ SSD qua mọi epoch, không
+        copy Drive hoặc giải nén lại. Khi campaign hoàn tất, 186 shard local được xoá;
+        48 official-test chỉ được stage sau đó bằng cell riêng. Snapshot versioned có
+        SHA-256 được mirror lên Drive sau từng epoch.
 
         `archive_manifest.json` có thể có 237 entry vì ba pilot đã được đóng gói lại.
         Audit sẽ chọn đúng 234 source shard: ưu tiên ba package mới, còn 231 archive cũ
@@ -83,8 +86,19 @@ cells = [
             ).strip()
             assert remote.rstrip("/").removesuffix(".git") == REPO_URL.rstrip("/").removesuffix(".git"), remote
             subprocess.run(["git", "-C", str(REPO_DIR), "fetch", "origin"], check=True)
-        subprocess.run(["git", "-C", str(REPO_DIR), "checkout", REPO_REF], check=True)
-        subprocess.run(["git", "-C", str(REPO_DIR), "pull", "--ff-only"], check=True)
+        immutable_ref = (
+            len(REPO_REF) == 40
+            and all(character in "0123456789abcdef" for character in REPO_REF.lower())
+        )
+        subprocess.run(
+            ["git", "-C", str(REPO_DIR), "checkout", *( ["--detach"] if immutable_ref else [] ), REPO_REF],
+            check=True,
+        )
+        if not immutable_ref:
+            subprocess.run(
+                ["git", "-C", str(REPO_DIR), "pull", "--ff-only", "origin", REPO_REF],
+                check=True,
+            )
         SOURCE_COMMIT = subprocess.check_output(
             ["git", "-C", str(REPO_DIR), "rev-parse", "HEAD"], text=True
         ).strip()
@@ -122,7 +136,7 @@ cells = [
         LOCAL_WORK_ROOT = Path("/content/replite_sanpo_main")
         DRIVE_RUNS_ROOT = DRIVE_DATA_ROOT / "main_runs"
 
-        RUN_ID = "replite_sanpo_mnv4convs_seed42_v2"  #@param {type:"string"}
+        RUN_ID = "replite_sanpo_mnv4convs_seed42_v3"  #@param {type:"string"}
         BACKBONE_NAME = "mobilenetv4_conv_small"  #@param ["mobilenetv4_conv_small", "mobilenetv3_small_050"]
         PRETRAINED_IN1K = True  #@param {type:"boolean"}
         EPOCHS = 50  #@param {type:"integer"}
@@ -145,9 +159,61 @@ cells = [
         AMP_INITIAL_SCALE = 4096.0
         PROGRESS_EVERY_N_STEPS = 20
         MAX_PEAK_VRAM_GIB = 22.0
+        LOCAL_STAGE_EXPANSION_FACTOR = 1.03
+        LOCAL_STAGE_RESERVE_GIB = 4.0
 
         assert DRIVE_DATA_ROOT.is_dir(), DRIVE_DATA_ROOT
         assert RUN_ID and "/" not in RUN_ID and RUN_ID not in {".", ".."}
+
+        # A campaign must resume with exactly the commit that created it even
+        # if `main` advances while Colab is disconnected. The small Drive pin
+        # is written before any training and is immutable for this RUN_ID.
+        SOURCE_PIN = DRIVE_RUNS_ROOT / RUN_ID / "source_pin.json"
+        SOURCE_PIN.parent.mkdir(parents=True, exist_ok=True)
+        pin = {
+            "schema_version": 1,
+            "run_id": RUN_ID,
+            "repository": REPO_URL,
+            "source_commit": SOURCE_COMMIT,
+        }
+        if SOURCE_PIN.exists():
+            existing_pin = json.loads(SOURCE_PIN.read_text(encoding="utf-8"))
+            assert existing_pin.get("schema_version") == 1, existing_pin
+            assert existing_pin.get("run_id") == RUN_ID, existing_pin
+            assert existing_pin.get("repository") == REPO_URL, existing_pin
+            pinned_commit = existing_pin.get("source_commit")
+            assert (
+                isinstance(pinned_commit, str)
+                and len(pinned_commit) == 40
+                and all(character in "0123456789abcdef" for character in pinned_commit)
+            ), existing_pin
+            if pinned_commit != SOURCE_COMMIT:
+                present = subprocess.run(
+                    ["git", "-C", str(REPO_DIR), "cat-file", "-e", f"{pinned_commit}^{{commit}}"],
+                    check=False,
+                )
+                if present.returncode:
+                    subprocess.run(
+                        ["git", "-C", str(REPO_DIR), "fetch", "origin", pinned_commit],
+                        check=True,
+                    )
+                subprocess.run(
+                    ["git", "-C", str(REPO_DIR), "checkout", "--detach", pinned_commit],
+                    check=True,
+                )
+                SOURCE_COMMIT = subprocess.check_output(
+                    ["git", "-C", str(REPO_DIR), "rev-parse", "HEAD"], text=True
+                ).strip()
+            assert SOURCE_COMMIT == pinned_commit
+            print("RESUME SOURCE PIN:", SOURCE_COMMIT)
+        else:
+            temporary_pin = SOURCE_PIN.with_name(SOURCE_PIN.name + ".tmp")
+            temporary_pin.write_text(
+                json.dumps(pin, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary_pin, SOURCE_PIN)
+            print("NEW SOURCE PIN:", SOURCE_COMMIT)
         assert EPOCHS >= 2, "Campaign phải có ít nhất 2 epoch để gate sau epoch 1"
         assert IMAGE_HEIGHT % 32 == 0 and IMAGE_WIDTH % 32 == 0
         assert BATCH_SIZE > 0 and NUM_WORKERS >= 0 and PREFETCH_FACTOR > 0
@@ -186,6 +252,10 @@ cells = [
                 "split_seed": SEED,
                 "depth_min_metres": 0.1,
                 "depth_max_metres": 80.0,
+                "local_staging": {
+                    "expansion_factor": LOCAL_STAGE_EXPANSION_FACTOR,
+                    "reserve_gib": LOCAL_STAGE_RESERVE_GIB,
+                },
             },
             "train": {
                 "epochs": EPOCHS,
@@ -221,30 +291,133 @@ cells = [
         CONSOLE_LOG = LOCAL_RUN_DIR / "console.log"
 
         def run_live(arguments):
-            # Stream output both below the cell and into console.log.
+            # Keep one clean log per invocation. console.log is deliberately
+            # truncated so `tail -F` never mixes inspect/pilot/train output.
+            import fcntl
+            import queue
+            import signal
+            import threading
+            import time
+
+            assert arguments and arguments[0] in {
+                "inspect", "stage-train", "pilot", "train", "stage-test"
+            }
+            action = arguments[0]
             LOCAL_RUN_DIR.mkdir(parents=True, exist_ok=True)
+            log_dir = LOCAL_RUN_DIR / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            started_at = datetime.now(timezone.utc)
+            command_log = log_dir / (
+                f"{started_at.strftime('%Y%m%dT%H%M%S_%fZ')}_{action}.log"
+            )
+            lock_path = LOCAL_RUN_DIR / "run_live.lock"
             command = [
                 sys.executable, "-u", str(REPO_DIR / "tools/train_sanpo_main.py"),
                 *arguments, "--config", str(CONFIG_PATH),
             ]
-            with CONSOLE_LOG.open("a", encoding="utf-8", buffering=1) as log:
-                process = subprocess.Popen(
-                    command, cwd=REPO_DIR, stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, text=True, bufsize=1,
-                )
-                assert process.stdout is not None
-                for line in process.stdout:
-                    print(line, end="", flush=True)
-                    log.write(line)
-                return_code = process.wait()
+            with lock_path.open("a+", encoding="utf-8") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise RuntimeError(
+                        f"Một lệnh khác của RUN_ID={RUN_ID} đang chạy. "
+                        "Dừng cell/process cũ trước khi chạy lại."
+                    ) from exc
+                with (
+                    CONSOLE_LOG.open("w", encoding="utf-8", buffering=1) as latest,
+                    command_log.open("x", encoding="utf-8", buffering=1) as archive,
+                ):
+                    sinks = (latest, archive)
+
+                    def emit(line):
+                        print(line, end="", flush=True)
+                        for sink in sinks:
+                            sink.write(line)
+
+                    process = subprocess.Popen(
+                        command, cwd=REPO_DIR, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, bufsize=1,
+                        start_new_session=True,
+                    )
+                    assert process.stdout is not None
+                    emit(
+                        f"[run_live] START action={action} pid={process.pid} "
+                        f"utc={started_at.isoformat()}\n"
+                    )
+                    emit(f"[run_live] archived_log={command_log}\n")
+                    lines = queue.Queue()
+
+                    def read_output():
+                        try:
+                            for line in process.stdout:
+                                lines.put(line)
+                        finally:
+                            lines.put(None)
+
+                    reader = threading.Thread(target=read_output, daemon=True)
+                    reader.start()
+                    last_heartbeat = time.monotonic()
+                    try:
+                        while True:
+                            try:
+                                line = lines.get(timeout=1.0)
+                            except queue.Empty:
+                                line = ""
+                            if line is None:
+                                break
+                            if line:
+                                emit(line)
+                            if process.poll() is not None and not reader.is_alive():
+                                while not lines.empty():
+                                    line = lines.get_nowait()
+                                    if line is None:
+                                        break
+                                    emit(line)
+                                break
+                            now = time.monotonic()
+                            if now - last_heartbeat >= 15.0:
+                                elapsed = int(
+                                    (datetime.now(timezone.utc) - started_at).total_seconds()
+                                )
+                                emit(
+                                    f"[run_live] HEARTBEAT action={action} "
+                                    f"pid={process.pid} elapsed={elapsed}s\n"
+                                )
+                                last_heartbeat = now
+                    except BaseException:
+                        emit(
+                            f"[run_live] INTERRUPT action={action} pid={process.pid}\n"
+                        )
+                        if process.poll() is None:
+                            os.killpg(process.pid, signal.SIGINT)
+                            try:
+                                process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                os.killpg(process.pid, signal.SIGTERM)
+                                try:
+                                    process.wait(timeout=2)
+                                except subprocess.TimeoutExpired:
+                                    os.killpg(process.pid, signal.SIGKILL)
+                        reader.join(timeout=2)
+                        raise
+                    reader.join(timeout=2)
+                    return_code = process.wait()
+                    elapsed = int(
+                        (datetime.now(timezone.utc) - started_at).total_seconds()
+                    )
+                    emit(
+                        f"[run_live] END action={action} pid={process.pid} "
+                        f"exit={return_code} elapsed={elapsed}s\n"
+                    )
             if return_code:
                 tail = "\n".join(
-                    CONSOLE_LOG.read_text(encoding="utf-8").splitlines()[-80:]
+                    command_log.read_text(encoding="utf-8").splitlines()[-80:]
                 )
                 raise RuntimeError(
                     f"RepLite command failed with exit code {return_code}. "
-                    f"Full log: {CONSOLE_LOG}\n\n{tail}"
+                    f"Full log: {command_log}\n\n{tail}"
                 )
+            print("Completed log:", command_log)
 
         print("Config:", CONFIG_PATH)
         print("Run Drive:", DRIVE_RUNS_ROOT / RUN_ID)
@@ -255,6 +428,25 @@ cells = [
         r"""
         #@title 3) Audit 234 archive + freeze split + xem cấu hình/model/parameter (KHÔNG train)
         run_live(["inspect"])
+        """
+    ),
+    markdown(
+        r"""
+        ## Stage official-train lên SSD `/content`
+
+        Cell này xử lý toàn bộ 186 archive official-train (bao gồm fit và inner-val):
+        kiểm dung lượng, copy từng archive từ Drive trong khi tính SHA-256, giải nén vào
+        thư mục tạm rồi publish atomically. Archive nén local được xoá ngay sau khi shard
+        giải nén xong. Nếu cell ngắt, chạy lại sẽ bỏ qua shard đã hoàn tất.
+
+        Pilot và main train sẽ bị từ chối nếu stage chưa đủ 186/186. Official-test hoàn
+        toàn chưa được stage hoặc mở ở bước này.
+        """
+    ),
+    code(
+        r"""
+        #@title 4) Stage 186 official-train archive lên local SSD (chạy một lần/session)
+        run_live(["stage-train"])
         """
     ),
     markdown(
@@ -276,34 +468,34 @@ cells = [
     ),
     code(
         r"""
-        #@title 4) Chạy pilot epoch 1 và stream log kiểu YOLO
+        #@title 5) Chạy pilot epoch 1 và stream log kiểu YOLO
         run_live(["pilot"])
         print("\nCó thể xem lại/tail log tại:", CONSOLE_LOG)
         """
     ),
     code(
         r"""
-        #@title 5) Xem gate và metric epoch 1
+        #@title 6) Xem gate và metric epoch 1
         DRIVE_RUN_DIR = DRIVE_RUNS_ROOT / RUN_ID
         PILOT_GATE_PATH = DRIVE_RUN_DIR / "pilot_gate.json"
         assert PILOT_GATE_PATH.is_file(), PILOT_GATE_PATH
         PILOT_GATE = json.loads(PILOT_GATE_PATH.read_text(encoding="utf-8"))
         print(json.dumps(PILOT_GATE, indent=2, ensure_ascii=False))
         assert PILOT_GATE["status"] == "pass", "Không được train main khi pilot chưa PASS"
-        print("\nAPPROVAL TOKEN (copy sang Cell 6):")
+        print("\nAPPROVAL TOKEN (copy sang Cell 7):")
         print(PILOT_GATE["approval_token"])
         print("\nTrong Colab Terminal có thể xem log bằng:")
-        print(f"tail -f {CONSOLE_LOG}")
+        print(f"tail -n 80 -F {CONSOLE_LOG}")
         """
     ),
     code(
         r"""
-        #@title 6) APPROVE và strict-resume epoch 2 → EPOCHS
+        #@title 7) APPROVE và strict-resume epoch 2 → EPOCHS
         START_MAIN = False  #@param {type:"boolean"}
         MAIN_APPROVAL_TOKEN = ""  #@param {type:"string"}
 
         if not START_MAIN:
-            print("Main train CHƯA chạy. Xem metric Cell 5, rồi đặt START_MAIN=True và dán token.")
+            print("Main train CHƯA chạy. Xem metric Cell 6, rồi đặt START_MAIN=True và dán token.")
         else:
             assert MAIN_APPROVAL_TOKEN == PILOT_GATE["approval_token"], "Sai approval token"
             run_live(["train", "--approval-token", MAIN_APPROVAL_TOKEN])
@@ -311,15 +503,38 @@ cells = [
     ),
     markdown(
         r"""
+        ## Sau khi campaign hoàn tất: stage official-test
+
+        Cell 7 tự xoá stage official-train local sau khi snapshot epoch cuối đã an toàn
+        trên Drive. Cell dưới đây bị khóa cho đến khi checksum-valid snapshot đủ `EPOCHS`
+        được xác nhận; nó chỉ giải nén 48 official-test shard lên SSD và **chưa đánh giá**.
+        """
+    ),
+    code(
+        r"""
+        #@title 8) Stage official-test sau khi train hoàn tất (chưa evaluate)
+        STAGE_OFFICIAL_TEST = False  #@param {type:"boolean"}
+
+        if not STAGE_OFFICIAL_TEST:
+            print("Official-test CHƯA được stage. Chỉ bật sau khi Cell 7 train hoàn tất.")
+        else:
+            run_live(["stage-test"])
+        """
+    ),
+    markdown(
+        r"""
         ## Resume sau khi Colab mất session
 
-        Chạy lại Cell 1 → 3, rồi Cell 5 để đọc token từ Drive. Bỏ qua Cell 4 nếu đã có
-        snapshot epoch 1. Sau đó chạy Cell 6. Lệnh `train` tự quét snapshot mới nhất xuống
+        Khi Colab mất session, SSD `/content` cũng mất. Chạy lại Cell 1 → 4 để dựng lại
+        source/config và restage official-train, rồi Cell 6 để đọc token từ Drive. Bỏ qua
+        Cell 5 nếu đã có snapshot epoch 1. Sau đó chạy Cell 7. Lệnh `train` tự quét snapshot mới nhất xuống
         cũ, bỏ snapshot hỏng, kiểm SHA-256 cùng source/config/catalog/split hash rồi mới
         strict-load model, optimizer, scheduler, GradScaler, RNG, global step và AMP skip.
 
-        Đừng đổi `RUN_ID` hay bất kỳ config nào khi resume. `console.log` được ghi ở local
-        runtime; lịch sử epoch và checkpoint nguồn sự thật nằm trong snapshot Drive.
+        Đừng đổi `RUN_ID` hay bất kỳ config nào khi resume. `console.log` chỉ chứa lệnh
+        đang chạy gần nhất; log đầy đủ riêng của từng lần gọi nằm trong `runs/<RUN_ID>/logs`.
+        Cả hai được ghi ở local runtime; lịch sử epoch và checkpoint nguồn sự thật nằm
+        trong snapshot Drive.
         """
     ),
 ]

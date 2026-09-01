@@ -367,27 +367,40 @@ was used for every shard.
 
 Run the notebook cells in order. Cell 3 prints the resolved architecture,
 MobileNet feature stages, ImageNet-1K weight provenance, parameter counts,
-optimizer groups, schedule, archive hashes, and frozen split before any model
-update. Cell 4 performs a disposable one-batch preflight and then runs exactly
-campaign epoch 1 over the complete train split with complete validation. Cell
-5 displays the operational gate and approval token. Only after reviewing those
-results should `START_MAIN` be enabled and the token pasted into Cell 6; that
+optimizer groups, schedule, archive hashes, frozen split, and SSD capacity plan
+before any model update. Cell 4 copies, SHA-verifies, and atomically extracts
+all 186 official-train shards (fit plus inner-validation) once to `/content`.
+Cell 5 performs a disposable one-batch preflight and then runs exactly campaign
+epoch 1 over the complete train split with complete validation. If FP16 scaled
+gradients overflow, preflight records the affected parameters and backs the
+scale down deterministically before constructing the production trainer. Cell
+6 displays the operational gate and approval token. Only after reviewing those
+results should `START_MAIN` be enabled and the token pasted into Cell 7; that
 cell strict-resumes epoch 2 with the same full-campaign scheduler.
 
-The console uses YOLO-style rows and is also written to `console.log` for
-`tail -f`. Every validation writes detection mAP50/mAP50--95 and per-class AP,
+The console uses YOLO-style rows. `console.log` contains only the current/latest
+command for `tail -F`; immutable per-invocation logs live below `logs/`. Every
+validation writes detection mAP50/mAP50--95 and per-class AP,
 segmentation mIoU/pixel accuracy/per-class IoU, and depth AbsRel/RMSE/delta1.
 Each completed epoch publishes a versioned SHA-256 snapshot containing the
 checkpoint, history, metrics, resolved configuration, and split metadata.
-After a Colab disconnect, rerun setup/config/audit and the gate cell, skip the
-pilot, and use Cell 6; restore scans newest to oldest and rejects corrupt or
-source/config/catalog/split-incompatible snapshots.
+After a Colab disconnect, rerun setup/config and Cell 4 because `/content` is
+ephemeral, then read the existing gate, skip the pilot, and use Cell 7; restore
+scans newest to oldest and rejects corrupt or source/config/catalog/split-
+incompatible snapshots. Each `RUN_ID` also writes an immutable source pin on
+Drive, so Cell 2 checks out the campaign's original commit even if `main` has
+advanced since the previous Colab session.
 
-The loader copies and verifies one archive at a time from Drive, safely
-extracts it to Colab SSD, and removes that shard before opening the next. This
-keeps local disk bounded, but a complete epoch still reads the whole selected
-training corpus from Drive. Derived detection boxes remain an internal
-panoptic-to-box protocol, not an official SANPO detection benchmark.
+The staged loader reuses the extracted official-train corpus directly from SSD
+for every epoch, so epochs do not reread Drive or re-extract archives. The stage
+is resumable shard-by-shard; its completion gate rechecks every referenced file
+against the stored path/size signature. Capacity planning uses the downloader's
+exact selected-file byte totals plus a configurable allowance. The stage is
+deleted only after the final epoch snapshot is safe on Drive. Cell 8 can then
+stage the 48 official-test shards; it is
+blocked before full campaign completion and staging alone does not evaluate the
+holdout. Derived detection boxes remain an internal panoptic-to-box protocol,
+not an official SANPO detection benchmark.
 
 ## Standalone backbones
 

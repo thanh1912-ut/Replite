@@ -44,14 +44,21 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         "IMAGE_WIDTH = 512",
         "BATCH_SIZE = 4",
         "VAL_FRACTION = 0.15",
+        'RUN_ID = "replite_sanpo_mnv4convs_seed42_v3"',
+        "LOCAL_STAGE_EXPANSION_FACTOR = 1.03",
+        'SOURCE_PIN = DRIVE_RUNS_ROOT / RUN_ID / "source_pin.json"',
+        '"checkout", "--detach", pinned_commit',
+        'assert SOURCE_COMMIT == pinned_commit',
+        'run_live(["stage-train"])',
         '"monitor": "val/total"',
         'run_live(["pilot"])',
         'run_live(["inspect"])',
         "START_MAIN = False",
         "MAIN_APPROVAL_TOKEN",
         'run_live(["train", "--approval-token", MAIN_APPROVAL_TOKEN])',
+        'run_live(["stage-test"])',
         "def run_live(arguments)",
-        "tail -f",
+        "tail -F",
     ):
         assert marker in source
 
@@ -64,6 +71,21 @@ def test_main_notebook_delegates_audited_streaming_and_never_downloads() -> None
     assert "download_sanpo_real_pilot.py" not in source
     assert "gdown" not in source
     assert "official-test không được mở" in NOTEBOOK.read_text(encoding="utf-8").lower()
+
+
+def test_main_notebook_keeps_command_logs_isolated_and_visible() -> None:
+    _, source = _source()
+    assert 'CONSOLE_LOG.open("w"' in source
+    assert 'command_log.open("x"' in source
+    assert 'CONSOLE_LOG.open("a"' not in source
+    assert 'fcntl.LOCK_EX | fcntl.LOCK_NB' in source
+    assert 'f"[run_live] START action={action}' in source
+    assert 'f"[run_live] HEARTBEAT action={action}' in source
+    assert 'f"[run_live] END action={action}' in source
+    assert 'f"[run_live] INTERRUPT action={action}' in source
+    assert "start_new_session=True" in source
+    assert "os.killpg(process.pid, signal.SIGINT)" in source
+    assert '"stage-train", "pilot", "train", "stage-test"' in source
 
 
 def test_main_runner_exists_and_compiles() -> None:

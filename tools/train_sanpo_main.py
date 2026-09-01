@@ -30,6 +30,7 @@ from replite.data import (
     ArchiveCatalog,
     ArchiveGroupSplit,
     ArchiveShardLoader,
+    LocalArchiveStage,
     SANPO_DERIVED_DETECTION_CONFIG,
     SANPO_DERIVED_DETECTION_CONFIG_SHA256,
     SANPO_DETECTION_CLASS_NAMES,
@@ -70,8 +71,8 @@ EXPECTED = {
     "train_frames": 14_718,
     "test_frames": 3_803,
 }
-PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v2"
-APPROVAL_KIND = "replite-sanpo-main-epoch1-approval-v1"
+PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v3"
+APPROVAL_KIND = "replite-sanpo-main-epoch1-approval-v2"
 DETECTION_MIN_COMPONENT_PIXELS = int(
     SANPO_DERIVED_DETECTION_CONFIG["min_component_pixels"]
 )
@@ -229,6 +230,7 @@ class Prepared:
     split: ArchiveGroupSplit
     context: SnapshotContext
     checkpoint_extra: dict[str, Any]
+    train_stage: LocalArchiveStage
     train_loader: ArchiveShardLoader
     val_loader: ArchiveShardLoader
 
@@ -262,6 +264,10 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         raise AssertionError("train/validation session leakage")
     if split.official_test_records != catalog.test_records:
         raise AssertionError("official-test identity changed during split creation")
+    if {item.key for item in (*split.train_records, *split.validation_records)} != {
+        item.key for item in catalog.train_records
+    }:
+        raise AssertionError("fit plus inner-validation does not cover official train")
 
     config_sha = canonical_json_sha256(config)
     source_sha = canonical_json_sha256(
@@ -283,6 +289,35 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         "official_test_used": False,
     }
     local_root = Path(config["local_work_root"]).expanduser().resolve()
+    staging = config["data"].get("local_staging", {})
+    if not isinstance(staging, Mapping):
+        raise ValueError("data.local_staging must be a mapping")
+    expansion_factor = staging.get("expansion_factor", 1.05)
+    reserve_gib = staging.get("reserve_gib", 4.0)
+    if (
+        isinstance(expansion_factor, bool)
+        or not isinstance(expansion_factor, (int, float))
+        or not math.isfinite(float(expansion_factor))
+        or float(expansion_factor) < 1.0
+    ):
+        raise ValueError("data.local_staging.expansion_factor must be at least one")
+    if (
+        isinstance(reserve_gib, bool)
+        or not isinstance(reserve_gib, (int, float))
+        or not math.isfinite(float(reserve_gib))
+        or float(reserve_gib) < 0.0
+    ):
+        raise ValueError("data.local_staging.reserve_gib must be non-negative")
+    train_stage = LocalArchiveStage(
+        catalog.train_records,
+        local_root=local_root
+        / "stages"
+        / config["run_id"]
+        / "official_train",
+        purpose="official_train",
+        expansion_factor=float(expansion_factor),
+        reserve_bytes=math.ceil(float(reserve_gib) * 1024**3),
+    )
     common = {
         "local_root": local_root / "shards" / config["run_id"],
         "batch_size": int(config["data"]["batch_size"]),
@@ -300,6 +335,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
             ),
             "normalize": True,
         },
+        "local_stage": train_stage,
     }
     return Prepared(
         config_path=config_path,
@@ -313,6 +349,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         split=split,
         context=context,
         checkpoint_extra=extra,
+        train_stage=train_stage,
         train_loader=ArchiveShardLoader(split.train_records, shuffle=True, **common),
         val_loader=ArchiveShardLoader(
             split.validation_records, shuffle=False, **common
@@ -443,7 +480,11 @@ class TrainObjects:
     warmup_steps: int
 
 
-def build_train_objects(prepared: Prepared) -> TrainObjects:
+def build_train_objects(
+    prepared: Prepared,
+    *,
+    amp_initial_scale: float | None = None,
+) -> TrainObjects:
     _seed_everything(int(prepared.config["train"]["seed"]))
     model = create_model(prepared)
     criterion = create_criterion(prepared)
@@ -475,7 +516,11 @@ def build_train_objects(prepared: Prepared) -> TrainObjects:
     trainer.scaler = torch.amp.GradScaler(
         "cuda",
         enabled=trainer.amp_enabled,
-        init_scale=float(prepared.config["train"]["amp_initial_scale"]),
+        init_scale=(
+            float(prepared.config["train"]["amp_initial_scale"])
+            if amp_initial_scale is None
+            else float(amp_initial_scale)
+        ),
     )
     return TrainObjects(
         model=model,
@@ -618,7 +663,11 @@ def inspection_payload(
             "deterministic": "warn_only",
             "tf32": False,
             "persistent_workers": False,
-            "archive_policy": "one verified local SSD shard at a time",
+            "archive_policy": (
+                "stage all 186 official-train shards once on local SSD; "
+                "reuse for fit and inner-validation; official-test deferred"
+            ),
+            "train_stage": prepared.train_stage.disk_plan(),
         },
     }
 
@@ -752,6 +801,49 @@ def _one_batch(loader: ArchiveShardLoader) -> tuple[Tensor, dict[str, Any]]:
             close()
 
 
+def _gradient_health(model: nn.Module) -> tuple[int, tuple[str, ...]]:
+    """Return connected-gradient count and names containing NaN/Inf values."""
+
+    connected = 0
+    nonfinite: list[str] = []
+    for name, parameter in model.named_parameters():
+        gradient = parameter.grad
+        if not parameter.requires_grad or gradient is None:
+            continue
+        connected += 1
+        if not bool(torch.isfinite(gradient).all()):
+            nonfinite.append(name)
+    return connected, tuple(nonfinite)
+
+
+def _finish_preflight_optimizer_step(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+) -> tuple[bool, int, tuple[str, ...], float, float]:
+    """Consume one unscaled preflight gradient set without unsafe updates."""
+
+    connected, nonfinite = _gradient_health(model)
+    if connected == 0:
+        raise FloatingPointError("preflight loss produced no model gradients")
+    old_scale = float(scaler.get_scale())
+    if scaler.is_enabled():
+        # GradScaler has already inspected the gradients in unscale_(). It
+        # atomically skips optimizer.step() when the set contains Inf/NaN.
+        scaler.step(optimizer)
+        scaler.update()
+        new_scale = float(scaler.get_scale())
+        stepped = not nonfinite and new_scale >= old_scale
+    elif nonfinite:
+        new_scale = old_scale
+        stepped = False
+    else:
+        optimizer.step()
+        new_scale = old_scale
+        stepped = True
+    return stepped, connected, nonfinite, old_scale, new_scale
+
+
 def disposable_preflight(prepared: Prepared) -> dict[str, Any]:
     """Use a throwaway model so production BN buffers and RNG stay pristine."""
 
@@ -773,36 +865,68 @@ def disposable_preflight(prepared: Prepared) -> dict[str, Any]:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
     started = time.perf_counter()
-    with torch.autocast(
-        device_type="cuda",
-        dtype=torch.float16,
-        enabled=device.type == "cuda",
-    ):
-        outputs = model(inputs)
-        losses = criterion(outputs, targets)
-    total = losses["total"]
-    if not bool(torch.isfinite(total.detach())):
-        raise FloatingPointError("preflight loss is non-finite")
-    scaler.scale(total).backward() if scaler.is_enabled() else total.backward()
-    if scaler.is_enabled():
-        scaler.unscale_(optimizer)
-    gradients = [
-        item.grad
-        for item in model.parameters()
-        if item.requires_grad and item.grad is not None
-    ]
-    if not gradients or any(
-        not bool(torch.isfinite(item).all()) for item in gradients
-    ):
-        raise FloatingPointError("preflight gradient is missing or non-finite")
-    old_scale = float(scaler.get_scale())
-    if scaler.is_enabled():
-        scaler.step(optimizer)
-        scaler.update()
-        stepped = float(scaler.get_scale()) >= old_scale
-    else:
-        optimizer.step()
-        stepped = True
+    initial_scale = float(scaler.get_scale())
+    overflow_attempts: list[dict[str, Any]] = []
+    while True:
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=device.type == "cuda",
+        ):
+            outputs = model(inputs)
+            losses = criterion(outputs, targets)
+        total = losses["total"]
+        if not bool(torch.isfinite(total.detach())):
+            raise FloatingPointError("preflight loss is non-finite")
+        scaler.scale(total).backward() if scaler.is_enabled() else total.backward()
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
+        (
+            stepped,
+            connected_gradients,
+            nonfinite_gradients,
+            old_scale,
+            new_scale,
+        ) = _finish_preflight_optimizer_step(model, optimizer, scaler)
+
+        if nonfinite_gradients:
+            if not scaler.is_enabled():
+                names = ", ".join(nonfinite_gradients[:8])
+                raise FloatingPointError(
+                    "preflight gradients are non-finite: " + names
+                )
+            overflow_attempts.append(
+                {
+                    "scale": old_scale,
+                    "next_scale": new_scale,
+                    "parameter_count": len(nonfinite_gradients),
+                    "parameters": list(nonfinite_gradients[:16]),
+                }
+            )
+            print(
+                "[preflight] AMP overflow "
+                f"scale={old_scale:g} -> {new_scale:g} | "
+                f"nonfinite_gradients={len(nonfinite_gradients)} | "
+                f"first={nonfinite_gradients[0]}"
+            )
+            if new_scale >= old_scale or new_scale < 1.0:
+                names = ", ".join(nonfinite_gradients[:8])
+                raise FloatingPointError(
+                    "preflight AMP could not find a stable scale; "
+                    f"last gradients: {names}"
+                )
+            del outputs, losses, total
+            continue
+
+        if scaler.is_enabled() and not stepped:
+            raise RuntimeError(
+                "GradScaler skipped a finite-gradient preflight update"
+            )
+        # ``old_scale`` is the scale actually proven finite by this attempt;
+        # a growth-interval update could make ``new_scale`` larger but untested.
+        stable_scale = old_scale
+        break
     if device.type == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
@@ -824,11 +948,15 @@ def disposable_preflight(prepared: Prepared) -> dict[str, Any]:
             if isinstance(value, Tensor) and value.ndim == 0
         },
         "optimizer_stepped": stepped,
+        "amp_initial_scale": initial_scale,
+        "amp_stable_scale": stable_scale,
+        "amp_backoff_count": len(overflow_attempts),
+        "amp_overflow_attempts": overflow_attempts,
         "elapsed_seconds": elapsed,
         "peak_vram_gib": peak,
         "production_model_mutated": False,
     }
-    del outputs, losses, inputs, targets, gradients
+    del outputs, losses, inputs, targets
     del optimizer, criterion, model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -945,6 +1073,7 @@ def _write_metadata(
                     "archive_name": item.archive_path.name,
                     "archive_bytes": item.archive_bytes,
                     "archive_sha256": item.archive_sha256,
+                    "source_bytes": item.source_bytes,
                     "joint_frames": item.joint_frames,
                 }
                 for item in prepared.catalog.records
@@ -1095,6 +1224,136 @@ def _publish_gate(prepared: Prepared, gate: Mapping[str, Any]) -> None:
     _atomic_json(_gate_path(prepared), dict(gate))
 
 
+def _load_cached_inspection(prepared: Prepared) -> dict[str, Any] | None:
+    """Reuse Cell 3's context-bound audit instead of printing it again."""
+
+    path = (
+        prepared.local_root
+        / "inspections"
+        / f"{prepared.config['run_id']}.json"
+    )
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        print("Cached inspection is unreadable; rebuilding:", path)
+        return None
+    required = {
+        "data", "model_config", "pretrained", "parameters", "schedule"
+    }
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or value.get("protocol_id") != PROTOCOL_ID
+        or value.get("context") != prepared.context.as_dict()
+        or not required.issubset(value)
+    ):
+        print("Cached inspection is stale/incomplete; rebuilding:", path)
+        return None
+    print("Reusing context-matched inspection from Cell 3:", path)
+    return value
+
+
+def _stage_progress(
+    index: int,
+    total: int,
+    record: Any,
+    status: str,
+) -> None:
+    print(
+        f"[stage] {index:03d}/{total:03d} | {status:7s} | "
+        f"{record.split}/{record.session_id}/{record.sensor} | "
+        f"archive={record.archive_bytes / 1024**3:.2f} GiB",
+        flush=True,
+    )
+
+
+def _print_stage_plan(title: str, plan: Mapping[str, Any]) -> None:
+    print(f"\n========== {title} ==========")
+    print(
+        f"pending={plan['pending_records']} | "
+        f"archives={int(plan['archive_bytes']) / 1024**3:.2f} GiB | "
+        f"exact selected files={int(plan['exact_source_bytes']) / 1024**3:.2f} GiB "
+        f"({plan['source_bytes_records']} records) | "
+        f"capacity estimate={int(plan['estimated_unpacked_bytes']) / 1024**3:.2f} GiB"
+    )
+    print(
+        f"required free={int(plan['required_free_bytes']) / 1024**3:.2f} GiB | "
+        f"available={int(plan['available_free_bytes']) / 1024**3:.2f} GiB"
+    )
+
+
+def stage_official_train(filename: str | os.PathLike[str]) -> dict[str, Any]:
+    """Copy, verify, and extract official-train once for all later epochs."""
+
+    prepared = prepare(filename)
+    plan = prepared.train_stage.disk_plan()
+    _print_stage_plan("STAGE OFFICIAL-TRAIN TO LOCAL SSD", plan)
+    result = prepared.train_stage.prepare_all(_stage_progress)
+    if result.get("complete") is not True:
+        raise RuntimeError("official-train SSD stage did not complete")
+    print(
+        "\nTRAIN STAGE READY | "
+        f"{result['completed_count']}/{result['record_count']} shards | "
+        f"{int(result['completed_extracted_bytes']) / 1024**3:.2f} GiB | "
+        f"{prepared.train_stage.local_root}"
+    )
+    return result
+
+
+def _official_test_stage(prepared: Prepared) -> LocalArchiveStage:
+    staging = prepared.config["data"].get("local_staging", {})
+    return LocalArchiveStage(
+        prepared.split.official_test_records,
+        local_root=prepared.local_root
+        / "stages"
+        / prepared.config["run_id"]
+        / "official_test",
+        purpose="official_test",
+        expansion_factor=float(staging.get("expansion_factor", 1.05)),
+        reserve_bytes=math.ceil(float(staging.get("reserve_gib", 4.0)) * 1024**3),
+    )
+
+
+def stage_official_test(filename: str | os.PathLike[str]) -> dict[str, Any]:
+    """Stage the untouched holdout only after a checksum-valid full campaign."""
+
+    prepared = prepare(filename)
+    restored = _restore(prepared)
+    status_path = prepared.local_run / "run_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    expected_epoch = int(prepared.config["train"]["epochs"]) - 1
+    if (
+        not isinstance(status, dict)
+        or status.get("status") != "complete"
+        or status.get("epoch_completed") != expected_epoch
+        or restored.epoch_completed != expected_epoch
+        or status.get("official_test_used") is not False
+    ):
+        raise PermissionError(
+            "official-test may be staged only after the full checksum-valid "
+            "training campaign is complete"
+        )
+
+    # The full campaign no longer needs official-train pixels. This is an
+    # ownership-checked deletion under /content; Drive archives are untouched.
+    prepared.train_stage.cleanup()
+    test_stage = _official_test_stage(prepared)
+    plan = test_stage.disk_plan()
+    _print_stage_plan("STAGE OFFICIAL-TEST TO LOCAL SSD", plan)
+    result = test_stage.prepare_all(_stage_progress)
+    if result.get("complete") is not True:
+        raise RuntimeError("official-test SSD stage did not complete")
+    print(
+        "\nTEST STAGE READY (NOT EVALUATED) | "
+        f"{result['completed_count']}/{result['record_count']} shards | "
+        f"{int(result['completed_extracted_bytes']) / 1024**3:.2f} GiB | "
+        f"{test_stage.local_root}"
+    )
+    return result
+
+
 def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("pilot requires an NVIDIA CUDA runtime")
@@ -1112,14 +1371,21 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
             "unpublished local checkpoint exists; use a new RUN_ID"
         )
 
-    inspection = inspect_campaign(filename)
+    prepared.train_stage.require_complete()
+
+    inspection = _load_cached_inspection(prepared)
+    if inspection is None:
+        inspection = inspect_campaign(filename)
     _write_metadata(prepared, inspection)
     preflight = disposable_preflight(prepared)
     _atomic_json(prepared.local_run / "preflight.json", preflight)
     # The disposable model consumed RNG and updated its own BN buffers. Reset
     # before constructing the clean production model for campaign epoch zero.
     _seed_everything(int(prepared.config["train"]["seed"]))
-    objects = build_train_objects(prepared)
+    objects = build_train_objects(
+        prepared,
+        amp_initial_scale=float(preflight["amp_stable_scale"]),
+    )
     prepared.train_loader.set_epoch(0)
     prepared.val_loader.set_epoch(0)
     torch.cuda.reset_peak_memory_stats()
@@ -1269,6 +1535,7 @@ def run_main(filename: str | os.PathLike[str], supplied_token: str) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("main training requires an NVIDIA CUDA runtime")
     prepared = prepare(filename)
+    prepared.train_stage.require_complete()
     _verify_approval(prepared, supplied_token)
     restored = _restore(prepared)
     objects = build_train_objects(prepared)
@@ -1338,16 +1605,18 @@ def run_main(filename: str | os.PathLike[str], supplied_token: str) -> None:
             f"{snapshot.snapshot_dir} | {snapshot.checkpoint_sha256}"
         )
     objects.logger.close()
+    prepared.train_stage.cleanup()
     print("\nTRAINING COMPLETE")
     print("Drive run:", prepared.drive_run)
     print("Best:", objects.trainer.best_metrics)
+    print("Official-train local SSD stage đã được xoá; Drive archives còn nguyên.")
     print("Official-test vẫn chưa được dùng.")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "pilot"):
+    for name in ("inspect", "stage-train", "pilot", "stage-test"):
         child = commands.add_parser(name)
         child.add_argument("--config", required=True)
     train = commands.add_parser("train")
@@ -1360,10 +1629,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "inspect":
         inspect_campaign(args.config)
+    elif args.command == "stage-train":
+        stage_official_train(args.config)
     elif args.command == "pilot":
         run_pilot(args.config)
     elif args.command == "train":
         run_main(args.config, args.approval_token)
+    elif args.command == "stage-test":
+        stage_official_test(args.config)
     return 0
 
 
