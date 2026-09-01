@@ -154,6 +154,32 @@ def test_segmentation_metric_state_round_trip_and_all_ignore() -> None:
     assert torch.equal(restored.confusion_matrix, metric.confusion_matrix)
 
 
+def test_metric_valid_masks_are_not_mutated_and_batch_masks_broadcast() -> None:
+    segmentation_mask = torch.ones(2, 1, 2, dtype=torch.bool)
+    segmentation_before = segmentation_mask.clone()
+    segmentation = SegmentationMetrics(2)
+    segmentation.update(
+        torch.tensor([[[0, 1]], [[1, 0]]]),
+        torch.tensor([[[0, 255]], [[1, 0]]]),
+        valid_mask=segmentation_mask,
+    )
+    assert torch.equal(segmentation_mask, segmentation_before)
+    assert segmentation.compute()["num_pixels"] == 3
+
+    # Expanded B-only masks are overlapping views internally; updates must use
+    # an out-of-place conjunction rather than an in-place &= operation.
+    depth_mask = torch.tensor([True, False])
+    depth_before = depth_mask.clone()
+    depth = DepthMetrics()
+    depth.update(
+        torch.ones(2, 1, 1, 2),
+        torch.ones(2, 1, 1, 2),
+        valid_mask=depth_mask,
+    )
+    assert torch.equal(depth_mask, depth_before)
+    assert depth.compute()["num_pixels"] == 2
+
+
 def test_depth_metrics_match_hand_computation_and_merge() -> None:
     prediction = torch.tensor([[[[1.0, 3.0]]]])
     target = torch.tensor([[[[2.0, 2.0]]]])
@@ -182,6 +208,18 @@ def test_depth_metric_no_valid_pixels_is_explicit_and_invalid_prediction_rejecte
     assert metric.compute()["num_pixels"] == 0
     with pytest.raises(ValueError, match="finite and positive"):
         metric.update(torch.zeros(1, 1, 1, 1), torch.ones(1, 1, 1, 1))
+
+
+def test_depth_metric_uses_exclusive_min_inclusive_max_and_strict_delta1() -> None:
+    metric = DepthMetrics(min_depth=0.1, max_depth=80.0)
+    metric.update(
+        torch.tensor([[[[0.1, 100.0, 1.25]]]]),
+        torch.tensor([[[[0.1, 80.0, 1.0]]]]),
+        valid_mask=torch.ones(1, 1, 1, 3, dtype=torch.bool),
+    )
+    result = metric.compute()
+    assert result["num_pixels"] == 2
+    assert result["delta1"] == pytest.approx(0.0)
 
 
 def test_classification_and_multitask_metric_adapter() -> None:
@@ -260,14 +298,160 @@ def test_detection_map_penalizes_higher_scored_false_positive() -> None:
     assert result["map50_95"] == pytest.approx(0.5)
 
 
+def test_detection_map_does_not_count_ignored_region_as_false_positive() -> None:
+    metric = DetectionMAP(1, iou_thresholds=(0.5,))
+    metric.update(
+        [_detection([[20, 20, 30, 30], [0, 0, 10, 10]], [0.9, 0.8], [0, 0])],
+        [
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
+                "labels": torch.tensor([0], dtype=torch.long),
+                "ignore_boxes": torch.tensor([[20.0, 20.0, 30.0, 30.0]]),
+            }
+        ],
+    )
+    result = metric.compute()
+    assert result["map50"] == pytest.approx(1.0)
+    assert result["map50_95"] == pytest.approx(1.0)
+
+
+def test_detection_positive_match_takes_precedence_over_overlapping_ignore() -> None:
+    metric = DetectionMAP(1, iou_thresholds=(0.5,))
+    metric.update(
+        [_detection([[0, 0, 10, 10]], [0.9], [0])],
+        [
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
+                "labels": torch.tensor([0], dtype=torch.long),
+                "ignore_boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
+            }
+        ],
+    )
+    assert metric.compute()["map50"] == pytest.approx(1.0)
+
+
+def test_detection_all_ignored_predictions_leave_missing_target_ap_at_zero() -> None:
+    metric = DetectionMAP(1, iou_thresholds=(0.5,))
+    metric.update(
+        [_detection([[20, 20, 30, 30]], [0.9], [0])],
+        [
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
+                "labels": torch.tensor([0], dtype=torch.long),
+                "ignore_boxes": torch.tensor([[20.0, 20.0, 30.0, 30.0]]),
+            }
+        ],
+    )
+    assert metric.compute()["map50"] == pytest.approx(0.0)
+
+
+def test_detection_empty_predictions_with_positive_target_has_zero_ap() -> None:
+    metric = DetectionMAP(1, iou_thresholds=(0.5,))
+    metric.update(
+        [_detection([], [], [])],
+        [_target([[0, 0, 10, 10]], [0])],
+    )
+    assert metric.compute()["map50"] == pytest.approx(0.0)
+
+
+def test_detection_ignore_boxes_are_intentionally_class_agnostic() -> None:
+    metric = DetectionMAP(2, iou_thresholds=(0.5,))
+    metric.update(
+        [
+            _detection(
+                [
+                    [20, 20, 30, 30],
+                    [20, 20, 30, 30],
+                    [0, 0, 10, 10],
+                    [40, 40, 50, 50],
+                ],
+                [0.95, 0.9, 0.8, 0.7],
+                [0, 1, 0, 1],
+            )
+        ],
+        [
+            {
+                "boxes": torch.tensor(
+                    [[0.0, 0.0, 10.0, 10.0], [40.0, 40.0, 50.0, 50.0]]
+                ),
+                "labels": torch.tensor([0, 1], dtype=torch.long),
+                "ignore_boxes": torch.tensor([[20.0, 20.0, 30.0, 30.0]]),
+            }
+        ],
+    )
+    assert metric.compute()["map50"] == pytest.approx(1.0)
+
+
+def test_detection_ignore_prediction_still_consumes_max_detection_cap() -> None:
+    metric = DetectionMAP(1, iou_thresholds=(0.5,), max_detections=1)
+    metric.update(
+        [_detection([[20, 20, 30, 30], [0, 0, 10, 10]], [0.9, 0.8], [0, 0])],
+        [
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
+                "labels": torch.tensor([0], dtype=torch.long),
+                "ignore_boxes": torch.tensor([[20.0, 20.0, 30.0, 30.0]]),
+            }
+        ],
+    )
+    assert metric.compute()["map50"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "ignore_boxes",
+    (
+        torch.ones(4),
+        torch.ones(2, 2, 2),
+        torch.ones(2, 3),
+        torch.empty(0, 3),
+        torch.empty(2, 0),
+        torch.empty(0, 4, 1),
+    ),
+)
+def test_detection_rejects_malformed_ignore_box_shapes(ignore_boxes) -> None:
+    metric = DetectionMAP(1)
+    with pytest.raises(ValueError, match="ignore_boxes must have shape M,4"):
+        metric.update(
+            [_detection([], [], [])],
+            [
+                {
+                    "boxes": torch.empty(0, 4),
+                    "labels": torch.empty(0, dtype=torch.long),
+                    "ignore_boxes": ignore_boxes,
+                }
+            ],
+        )
+
+
 def test_detection_map_merge_and_state_round_trip() -> None:
     first, second = DetectionMAP(1), DetectionMAP(1)
-    first.update([_detection([[0, 0, 4, 4]], [0.9], [0])], [_target([[0, 0, 4, 4]], [0])])
+    first.update(
+        [_detection([[0, 0, 4, 4]], [0.9], [0])],
+        [
+            {
+                **_target([[0, 0, 4, 4]], [0]),
+                "ignore_boxes": torch.tensor([[6.0, 6.0, 8.0, 8.0]]),
+            }
+        ],
+    )
     second.update([_detection([], [], [])], [_target([], [])])
     first.merge_state(second)
     restored = DetectionMAP(1)
     restored.load_state_dict(first.state_dict())
     assert restored.compute() == first.compute()
+    torch.testing.assert_close(
+        restored.targets[0]["ignore_boxes"], first.targets[0]["ignore_boxes"]
+    )
+
+    legacy_state = first.state_dict()
+    for target in legacy_state["targets"]:
+        target.pop("ignore_boxes")
+    legacy_restored = DetectionMAP(1)
+    legacy_restored.load_state_dict(legacy_state)
+    assert all(
+        target["ignore_boxes"].shape == (0, 4)
+        for target in legacy_restored.targets
+    )
 
 
 def test_multitask_metric_adapter_decodes_raw_detection_output() -> None:
@@ -297,3 +481,37 @@ def test_multitask_metric_adapter_decodes_raw_detection_output() -> None:
         },
     )
     assert adapter.compute()["detection/map50_95"] == pytest.approx(1.0)
+
+
+def test_multitask_metric_adapter_forwards_detection_maximum(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_decode(predictions, image_sizes, **kwargs):
+        captured.update(kwargs)
+        return [_detection([], [], []) for _ in image_sizes]
+
+    monkeypatch.setattr("replite.training.metrics.decode_detections", fake_decode)
+    output = RepLiteOutput(
+        DetectionOutput(
+            (torch.zeros(1, 1, 1, 1),) * 3,
+            (torch.ones(1, 4, 1, 1),) * 3,
+            (torch.zeros(1, 1, 1, 1),) * 3,
+        ),
+        None,
+        None,
+        None,
+    )
+    adapter = MultiTaskMetrics(detection=DetectionMAP(1, max_detections=7))
+    adapter.update(
+        output,
+        {
+            "detection": [
+                {
+                    "boxes": torch.empty(0, 4),
+                    "labels": torch.empty(0, dtype=torch.long),
+                    "valid_size": (32, 32),
+                }
+            ]
+        },
+    )
+    assert captured["max_detections"] == 7

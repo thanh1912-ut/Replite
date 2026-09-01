@@ -321,6 +321,30 @@ live weights against `last.pt`, compares cumulative skips in `last.prev.pt`,
 performs only the held-out forward-pass QA, and checks every copied artifact
 before publishing to Drive.
 
+### SANPO smoke validation metrics
+
+For a completed live pilot, pull the current evaluator and run it in a new
+Colab cell. Do not rerun setup, extraction, training, or AMP recovery first:
+
+```python
+!git -C /content/Replite pull --ff-only
+%run -i /content/Replite/tools/evaluate_sanpo_smoke_val.py
+```
+
+The evaluator creates a separate inference model, strict-loads the selected
+`best.pt`, and consumes only the held-out validation session. It reports
+detection mAP50 and mAP50--95, segmentation mIoU and all per-class IoUs, and
+depth AbsRel, RMSE, and delta1. JSON, tidy CSV tables, the complete 30-by-30
+segmentation confusion matrix, and a PNG/SVG dashboard are checksum-verified
+before being published under the run's versioned `evaluations/` directory.
+The live training model, optimizer, scheduler, scaler, RNG state, root artifact
+manifest, and official-test split are left unchanged.
+
+These are descriptive pilot metrics from one 73-frame held-out official-train
+session at 288x512. Detection boxes are derived from panoptic components and
+the internal AP accumulator is not the official SANPO or COCO evaluator, so do
+not present this bundle as an official benchmark result.
+
 ## Standalone backbones
 
 Lightweight native-trunk feature backbones for dense prediction:

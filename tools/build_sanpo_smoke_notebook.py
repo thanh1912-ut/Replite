@@ -43,7 +43,9 @@ cells = [
         3. trực quan RGB, detection box dẫn xuất, semantic mask và metric depth;
         4. smoke train mặc định **3 epoch** trên một train session, validation bằng train
            session còn lại; official-test không tham gia `fit()` hoặc chọn checkpoint;
-        5. kiểm checkpoint rồi mới mirror run bundle có checksum lên Drive.
+        5. kiểm checkpoint rồi mới mirror run bundle có checksum lên Drive;
+        6. strict-load `best.pt`, tính mAP/mIoU/depth trên **val session** và lưu
+           evaluation bundle riêng; official-test không tham gia metric.
 
         Detection box được dẫn xuất từ official panoptic mask, **không phải official SANPO
         detection benchmark**. Chạy tuần tự từ trên xuống. Runtime cần GPU.
@@ -128,6 +130,9 @@ cells = [
         DEPTH_MAX_METRES = 80.0
         AMP_INITIAL_SCALE = 4096.0
         MAX_RECOVERABLE_AMP_SKIP_RATE = 0.05
+        VAL_DETECTION_SCORE_THRESHOLD = 0.001
+        VAL_DETECTION_NMS_IOU_THRESHOLD = 0.6
+        VAL_DETECTION_MAX_DETECTIONS = 300
 
         assert 2 <= SMOKE_EPOCHS <= 5, "Smoke phải nằm trong 2–5 epoch"
         assert IMAGE_HEIGHT % 32 == 0 and IMAGE_WIDTH % 32 == 0
@@ -483,12 +488,17 @@ cells = [
         from replite.data import (
             SANPO_DETECTION_CLASS_NAMES,
             SANPO_SEGMENTATION_CLASS_NAMES,
+            SANPO_SEGMENTATION_IGNORE_INDEX,
             SanpoJointDataset,
             sanpo_joint_collate,
         )
         from replite.training import (
             CheckpointManager,
+            DepthMetrics,
+            DetectionMAP,
             MultiTaskCriterion,
+            MultiTaskMetrics,
+            SegmentationMetrics,
             Trainer,
             TrainerConfig,
             TrainingLogger,
@@ -609,6 +619,23 @@ cells = [
         )
         logger = TrainingLogger(LOCAL_RUN_DIR, run_id=RUN_ID, fsync=False)
         checkpoint_manager = CheckpointManager(LOCAL_RUN_DIR / "checkpoints")
+        validation_metrics = MultiTaskMetrics(
+            detection=DetectionMAP(
+                len(SANPO_DETECTION_CLASS_NAMES),
+                max_detections=VAL_DETECTION_MAX_DETECTIONS,
+            ),
+            segmentation=SegmentationMetrics(
+                len(SANPO_SEGMENTATION_CLASS_NAMES),
+                ignore_index=SANPO_SEGMENTATION_IGNORE_INDEX,
+            ),
+            depth=DepthMetrics(
+                min_depth=DEPTH_MIN_METRES,
+                max_depth=DEPTH_MAX_METRES,
+            ),
+            detection_reg_max=model_config.detection_reg_max,
+            detection_score_threshold=VAL_DETECTION_SCORE_THRESHOLD,
+            detection_nms_iou_threshold=VAL_DETECTION_NMS_IOU_THRESHOLD,
+        )
 
         class NotebookTrainer(Trainer):
             def train_epoch(self, loader, *, epoch):
@@ -633,13 +660,22 @@ cells = [
                 result = super().validate(
                     tqdm(loader, desc=f"val {0 if epoch is None else epoch + 1}/{self.config.epochs}", leave=True), epoch=epoch
                 )
-                print(f"[val] total={result['total']:.6f} | {time.perf_counter()-started:.1f}s")
+                print(
+                    f"[val] total={result['total']:.6f} "
+                    f"| mAP50={result['detection/map50']:.4f} "
+                    f"| mAP50-95={result['detection/map50_95']:.4f} "
+                    f"| mIoU={result['segmentation/miou']:.4f} "
+                    f"| AbsRel={result['depth/abs_rel']:.4f} "
+                    f"| RMSE={result['depth/rmse']:.3f}m "
+                    f"| delta1={result['depth/delta1']:.4f} "
+                    f"| {time.perf_counter()-started:.1f}s"
+                )
                 return result
 
         trainer = NotebookTrainer(
             model, criterion, optimizer, trainer_config,
             device="cuda", scheduler=scheduler, logger=logger,
-            checkpoint_manager=checkpoint_manager, validation_metrics=None,
+            checkpoint_manager=checkpoint_manager, validation_metrics=validation_metrics,
         )
         # Default 65536 overflows during the first few multi-task updates on
         # this pilot. 4096 is the empirically recovered scale from the first
@@ -779,6 +815,15 @@ cells = [
                 "requires_zero_skips_in_final_epoch": True,
                 "requires_finite_final_scale_at_least": 1.0,
             },
+            "validation_metrics": {
+                "selection_split": "held-out SANPO official-train session",
+                "checkpoint_selection_remains": "minimum val/total",
+                "detection_score_threshold": VAL_DETECTION_SCORE_THRESHOLD,
+                "detection_nms_iou_threshold": VAL_DETECTION_NMS_IOU_THRESHOLD,
+                "detection_max_detections": VAL_DETECTION_MAX_DETECTIONS,
+                "segmentation_ignore_index": SANPO_SEGMENTATION_IGNORE_INDEX,
+                "depth_valid_range_metres": [DEPTH_MIN_METRES, DEPTH_MAX_METRES],
+            },
             "pretrained_random_init_fallback": pretrained_fallback,
             "split_protocol": {
                 "train_session": train_dataset.info.session_id,
@@ -870,6 +915,33 @@ cells = [
         print("Drive run:", DRIVE_RUN_DIR)
         print("Preview:", DRIVE_RUN_DIR / "sanpo_data_preview.png")
         print("Best checkpoint:", DRIVE_RUN_DIR / "checkpoints" / "best.pt")
+        """
+    ),
+    markdown(
+        r"""
+        ## Metric của checkpoint tốt nhất trên val
+
+        Cell cuối dựng một model inference riêng, strict-load `best.pt`, rồi tính trên đúng
+        session val 73 frame: detection mAP50/mAP50–95, segmentation mIoU/per-class IoU,
+        và depth AbsRel/RMSE/δ1. Kết quả hậu kiểm được ghi vào bundle versioned dưới
+        `evaluations/`; root artifact của smoke run không bị ghi đè.
+
+        Đây là **descriptive smoke metric**, không phải official SANPO benchmark: val là một
+        session thuộc official-train và detection box được dẫn xuất từ panoptic mask.
+        """
+    ),
+    code(
+        r"""
+        #@title 9) Evaluate best.pt trên held-out val và lưu JSON/CSV/dashboard
+        import runpy
+
+        evaluator_path = REPO_DIR / "tools" / "evaluate_sanpo_smoke_val.py"
+        assert evaluator_path.is_file(), evaluator_path
+        evaluator_namespace = runpy.run_path(
+            str(evaluator_path), init_globals=globals()
+        )
+        VAL_METRICS_RESULT = evaluator_namespace["VAL_METRICS_RESULT"]
+        del evaluator_namespace
         """
     ),
 ]

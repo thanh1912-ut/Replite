@@ -84,8 +84,9 @@ class SegmentationMetrics:
             raise ValueError("segmentation labels must have shape B,H,W")
         if prediction.shape != target.shape:
             raise ValueError("prediction and target shapes must match")
-        mask = _broadcast_bool_mask(valid_mask, target)
-        mask &= target.ne(self.ignore_index)
+        mask = _broadcast_bool_mask(valid_mask, target) & target.ne(
+            self.ignore_index
+        )
         if not bool(mask.any()):
             return
         actual = target[mask].long()
@@ -216,10 +217,11 @@ class DepthMetrics:
             raise ValueError("depth prediction and target shapes must match")
         if not prediction.is_floating_point() or not target.is_floating_point():
             raise TypeError("depth prediction and target must be floating point")
-        mask = _broadcast_bool_mask(valid_mask, target)
-        mask &= torch.isfinite(target) & target.gt(self.min_depth)
+        mask = _broadcast_bool_mask(valid_mask, target) & torch.isfinite(
+            target
+        ) & target.gt(self.min_depth)
         if self.max_depth is not None:
-            mask &= target.le(self.max_depth)
+            mask = mask & target.le(self.max_depth)
         if not bool(mask.any()):
             return
         predicted = prediction[mask].detach().float()
@@ -343,8 +345,9 @@ class ClassificationMetrics:
             target = target[:, 0]
         if prediction.ndim != 1 or target.ndim != 1 or prediction.shape != target.shape:
             raise ValueError("classification labels must have shape B")
-        mask = _broadcast_bool_mask(valid_mask, target)
-        mask &= target.ne(self.ignore_index)
+        mask = _broadcast_bool_mask(valid_mask, target) & target.ne(
+            self.ignore_index
+        )
         if not bool(mask.any()):
             return
         actual = target[mask].long()
@@ -430,6 +433,21 @@ def _validate_box_mapping(
         if scores.shape != (boxes.shape[0],) or not bool(torch.isfinite(scores).all()):
             raise ValueError("scores must be a finite tensor with shape N")
         result["scores"] = scores
+    else:
+        ignore_boxes = torch.as_tensor(
+            item.get("ignore_boxes", ()), dtype=torch.float32
+        ).detach().cpu()
+        if ignore_boxes.shape == (0,):
+            ignore_boxes = ignore_boxes.reshape(0, 4)
+        if ignore_boxes.ndim != 2 or ignore_boxes.shape[1] != 4:
+            raise ValueError("ignore_boxes must have shape M,4")
+        if not bool(torch.isfinite(ignore_boxes).all()):
+            raise ValueError("ignore_boxes must be finite")
+        if ignore_boxes.shape[0] and bool(
+            (ignore_boxes[:, 2:] <= ignore_boxes[:, :2]).any()
+        ):
+            raise ValueError("ignore_boxes must have positive width and height")
+        result["ignore_boxes"] = ignore_boxes
     return result
 
 
@@ -512,6 +530,7 @@ class DetectionMAP:
 
     def _class_ap(self, class_id: int, threshold: float) -> float | None:
         targets_by_image: list[Tensor] = []
+        ignored_by_image: list[Tensor] = []
         total_targets = 0
         detections: list[tuple[float, int, int, Tensor]] = []
         insertion = 0
@@ -520,6 +539,7 @@ class DetectionMAP:
         ):
             boxes = target["boxes"][target["labels"] == class_id]
             targets_by_image.append(boxes)
+            ignored_by_image.append(target["ignore_boxes"])
             total_targets += int(boxes.shape[0])
             mask = prediction["labels"] == class_id
             for score, box in zip(prediction["scores"][mask], prediction["boxes"][mask]):
@@ -529,22 +549,36 @@ class DetectionMAP:
             return None
         detections.sort(key=lambda item: (-item[0], item[1]))
         matched = [torch.zeros(len(boxes), dtype=torch.bool) for boxes in targets_by_image]
-        true_positive = torch.zeros(len(detections), dtype=torch.float64)
-        false_positive = torch.zeros(len(detections), dtype=torch.float64)
-        for index, (_, _, image_index, box) in enumerate(detections):
+        true_positive: list[float] = []
+        false_positive: list[float] = []
+        for _, _, image_index, box in detections:
             targets = targets_by_image[image_index]
-            if targets.numel() == 0:
-                false_positive[index] = 1.0
+            if targets.numel():
+                overlaps = box_iou(box.unsqueeze(0), targets).squeeze(0)
+                overlaps = overlaps.masked_fill(matched[image_index], -1.0)
+                overlap, target_index = overlaps.max(dim=0)
+                if overlap >= threshold:
+                    true_positive.append(1.0)
+                    false_positive.append(0.0)
+                    matched[image_index][target_index] = True
+                    continue
+
+            # SANPO conversion moves components below the configured minimum
+            # area into class-agnostic ignore boxes. Training masks these
+            # regions, so an otherwise-unmatched detection there must be
+            # excluded from both TP and FP. Positive matches take precedence.
+            ignored = ignored_by_image[image_index]
+            if ignored.numel() and bool(
+                (box_iou(box.unsqueeze(0), ignored).squeeze(0) >= threshold).any()
+            ):
                 continue
-            overlaps = box_iou(box.unsqueeze(0), targets).squeeze(0)
-            overlaps = overlaps.masked_fill(matched[image_index], -1.0)
-            overlap, target_index = overlaps.max(dim=0)
-            if overlap >= threshold:
-                true_positive[index] = 1.0
-                matched[image_index][target_index] = True
-            else:
-                false_positive[index] = 1.0
-        return self._interpolated_ap(true_positive, false_positive, total_targets)
+            true_positive.append(0.0)
+            false_positive.append(1.0)
+        return self._interpolated_ap(
+            torch.tensor(true_positive, dtype=torch.float64),
+            torch.tensor(false_positive, dtype=torch.float64),
+            total_targets,
+        )
 
     def compute(self) -> dict[str, Any]:
         threshold_values: dict[float, list[float]] = {}
@@ -732,6 +766,7 @@ class MultiTaskMetrics:
                     reg_max=self.detection_reg_max,
                     score_threshold=self.detection_score_threshold,
                     nms_iou_threshold=self.detection_nms_iou_threshold,
+                    max_detections=self.detection.max_detections,
                 )
                 self.detection.update(decoded, target_batch)
         if self.segmentation is not None:

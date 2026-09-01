@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK_PATH = ROOT / "notebooks" / "SANPO_Real_Extract_Visualize_Smoke_Train.ipynb"
 RECOVERY_PATH = ROOT / "tools" / "recover_sanpo_smoke_amp.py"
+VAL_EVALUATOR_PATH = ROOT / "tools" / "evaluate_sanpo_smoke_val.py"
 
 
 def _notebook_source() -> tuple[dict[str, object], str]:
@@ -64,6 +65,14 @@ def test_notebook_contains_integrity_extraction_and_training_gates() -> None:
         "trainer.global_step + trainer.amp_skip_count == attempted_updates",
         "amp_skips_by_epoch[-1] == 0",
         "amp_epoch_skip_history_complete = True",
+        "validation_metrics=validation_metrics",
+        "DetectionMAP(",
+        "SegmentationMetrics(",
+        "DepthMetrics(",
+        "detection/map50_95",
+        "segmentation/miou",
+        "depth/abs_rel",
+        "evaluate_sanpo_smoke_val.py",
         'smoke_status = "smoke_pass_amp_recovered"',
         "artifact_manifest.json",
         "artifact_manifest_sha256",
@@ -96,3 +105,40 @@ def test_amp_recovery_never_retrains_and_requires_final_epoch_stability() -> Non
     assert "EXPECTED_TRAINING_SOURCE_COMMIT" in source
     assert "torch.equal(live_tensor, saved_tensor)" in source
     assert "artifact_manifest.json SHA-256 mismatch" in source
+
+
+def test_val_evaluator_is_val_only_inference_and_persists_full_metrics() -> None:
+    source = VAL_EVALUATOR_PATH.read_text(encoding="utf-8")
+    compile(source, str(VAL_EVALUATOR_PATH), "exec")
+    for forbidden in (
+        ".fit(",
+        ".train_epoch(",
+        ".backward(",
+        ".optimizer.step(",
+        ".scheduler.step(",
+        "official_test_loader",
+        "official_test_dataset",
+    ):
+        assert forbidden not in source
+    for required in (
+        '"val_loader"',
+        '"best.pt"',
+        "DetectionMAP(",
+        "SegmentationMetrics(",
+        "DepthMetrics(",
+        "ignore_boxes",
+        "val_metrics_best.json",
+        "val_detection_per_class.csv",
+        "val_segmentation_per_class.csv",
+        "val_segmentation_confusion_matrix.csv",
+        "artifact_manifest.json",
+        'with_name(drive_evaluation_dir.name + ".uploading")',
+        "allow_nan=False",
+        "expected_segmentation_pixels",
+        "expected_depth_pixels",
+        "metrics_source_sha256",
+        "live_state_unchanged",
+    ):
+        assert required in source
+    _, notebook_source = _notebook_source()
+    assert "del evaluator_namespace" in notebook_source
