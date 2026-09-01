@@ -126,6 +126,8 @@ cells = [
         SEED = 42  #@param {type:"integer"}
         DEPTH_MIN_METRES = 0.1
         DEPTH_MAX_METRES = 80.0
+        AMP_INITIAL_SCALE = 4096.0
+        MAX_RECOVERABLE_AMP_SKIP_RATE = 0.05
 
         assert 2 <= SMOKE_EPOCHS <= 5, "Smoke phải nằm trong 2–5 epoch"
         assert IMAGE_HEIGHT % 32 == 0 and IMAGE_WIDTH % 32 == 0
@@ -611,10 +613,19 @@ cells = [
         class NotebookTrainer(Trainer):
             def train_epoch(self, loader, *, epoch):
                 started = time.perf_counter()
+                skips_before = self.amp_skip_count
                 result = super().train_epoch(
                     tqdm(loader, desc=f"train {epoch + 1}/{self.config.epochs}", leave=True), epoch=epoch
                 )
-                print(f"[train] epoch {epoch + 1}/{self.config.epochs} | total={result['total']:.6f} | {time.perf_counter()-started:.1f}s")
+                if not hasattr(self, "amp_skips_by_epoch"):
+                    self.amp_skips_by_epoch = []
+                epoch_skips = self.amp_skip_count - skips_before
+                self.amp_skips_by_epoch.append(epoch_skips)
+                print(
+                    f"[train] epoch {epoch + 1}/{self.config.epochs} | total={result['total']:.6f} "
+                    f"| AMP skips={epoch_skips} | scale={self.scaler.get_scale():.0f} "
+                    f"| {time.perf_counter()-started:.1f}s"
+                )
                 return result
 
             def validate(self, loader, *, epoch=None):
@@ -629,6 +640,12 @@ cells = [
             model, criterion, optimizer, trainer_config,
             device="cuda", scheduler=scheduler, logger=logger,
             checkpoint_manager=checkpoint_manager, validation_metrics=None,
+        )
+        # Default 65536 overflows during the first few multi-task updates on
+        # this pilot. 4096 is the empirically recovered scale from the first
+        # smoke run; it avoids sacrificing those warm-up optimizer steps.
+        trainer.scaler = torch.amp.GradScaler(
+            "cuda", enabled=trainer.amp_enabled, init_scale=AMP_INITIAL_SCALE
         )
         print("Train/val/test:", len(train_dataset), len(val_dataset), len(official_test_dataset))
         print("Backbone:", BACKBONE_NAME, "| pretrained:", model_config.pretrained)
@@ -680,7 +697,35 @@ cells = [
                 assert compact[split] and all(np.isfinite(list(compact[split].values())))
             scalar_history.append(compact)
         assert trainer.global_step > 0
-        assert trainer.amp_skip_count == 0, f"AMP skips: {trainer.amp_skip_count}"
+        attempted_updates = SMOKE_EPOCHS * math.ceil(
+            len(train_loader) / trainer_config.grad_accum_steps
+        )
+        assert trainer.global_step + trainer.amp_skip_count == attempted_updates
+        amp_skip_rate = trainer.amp_skip_count / attempted_updates
+        amp_skips_by_epoch = list(getattr(trainer, "amp_skips_by_epoch", ()))
+        assert len(amp_skips_by_epoch) == SMOKE_EPOCHS
+        final_amp_scale = float(trainer.scaler.get_scale())
+        amp_gate_passed = (
+            amp_skip_rate <= MAX_RECOVERABLE_AMP_SKIP_RATE
+            and amp_skips_by_epoch[-1] == 0
+            and np.isfinite(final_amp_scale)
+            and final_amp_scale >= 1.0
+        )
+        assert amp_gate_passed, (
+            f"AMP chưa ổn định: skips={trainer.amp_skip_count}/{attempted_updates}, "
+            f"by_epoch={amp_skips_by_epoch}, final_scale={final_amp_scale}"
+        )
+        amp_epoch_skip_history_complete = True
+        if trainer.amp_skip_count:
+            smoke_status = "smoke_pass_amp_recovered"
+            print(
+                "AMP GradScaler đã tự phục hồi sau overflow ban đầu: "
+                f"{trainer.amp_skip_count}/{attempted_updates} skips "
+                f"({amp_skip_rate:.2%}), by_epoch={amp_skips_by_epoch}, "
+                f"final_scale={final_amp_scale:.0f}."
+            )
+        else:
+            smoke_status = "smoke_pass"
         for name in ("last.pt", "best.pt"):
             path = checkpoint_manager.directory / name
             assert path.is_file() and path.with_name(path.name + ".sha256").is_file(), path
@@ -690,13 +735,13 @@ cells = [
         trainer.model.eval()
         test_inputs, _ = next(iter(official_test_loader))
         with torch.inference_mode(), trainer._autocast():
-            test_outputs = trainer.model(test_inputs.to("cuda", non_blocking=True))
+            test_outputs = trainer.model(test_inputs.to(trainer.device, non_blocking=True))
         assert test_outputs.segmentation.shape[-2:] == (IMAGE_HEIGHT, IMAGE_WIDTH)
         assert test_outputs.depth.shape[-2:] == (IMAGE_HEIGHT, IMAGE_WIDTH)
         del test_inputs, test_outputs
 
         peak_vram_gib = torch.cuda.max_memory_allocated() / 1024**3
-        print(f"SMOKE PASS | {SMOKE_EPOCHS} epoch | {elapsed_seconds/60:.2f} min | peak VRAM {peak_vram_gib:.2f} GiB")
+        print(f"SMOKE PASS ({smoke_status}) | {SMOKE_EPOCHS} epoch | {elapsed_seconds/60:.2f} min | peak VRAM {peak_vram_gib:.2f} GiB")
         print("Official-test: forward-only QA; KHÔNG dùng chọn model.")
         """
     ),
@@ -728,6 +773,12 @@ cells = [
             "batch_size": BATCH_SIZE,
             "num_workers": NUM_WORKERS,
             "depth_range_metres": [DEPTH_MIN_METRES, DEPTH_MAX_METRES],
+            "amp_initial_scale": AMP_INITIAL_SCALE,
+            "amp_recovery_gate": {
+                "max_skip_rate": MAX_RECOVERABLE_AMP_SKIP_RATE,
+                "requires_zero_skips_in_final_epoch": True,
+                "requires_finite_final_scale_at_least": 1.0,
+            },
             "pretrained_random_init_fallback": pretrained_fallback,
             "split_protocol": {
                 "train_session": train_dataset.info.session_id,
@@ -756,10 +807,14 @@ cells = [
             json.dumps(
                 {
                     "schema_version": 1,
-                    "status": "smoke_pass",
+                    "status": smoke_status,
                     "epochs": SMOKE_EPOCHS,
                     "global_step": trainer.global_step,
                     "amp_skip_count": trainer.amp_skip_count,
+                    "amp_skip_rate": amp_skip_rate,
+                    "amp_skips_by_epoch": amp_skips_by_epoch,
+                    "amp_epoch_skip_history_complete": amp_epoch_skip_history_complete,
+                    "final_amp_scale": final_amp_scale,
                     "elapsed_seconds": elapsed_seconds,
                     "peak_vram_gib": peak_vram_gib,
                     "best_metrics": trainer.best_metrics,
@@ -769,8 +824,11 @@ cells = [
         )
         (LOCAL_RUN_DIR / "source_commit.txt").write_text(SOURCE_COMMIT + "\n", encoding="utf-8")
 
+        artifact_manifest_path = LOCAL_RUN_DIR / "artifact_manifest.json"
         artifact_records = []
         for path in sorted(item for item in LOCAL_RUN_DIR.rglob("*") if item.is_file()):
+            if path == artifact_manifest_path:
+                continue
             artifact_records.append({
                 "path": path.relative_to(LOCAL_RUN_DIR).as_posix(),
                 "bytes": path.stat().st_size,
@@ -782,20 +840,30 @@ cells = [
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "artifacts": artifact_records,
         }
-        (LOCAL_RUN_DIR / "artifact_manifest.json").write_text(
+        artifact_manifest_path.write_text(
             json.dumps(artifact_manifest, indent=2, sort_keys=True), encoding="utf-8"
         )
+        artifact_manifest_bytes = artifact_manifest_path.stat().st_size
+        artifact_manifest_sha256 = sha256_file(artifact_manifest_path)
 
         DRIVE_RUNS_ROOT.mkdir(parents=True, exist_ok=True)
         assert not DRIVE_RUN_DIR.exists(), f"Không ghi đè run: {DRIVE_RUN_DIR}"
         uploading = DRIVE_RUN_DIR.with_name(DRIVE_RUN_DIR.name + ".uploading")
         assert not uploading.exists(), f"Có upload dở: {uploading}"
-        shutil.copytree(LOCAL_RUN_DIR, uploading)
-        for record in artifact_records:
-            copied = uploading / record["path"]
-            assert copied.stat().st_size == record["bytes"]
-            assert sha256_file(copied) == record["sha256"]
-        os.replace(uploading, DRIVE_RUN_DIR)
+        try:
+            shutil.copytree(LOCAL_RUN_DIR, uploading)
+            for record in artifact_records:
+                copied = uploading / record["path"]
+                assert copied.stat().st_size == record["bytes"]
+                assert sha256_file(copied) == record["sha256"]
+            copied_manifest = uploading / artifact_manifest_path.name
+            assert copied_manifest.stat().st_size == artifact_manifest_bytes
+            assert sha256_file(copied_manifest) == artifact_manifest_sha256
+            os.replace(uploading, DRIVE_RUN_DIR)
+        except Exception:
+            if uploading.exists():
+                shutil.rmtree(uploading, ignore_errors=True)
+            raise
 
         print("HOÀN TẤT")
         print("Local run:", LOCAL_RUN_DIR)

@@ -234,6 +234,21 @@ class Trainer:
             self.amp_skip_count += 1
         return stepped, grad_norm
 
+    def _log_amp_overflow_skip(self, *, epoch: int, batch_index: int) -> None:
+        if self.logger is None:
+            return
+        self.logger.log(
+            "amp_overflow_skip",
+            {
+                "amp_skip_count": float(self.amp_skip_count),
+                "amp_scale": float(self.scaler.get_scale()),
+            },
+            epoch=epoch,
+            global_step=self.global_step,
+            split="train",
+            extra={"batch_index": batch_index},
+        )
+
     def train_epoch(self, loader: Any, *, epoch: int) -> dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -263,6 +278,8 @@ class Trainer:
             if boundary:
                 stepped, grad_norm = self._optimizer_step(microbatches)
                 microbatches = 0
+                if not stepped:
+                    self._log_amp_overflow_skip(epoch=epoch, batch_index=batch_index)
                 if stepped and self.logger is not None and self.global_step % self.config.log_every_n_steps == 0:
                     metrics = {f"loss/{name}": value / batches for name, value in sums.items()}
                     metrics.update(
@@ -271,6 +288,8 @@ class Trainer:
                     if grad_norm is not None and math.isfinite(grad_norm):
                         metrics["grad_norm"] = grad_norm
                     metrics["amp_skip_count"] = float(self.amp_skip_count)
+                    if self.amp_enabled:
+                        metrics["amp_scale"] = float(self.scaler.get_scale())
                     self.logger.log(
                         "train_step",
                         metrics,
@@ -279,7 +298,9 @@ class Trainer:
                         split="train",
                     )
         if microbatches:
-            self._optimizer_step(microbatches)
+            stepped, _ = self._optimizer_step(microbatches)
+            if not stepped:
+                self._log_amp_overflow_skip(epoch=epoch, batch_index=batch_index)
         if batches == 0:
             raise ValueError("training loader is empty")
         return {name: value / batches for name, value in sums.items()}
@@ -350,9 +371,12 @@ class Trainer:
         self.best_metrics = dict(state.best_metrics)
         self.amp_skip_count = int(state.extra.get("amp_skip_count", 0))
         if self.logger is not None:
+            resume_metrics = {"amp_skip_count": self.amp_skip_count}
+            if self.amp_enabled:
+                resume_metrics["amp_scale"] = float(self.scaler.get_scale())
             self.logger.log(
                 "resume",
-                {"amp_skip_count": self.amp_skip_count},
+                resume_metrics,
                 epoch=self.start_epoch,
                 global_step=self.global_step,
                 extra={"checkpoint": str(state.checkpoint_path)},
@@ -404,7 +428,10 @@ class Trainer:
                     "scaler": self.scaler,
                     "criterion": self.criterion,
                     "best_metrics": self.best_metrics,
-                    "extra": {"amp_skip_count": self.amp_skip_count},
+                    "extra": {
+                        "amp_skip_count": self.amp_skip_count,
+                        "amp_scale": float(self.scaler.get_scale()),
+                    },
                 }
                 if improved:
                     self.checkpoint_manager.save_named("best.pt", **checkpoint_kwargs)

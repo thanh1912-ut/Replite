@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -12,6 +13,7 @@ from replite.multitask.config import RepLiteConfig, TaskConfig
 from replite.multitask.model import RepLiteMultiTaskModel
 from replite.training.checkpoint import CheckpointManager
 from replite.training.losses import MultiTaskCriterion
+from replite.training.logging import TrainingLogger
 from replite.training.trainer import Trainer, TrainerConfig, move_to_device
 
 
@@ -167,6 +169,36 @@ def test_non_finite_loss_stops_before_optimizer_step() -> None:
     with pytest.raises(FloatingPointError, match="non-finite"):
         trainer.train_epoch([_batch(float("nan"), 1)], epoch=0)
     assert trainer.global_step == 0
+
+
+def test_skipped_optimizer_update_is_logged_with_scale(tmp_path) -> None:
+    model = ScalarModel()
+    logger = TrainingLogger(tmp_path, run_id="amp-skip")
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        TrainerConfig(epochs=1, amp=False, grad_accum_steps=2),
+        device="cpu",
+        logger=logger,
+    )
+
+    def force_skip(microbatches):
+        assert microbatches == 1
+        trainer.amp_skip_count += 1
+        trainer.optimizer.zero_grad(set_to_none=True)
+        return False, None
+
+    trainer._optimizer_step = force_skip
+    # An iterator has no len(), so its partial accumulation is flushed after
+    # the loop. The skip must still be observable in the durable event log.
+    trainer.train_epoch(iter([_batch(1, 1)]), epoch=0)
+    logger.close()
+
+    events = [json.loads(line) for line in logger.jsonl_path.read_text().splitlines()]
+    assert [event["event"] for event in events] == ["amp_overflow_skip"]
+    assert events[0]["metrics"] == {"amp_scale": 1.0, "amp_skip_count": 1.0}
+    assert events[0]["extra"] == {"batch_index": 0}
 
 
 def test_move_to_device_preserves_nested_non_tensor_values() -> None:

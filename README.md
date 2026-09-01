@@ -296,6 +296,31 @@ mask, and scales both positive and ignored half-open boxes with the dense
 targets. It reads sparse sample IDs from the manifest rather than scanning a
 numeric frame range.
 
+### SANPO smoke AMP gate
+
+The notebook starts FP16 gradient scaling at 4096. The first pilot run showed
+that PyTorch's default 65536 scale was four reductions above the stable range:
+four early optimizer updates were skipped while `GradScaler` backed off to
+4096, although all forward losses remained finite and train/validation loss
+decreased. The smoke audit now logs every overflow and the scale that follows
+it. A run with skips is accepted only as `smoke_pass_amp_recovered` when skips
+are at most 5% of attempted updates, the final epoch has zero new skips, and
+the final scale is finite and at least one. Any late or persistent overflow is
+a failure, not a warning to suppress.
+
+If the original three-epoch Colab pilot already stopped only at its obsolete
+zero-skip assertion, keep that runtime alive and run:
+
+```python
+!git -C /content/Replite pull --ff-only
+%run -i /content/Replite/tools/recover_sanpo_smoke_amp.py
+```
+
+Do not rerun setup Cell 1 or training Cell 7 first. The recovery verifies the
+live weights against `last.pt`, compares cumulative skips in `last.prev.pt`,
+performs only the held-out forward-pass QA, and checks every copied artifact
+before publishing to Drive.
+
 ## Standalone backbones
 
 Lightweight native-trunk feature backbones for dense prediction:
