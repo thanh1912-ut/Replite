@@ -45,7 +45,10 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         "BATCH_SIZE = 4",
         "VAL_FRACTION = 0.15",
         'DRIVE_BASE_ROOT = Path("/content/drive/MyDrive/nckh1m_data")',
-        'RUN_ID = "replite_sanpo_mnv4convs_seed42_v4"',
+        'RUN_ID = "replite_sanpo_mnv4convs_seed42_v5"',
+        'LOCAL_STAGE_CACHE_ID = "replite_sanpo_mnv4convs_seed42_v4"',
+        '"cache_id": LOCAL_STAGE_CACHE_ID',
+        "PROGRESS_EVERY_N_STEPS = 10",
         'print("SANPO DATA ROOT:", DRIVE_DATA_ROOT)',
         "LOCAL_STAGE_EXPANSION_FACTOR = 1.03",
         'SOURCE_PIN = DRIVE_RUNS_ROOT / RUN_ID / "source_pin.json"',
@@ -82,7 +85,11 @@ def test_main_notebook_keeps_command_logs_isolated_and_visible() -> None:
     assert 'CONSOLE_LOG.open("a"' not in source
     assert 'fcntl.LOCK_EX | fcntl.LOCK_NB' in source
     assert 'f"[run_live] START action={action}' in source
-    assert 'f"[run_live] HEARTBEAT action={action}' in source
+    assert 'f"[run_live] WAIT action={action}' in source
+    assert "silent={silent}s (process still running)" in source
+    assert "now - last_child_output >= 30.0" in source
+    assert source.count("last_child_output = time.monotonic()") >= 2
+    assert "[run_live] HEARTBEAT" not in source
     assert 'f"[run_live] END action={action}' in source
     assert 'f"[run_live] INTERRUPT action={action}' in source
     assert "start_new_session=True" in source

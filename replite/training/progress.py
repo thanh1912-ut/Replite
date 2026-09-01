@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from numbers import Integral, Real
 from typing import Any, TextIO
@@ -19,14 +20,18 @@ from typing import Any, TextIO
 TRAIN_PROGRESS_COLUMNS = (
     "Epoch",
     "GPU_mem",
+    "Batch",
+    "Progress",
+    "Speed",
+    "ETA",
     "total",
-    "detection_box",
-    "detection_classification",
-    "detection_quality",
-    "detection_dfl",
-    "segmentation",
+    "box",
+    "cls",
+    "qual",
+    "dfl",
+    "seg",
     "depth",
-    "Instances",
+    "Inst",
     "Size",
     "lr",
 )
@@ -43,6 +48,8 @@ VALIDATION_COLUMNS = (
     "RMSE(m)",
     "delta1",
 )
+
+VALIDATION_PROGRESS_COLUMNS = ("Val", "Batch", "Progress", "Speed", "ETA")
 
 EPOCH_ROW_FIELDS = (
     "schema_version",
@@ -145,6 +152,15 @@ def _format_cell(value: Any, *, digits: int = 4) -> str:
     if isinstance(value, Integral) and not isinstance(value, bool):
         return str(int(value))
     return f"{float(value):.{digits}f}"
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    rounded = int(round(seconds))
+    hours, remainder = divmod(rounded, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
 def format_validation_table(result: Mapping[str, Any]) -> str:
@@ -320,6 +336,7 @@ class YoloProgressReporter:
         reg_max: int = 0,
         stream: TextIO | None = None,
         use_tqdm: bool | None = None,
+        clock: Any = time.monotonic,
     ) -> None:
         if (
             isinstance(every_n_steps, bool)
@@ -335,8 +352,12 @@ class YoloProgressReporter:
         self.reg_max = int(reg_max)
         self.stream = sys.stdout if stream is None else stream
         self.use_tqdm = use_tqdm
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self.clock = clock
         self._bar: Any = None
         self._bar_completed = 0
+        self._phase_started = 0.0
 
     def _print(self, line: str) -> None:
         self.stream.write(line + "\n")
@@ -388,19 +409,65 @@ class YoloProgressReporter:
         if isinstance(raw_lr, Sequence) and not isinstance(raw_lr, (str, bytes)):
             raw_lr = raw_lr[0] if raw_lr else None
         checked_lr = _as_optional_number(raw_lr, name="lr") if raw_lr is not None else None
+        completed = int(payload.get("batches_completed", 0))
+        total_batches_raw = payload.get("total_batches")
+        total_batches = (
+            int(total_batches_raw) if total_batches_raw is not None else None
+        )
+        elapsed = max(0.0, float(self.clock()) - self._phase_started)
+        speed = completed / elapsed if completed > 0 and elapsed > 0 else 0.0
+        fraction = (
+            completed / total_batches
+            if total_batches is not None and total_batches > 0
+            else 0.0
+        )
+        eta = (
+            (total_batches - completed) / speed
+            if total_batches is not None and speed > 0
+            else None
+        )
         return {
             "Epoch": epoch_text,
             "GPU_mem": self._gpu_memory(payload.get("gpu_memory_bytes")),
+            "Batch": (
+                f"{completed}/{total_batches}"
+                if total_batches is not None
+                else str(completed)
+            ),
+            "Progress": f"{fraction * 100:5.1f}%",
+            "Speed": f"{speed:.2f}it/s" if speed > 0 else "--",
+            "ETA": _format_duration(eta),
             "total": loss("total"),
-            "detection_box": loss("detection_box"),
-            "detection_classification": loss("detection_classification"),
-            "detection_quality": loss("detection_quality"),
-            "detection_dfl": loss("detection_dfl"),
-            "segmentation": loss("segmentation"),
+            "box": loss("detection_box"),
+            "cls": loss("detection_classification"),
+            "qual": loss("detection_quality"),
+            "dfl": loss("detection_dfl"),
+            "seg": loss("segmentation"),
             "depth": loss("depth"),
-            "Instances": _format_cell(payload.get("instances")),
+            "Inst": _format_cell(payload.get("instances")),
             "Size": size,
             "lr": _format_cell(checked_lr, digits=6),
+        }
+
+    @staticmethod
+    def _validation_progress_values(payload: Mapping[str, Any], elapsed: float) -> dict[str, str]:
+        epoch = payload.get("epoch")
+        total_epochs = payload.get("total_epochs")
+        val = "-" if epoch is None else str(int(epoch) + 1)
+        if epoch is not None and total_epochs is not None:
+            val = f"{int(epoch) + 1}/{int(total_epochs)}"
+        completed = int(payload.get("batches_completed", 0))
+        raw_total = payload.get("total_batches")
+        total = int(raw_total) if raw_total is not None else None
+        speed = completed / elapsed if completed > 0 and elapsed > 0 else 0.0
+        fraction = completed / total if total is not None and total > 0 else 0.0
+        eta = (total - completed) / speed if total is not None and speed > 0 else None
+        return {
+            "Val": val,
+            "Batch": f"{completed}/{total}" if total is not None else str(completed),
+            "Progress": f"{fraction * 100:5.1f}%",
+            "Speed": f"{speed:.2f}it/s" if speed > 0 else "--",
+            "ETA": _format_duration(eta),
         }
 
     def _close_bar(self) -> None:
@@ -416,11 +483,8 @@ class YoloProgressReporter:
             raise TypeError("progress callback expects (str, mapping)")
         if event == "train_epoch_start":
             self._close_bar()
+            self._phase_started = float(self.clock())
             self._print("\t".join(TRAIN_PROGRESS_COLUMNS))
-            if self.reg_max == 0:
-                self._print(
-                    "detection_dfl=0 (reg_max=0: direct box regression, DFL disabled)"
-                )
             if self._wants_tqdm():
                 try:
                     from tqdm.auto import tqdm
@@ -441,7 +505,11 @@ class YoloProgressReporter:
             completed = int(payload.get("batches_completed", 0))
             total_batches = payload.get("total_batches")
             last = total_batches is not None and completed >= int(total_batches)
-            should_render = completed % self.every_n_steps == 0 or last
+            should_render = (
+                completed == 1
+                or completed % self.every_n_steps == 0
+                or last
+            )
             if self._bar is not None:
                 delta = max(0, completed - self._bar_completed)
                 if delta:
@@ -461,6 +529,26 @@ class YoloProgressReporter:
             self._close_bar()
             return
 
+        if event == "validation_start":
+            self._close_bar()
+            self._phase_started = float(self.clock())
+            self._print("\t".join(VALIDATION_PROGRESS_COLUMNS))
+            return
+
+        if event == "validation_batch_end":
+            completed = int(payload.get("batches_completed", 0))
+            total_batches = payload.get("total_batches")
+            last = total_batches is not None and completed >= int(total_batches)
+            if completed == 1 or completed % self.every_n_steps == 0 or last:
+                values = self._validation_progress_values(
+                    payload,
+                    max(0.0, float(self.clock()) - self._phase_started),
+                )
+                self._print(
+                    "\t".join(values[name] for name in VALIDATION_PROGRESS_COLUMNS)
+                )
+            return
+
         if event == "validation_end":
             result = payload.get("result", {})
             if not isinstance(result, Mapping):
@@ -472,6 +560,7 @@ __all__ = [
     "EPOCH_ROW_FIELDS",
     "TRAIN_PROGRESS_COLUMNS",
     "VALIDATION_COLUMNS",
+    "VALIDATION_PROGRESS_COLUMNS",
     "YoloProgressReporter",
     "detection_per_class_rows",
     "flatten_epoch_record",

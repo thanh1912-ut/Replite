@@ -62,6 +62,12 @@ cells = [
         Audit sẽ chọn đúng 234 source shard: ưu tiên ba package mới, còn 231 archive cũ
         sinh box trực tiếp từ panoptic theo cùng policy khóa ở ngưỡng 100 pixel; không
         tải lại hay repack dữ liệu cũ.
+
+        Log staging hiển thị shard/GiB/phase/speed/ETA/free SSD. Trước train, bảng
+        `TRAINING PLAN (EXACT)` cho biết chính xác train batches/epoch, optimizer
+        updates và validation batches. Trong train/val, dòng kiểu YOLO hiển thị
+        batch hiện tại/tổng batch, %, it/s và ETA; wrapper chỉ in `WAIT` sau 30 giây
+        tiến trình con hoàn toàn không xuất log.
         """
     ),
     code(
@@ -150,7 +156,10 @@ cells = [
         LOCAL_WORK_ROOT = Path("/content/replite_sanpo_main")
         DRIVE_RUNS_ROOT = DRIVE_DATA_ROOT / "main_runs"
 
-        RUN_ID = "replite_sanpo_mnv4convs_seed42_v4"  #@param {type:"string"}
+        RUN_ID = "replite_sanpo_mnv4convs_seed42_v5"  #@param {type:"string"}
+        # Reuse the checksum-verified SSD shards already staged by v4. The
+        # campaign/source pin is new, but the data cache identity stays fixed.
+        LOCAL_STAGE_CACHE_ID = "replite_sanpo_mnv4convs_seed42_v4"
         BACKBONE_NAME = "mobilenetv4_conv_small"  #@param ["mobilenetv4_conv_small", "mobilenetv3_small_050"]
         PRETRAINED_IN1K = True  #@param {type:"boolean"}
         EPOCHS = 50  #@param {type:"integer"}
@@ -171,13 +180,19 @@ cells = [
         GRAD_ACCUM_STEPS = 1  #@param {type:"integer"}
         GRAD_CLIP_NORM = 1.0  #@param {type:"number"}
         AMP_INITIAL_SCALE = 4096.0
-        PROGRESS_EVERY_N_STEPS = 20
+        PROGRESS_EVERY_N_STEPS = 10
         MAX_PEAK_VRAM_GIB = 22.0
         LOCAL_STAGE_EXPANSION_FACTOR = 1.03
         LOCAL_STAGE_RESERVE_GIB = 4.0
 
         assert DRIVE_DATA_ROOT.is_dir(), DRIVE_DATA_ROOT
         assert RUN_ID and "/" not in RUN_ID and RUN_ID not in {".", ".."}
+        assert (
+            LOCAL_STAGE_CACHE_ID
+            and "/" not in LOCAL_STAGE_CACHE_ID
+            and "\\" not in LOCAL_STAGE_CACHE_ID
+            and LOCAL_STAGE_CACHE_ID not in {".", ".."}
+        )
 
         # A campaign must resume with exactly the commit that created it even
         # if `main` advances while Colab is disconnected. The small Drive pin
@@ -267,6 +282,7 @@ cells = [
                 "depth_min_metres": 0.1,
                 "depth_max_metres": 80.0,
                 "local_staging": {
+                    "cache_id": LOCAL_STAGE_CACHE_ID,
                     "expansion_factor": LOCAL_STAGE_EXPANSION_FACTOR,
                     "reserve_gib": LOCAL_STAGE_RESERVE_GIB,
                 },
@@ -370,7 +386,7 @@ cells = [
 
                     reader = threading.Thread(target=read_output, daemon=True)
                     reader.start()
-                    last_heartbeat = time.monotonic()
+                    last_child_output = time.monotonic()
                     try:
                         while True:
                             try:
@@ -381,6 +397,7 @@ cells = [
                                 break
                             if line:
                                 emit(line)
+                                last_child_output = time.monotonic()
                             if process.poll() is not None and not reader.is_alive():
                                 while not lines.empty():
                                     line = lines.get_nowait()
@@ -389,15 +406,17 @@ cells = [
                                     emit(line)
                                 break
                             now = time.monotonic()
-                            if now - last_heartbeat >= 15.0:
+                            if now - last_child_output >= 30.0:
                                 elapsed = int(
                                     (datetime.now(timezone.utc) - started_at).total_seconds()
                                 )
+                                silent = int(now - last_child_output)
                                 emit(
-                                    f"[run_live] HEARTBEAT action={action} "
-                                    f"pid={process.pid} elapsed={elapsed}s\n"
+                                    f"[run_live] WAIT action={action} "
+                                    f"pid={process.pid} elapsed={elapsed}s "
+                                    f"silent={silent}s (process still running)\n"
                                 )
-                                last_heartbeat = now
+                                last_child_output = now
                     except BaseException:
                         emit(
                             f"[run_live] INTERRUPT action={action} pid={process.pid}\n"

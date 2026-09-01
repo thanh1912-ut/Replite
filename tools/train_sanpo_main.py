@@ -314,6 +314,15 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         raise ValueError("data.local_staging must be a mapping")
     expansion_factor = staging.get("expansion_factor", 1.05)
     reserve_gib = staging.get("reserve_gib", 4.0)
+    stage_cache_id = staging.get("cache_id", config["run_id"])
+    if (
+        not isinstance(stage_cache_id, str)
+        or not stage_cache_id
+        or stage_cache_id in {".", ".."}
+        or "/" in stage_cache_id
+        or "\\" in stage_cache_id
+    ):
+        raise ValueError("data.local_staging.cache_id must be one path component")
     if (
         isinstance(expansion_factor, bool)
         or not isinstance(expansion_factor, (int, float))
@@ -332,7 +341,7 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         catalog.train_records,
         local_root=local_root
         / "stages"
-        / config["run_id"]
+        / stage_cache_id
         / "official_train",
         purpose="official_train",
         expansion_factor=float(expansion_factor),
@@ -604,6 +613,37 @@ def _table(
         )
 
 
+def _print_execution_plan(
+    prepared: Prepared,
+    objects: TrainObjects,
+    *,
+    start_epoch: int,
+) -> None:
+    accumulate = objects.config.grad_accum_steps
+    train_batches = len(prepared.train_loader)
+    val_batches = len(prepared.val_loader)
+    updates = math.ceil(train_batches / accumulate)
+    print("\n========== TRAIN / VALIDATION PLAN ==========")
+    print(
+        f"epochs {start_epoch + 1}->{objects.config.epochs} | "
+        f"micro_batch={prepared.config['data']['batch_size']} | "
+        f"accumulate={accumulate} | "
+        f"effective_batch={int(prepared.config['data']['batch_size']) * accumulate}"
+    )
+    print(
+        f"train={prepared.train_loader.sample_count:,} samples, "
+        f"{train_batches:,} batches/epoch | "
+        f"optimizer={updates:,} updates/epoch | "
+        f"validation={prepared.val_loader.sample_count:,} samples, "
+        f"{val_batches:,} batches/epoch"
+    )
+    print(
+        f"campaign optimizer updates={objects.total_steps:,} | "
+        f"warmup={objects.warmup_steps:,} | "
+        f"progress every={prepared.config['train']['progress_every_n_steps']} batches"
+    )
+
+
 def inspection_payload(
     prepared: Prepared,
     model: nn.Module,
@@ -632,6 +672,9 @@ def inspection_payload(
             "val_samples": prepared.val_loader.sample_count,
             "official_test_samples_reserved": EXPECTED["test_frames"],
             "official_test_used": False,
+            "local_stage_cache_id": prepared.config["data"]
+            .get("local_staging", {})
+            .get("cache_id", prepared.config["run_id"]),
             "image_size": prepared.config["data"]["image_size"],
             "clip_frames": ["t-2", "t-1", "t"],
             "detection_classes": list(SANPO_DETECTION_CLASS_NAMES),
@@ -667,10 +710,25 @@ def inspection_payload(
         ],
         "schedule": {
             "epochs": prepared.config["train"]["epochs"],
+            "micro_batch_size": prepared.config["data"]["batch_size"],
+            "grad_accum_steps": prepared.config["train"]["grad_accum_steps"],
+            "effective_batch_size": (
+                int(prepared.config["data"]["batch_size"])
+                * int(prepared.config["train"]["grad_accum_steps"])
+            ),
             "batches_per_epoch": len(prepared.train_loader),
             "val_batches": len(prepared.val_loader),
+            "optimizer_updates_per_epoch": math.ceil(
+                len(prepared.train_loader)
+                / int(prepared.config["train"]["grad_accum_steps"])
+            ),
             "total_steps": total_steps,
             "warmup_steps": warmup_steps,
+            "num_workers": prepared.config["data"]["num_workers"],
+            "prefetch_factor": prepared.config["data"]["prefetch_factor"],
+            "progress_every_n_batches": prepared.config["train"][
+                "progress_every_n_steps"
+            ],
         },
         "runtime": {
             "python": sys.version.split()[0],
@@ -795,6 +853,35 @@ def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
                 f"{group['weight_decay']:.3g}",
             )
             for group in result["optimizer_groups"]
+        ),
+    )
+    schedule = result["schedule"]
+    _table(
+        "TRAINING PLAN (EXACT)",
+        ("item", "value"),
+        (
+            ("train samples", f"{result['data']['train_samples']:,}"),
+            ("validation samples", f"{result['data']['val_samples']:,}"),
+            ("micro batch / GPU", schedule["micro_batch_size"]),
+            ("gradient accumulation", schedule["grad_accum_steps"]),
+            ("effective batch", schedule["effective_batch_size"]),
+            ("train batches / epoch", f"{schedule['batches_per_epoch']:,}"),
+            (
+                "optimizer updates / epoch",
+                f"{schedule['optimizer_updates_per_epoch']:,}",
+            ),
+            ("validation batches / epoch", f"{schedule['val_batches']:,}"),
+            ("epochs", schedule["epochs"]),
+            ("total optimizer updates", f"{schedule['total_steps']:,}"),
+            ("warmup updates", f"{schedule['warmup_steps']:,}"),
+            (
+                "workers / prefetch",
+                f"{schedule['num_workers']} / {schedule['prefetch_factor']}",
+            ),
+            (
+                "progress row every batches",
+                schedule["progress_every_n_batches"],
+            ),
         ),
     )
     print("\nMODEL CONFIG")
@@ -1279,18 +1366,165 @@ def _load_cached_inspection(prepared: Prepared) -> dict[str, Any] | None:
     return value
 
 
-def _stage_progress(
-    index: int,
-    total: int,
-    record: Any,
-    status: str,
-) -> None:
-    print(
-        f"[stage] {index:03d}/{total:03d} | {status:7s} | "
-        f"{record.split}/{record.session_id}/{record.sensor} | "
-        f"archive={record.archive_bytes / 1024**3:.2f} GiB",
-        flush=True,
-    )
+def _duration(seconds: float | None) -> str:
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    rounded = int(round(seconds))
+    hours, remainder = divmod(rounded, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def _progress_bar(fraction: float, width: int = 18) -> str:
+    checked = min(1.0, max(0.0, fraction))
+    filled = min(width, int(checked * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+class StageProgressReporter:
+    """Newline-safe YOLO-style stage progress for Colab cells and ``tail -F``."""
+
+    def __init__(
+        self,
+        local_root: Path,
+        *,
+        interval_seconds: float = 3.0,
+        clock: Any = time.monotonic,
+    ) -> None:
+        if interval_seconds < 0:
+            raise ValueError("interval_seconds must be non-negative")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self.local_root = local_root
+        self.interval_seconds = interval_seconds
+        self.clock = clock
+        self.wall_started = 0.0
+        self.eta_started = 0.0
+        self.last_rendered = 0.0
+        self.phase_started = 0.0
+        self.phase = ""
+        self.phase_initial_bytes = 0
+        self.new_ready_start = 0
+        self.disabled = False
+
+    def _print(self, line: str) -> None:
+        if self.disabled:
+            return
+        try:
+            print(line, flush=True)
+        except BrokenPipeError:
+            self.disabled = True
+
+    def _render(self, payload: Mapping[str, Any], *, force: bool = False) -> None:
+        if self.disabled:
+            return
+        now = float(self.clock())
+        if not force and now - self.last_rendered < self.interval_seconds:
+            return
+        self.last_rendered = now
+        total_records = int(payload["total_records"])
+        ready_records = int(payload["ready_records"])
+        total_bytes = int(payload["total_bytes"])
+        ready_bytes = int(payload["ready_bytes"])
+        fraction = ready_bytes / total_bytes if total_bytes else 1.0
+        elapsed = max(0.0, now - self.eta_started)
+        newly_ready = max(0, ready_bytes - self.new_ready_start)
+        rate = newly_ready / elapsed if elapsed > 0 and newly_ready > 0 else 0.0
+        remaining_bytes = max(0, total_bytes - ready_bytes)
+        eta = 0.0 if remaining_bytes == 0 else (
+            remaining_bytes / rate if rate > 0 else None
+        )
+        record = payload.get("record")
+        current = "-"
+        if record is not None:
+            current = f"{record.session_id[:12]}/{record.sensor.removeprefix('camera_')}"
+        phase = str(payload.get("phase") or payload.get("status") or "ready")
+        phase_text = phase
+        event = payload.get("event")
+        if event in {"resume_check", "final_verify"}:
+            index = int(payload["index"])
+            scan_elapsed = max(0.0, now - self.phase_started)
+            scan_speed = index / scan_elapsed if index > 0 and scan_elapsed > 0 else 0.0
+            eta = (
+                (total_records - index) / scan_speed
+                if scan_speed > 0 and index < total_records
+                else 0.0 if index >= total_records else None
+            )
+            phase_text = f"{phase} {index}/{total_records}"
+        completed = payload.get("bytes_completed")
+        phase_total = payload.get("bytes_total")
+        phase_speed = "--"
+        if isinstance(completed, int) and isinstance(phase_total, int) and phase_total > 0:
+            phase_fraction = min(1.0, completed / phase_total)
+            phase_text = f"{phase} {phase_fraction * 100:5.1f}%"
+            phase_elapsed = now - self.phase_started
+            phase_delta = max(0, completed - self.phase_initial_bytes)
+            if phase_elapsed > 0.05 and phase_delta > 0:
+                phase_speed = f"{phase_delta / phase_elapsed / 1024**2:6.1f}MB/s"
+        free = shutil.disk_usage(self.local_root).free / 1024**3
+        self._print(
+            f"{payload.get('purpose', 'stage'):14s} "
+            f"{ready_records:3d}/{total_records:<3d} "
+            f"[{_progress_bar(fraction)}] {fraction * 100:5.1f}% "
+            f"{ready_bytes / 1024**3:6.1f}/{total_bytes / 1024**3:6.1f}G | "
+            f"{current:19.19s} | {phase_text:16.16s} | "
+            f"{phase_speed:10s} | ETA {_duration(eta):>7s} | free {free:5.1f}G",
+        )
+
+    def __call__(self, payload: Mapping[str, Any]) -> None:
+        event = payload.get("event")
+        now = float(self.clock())
+        if event == "stage_start":
+            self.wall_started = now
+            self.eta_started = now
+            self.phase_started = now
+            self.last_rendered = 0.0
+            self.new_ready_start = int(payload["ready_bytes"])
+            self._print(
+                "\nStage          Shards [overall progress]       Ready GiB | "
+                "Current             | Phase            | Speed      | ETA     | SSD",
+            )
+            self._render(payload, force=True)
+        elif event == "final_verify_start":
+            self.phase_started = now
+            self._render(payload, force=True)
+        elif event in {"resume_check", "final_verify"}:
+            index = int(payload["index"])
+            if index == 1 or index % 10 == 0 or index == int(payload["total_records"]):
+                self._render(payload, force=True)
+        elif event == "resume_end":
+            # Cached bytes were completed in a previous process and must not
+            # inflate this invocation's speed or make its ETA optimistic.
+            self.eta_started = now
+            self.phase_started = now
+            self.new_ready_start = int(payload["ready_bytes"])
+            self._render({**dict(payload), "phase": "resume-ready"}, force=True)
+        elif event == "record_start":
+            self.phase_started = now
+            self.phase = str(payload.get("status", "start"))
+            self.phase_initial_bytes = 0
+            if payload.get("status") != "cached":
+                self._render(payload, force=True)
+        elif event == "record_progress":
+            phase = str(payload.get("phase", "work"))
+            if phase != self.phase:
+                self.phase = phase
+                self.phase_started = now
+                self.phase_initial_bytes = int(payload.get("bytes_completed", 0))
+                self._render(payload, force=True)
+            else:
+                self._render(payload)
+        elif event == "record_end":
+            index = int(payload["index"])
+            cached = payload.get("status") == "cached"
+            if not cached or index % 10 == 0 or index == int(payload["total_records"]):
+                self._render(
+                    {**dict(payload), "phase": "cached" if cached else "done"},
+                    force=True,
+                )
+        elif event == "stage_end":
+            self._render({**dict(payload), "phase": "complete"}, force=True)
+            self._print(f"Stage complete in {_duration(now - self.wall_started)}")
 
 
 def _print_stage_plan(title: str, plan: Mapping[str, Any]) -> None:
@@ -1314,7 +1548,9 @@ def stage_official_train(filename: str | os.PathLike[str]) -> dict[str, Any]:
     prepared = prepare(filename)
     plan = prepared.train_stage.disk_plan()
     _print_stage_plan("STAGE OFFICIAL-TRAIN TO LOCAL SSD", plan)
-    result = prepared.train_stage.prepare_all(_stage_progress)
+    result = prepared.train_stage.prepare_all(
+        on_event=StageProgressReporter(prepared.train_stage.local_root)
+    )
     if result.get("complete") is not True:
         raise RuntimeError("official-train SSD stage did not complete")
     print(
@@ -1328,11 +1564,12 @@ def stage_official_train(filename: str | os.PathLike[str]) -> dict[str, Any]:
 
 def _official_test_stage(prepared: Prepared) -> LocalArchiveStage:
     staging = prepared.config["data"].get("local_staging", {})
+    stage_cache_id = staging.get("cache_id", prepared.config["run_id"])
     return LocalArchiveStage(
         prepared.split.official_test_records,
         local_root=prepared.local_root
         / "stages"
-        / prepared.config["run_id"]
+        / stage_cache_id
         / "official_test",
         purpose="official_test",
         expansion_factor=float(staging.get("expansion_factor", 1.05)),
@@ -1366,7 +1603,9 @@ def stage_official_test(filename: str | os.PathLike[str]) -> dict[str, Any]:
     test_stage = _official_test_stage(prepared)
     plan = test_stage.disk_plan()
     _print_stage_plan("STAGE OFFICIAL-TEST TO LOCAL SSD", plan)
-    result = test_stage.prepare_all(_stage_progress)
+    result = test_stage.prepare_all(
+        on_event=StageProgressReporter(test_stage.local_root)
+    )
     if result.get("complete") is not True:
         raise RuntimeError("official-test SSD stage did not complete")
     print(
@@ -1410,6 +1649,7 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
         prepared,
         amp_initial_scale=float(preflight["amp_stable_scale"]),
     )
+    _print_execution_plan(prepared, objects, start_epoch=0)
     prepared.train_loader.set_epoch(0)
     prepared.val_loader.set_epoch(0)
     torch.cuda.reset_peak_memory_stats()
@@ -1433,6 +1673,12 @@ def run_pilot(filename: str | os.PathLike[str]) -> dict[str, Any]:
         seconds=seconds,
         peak_vram=peak,
         epoch_skips=epoch_skips,
+    )
+    print(
+        f"[epoch] 1/{objects.config.epochs} complete | wall={_duration(seconds)} | "
+        f"peak_vram={peak:.2f}G | amp_skips={epoch_skips} | "
+        f"projected_remaining≈{_duration(seconds * (objects.config.epochs - 1))}",
+        flush=True,
     )
     before = _state_sha256(objects.model)
     state = objects.trainer.resume(str(objects.manager.last_path))
@@ -1569,6 +1815,7 @@ def run_main(filename: str | os.PathLike[str], supplied_token: str) -> None:
     history = _load_history(prepared.local_run)
     if history and history[-1]["epoch"] + 1 != state.next_epoch:
         raise ValueError("history and checkpoint epoch disagree")
+    _print_execution_plan(prepared, objects, start_epoch=state.next_epoch)
 
     while objects.trainer.start_epoch < objects.config.epochs:
         epoch = objects.trainer.start_epoch
@@ -1597,6 +1844,14 @@ def run_main(filename: str | os.PathLike[str], supplied_token: str) -> None:
         )
         if not _finite_scalars(record):
             raise FloatingPointError(f"epoch {epoch + 1} is non-finite")
+        remaining_epochs = objects.config.epochs - epoch - 1
+        print(
+            f"[epoch] {epoch + 1}/{objects.config.epochs} complete | "
+            f"wall={_duration(seconds)} | peak_vram={peak:.2f}G | "
+            f"amp_skips={record['epoch_amp_skips']} | "
+            f"projected_remaining≈{_duration(seconds * remaining_epochs)}",
+            flush=True,
+        )
         history.append(record)
         _write_reports(prepared, history, record)
         _atomic_json(

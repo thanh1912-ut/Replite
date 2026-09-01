@@ -814,6 +814,59 @@ def test_persistent_stage_extracts_once_resumes_and_cleans_owned_data(
     assert all(record.archive_path.is_file() for record in records)
 
 
+def test_persistent_stage_keeps_legacy_callback_and_emits_detailed_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(archives_module, "_zstd_stream_reader", _plain_tar_reader)
+    record = _write_tar_archive(
+        tmp_path / "source" / "progress.tar.zst",
+        session_id="session-progress",
+        selection_sha=_sha("stage-progress"),
+    )
+    stage = LocalArchiveStage(
+        (record,),
+        local_root=tmp_path / "progress-stage",
+        purpose="official_train",
+        expansion_factor=1.0,
+        reserve_bytes=0,
+    )
+    legacy: list[tuple[int, int, str, str]] = []
+    events: list[dict[str, object]] = []
+
+    result = stage.prepare_all(
+        lambda index, total, item, status: legacy.append(
+            (index, total, item.session_id, status)
+        ),
+        on_event=lambda payload: events.append(dict(payload)),
+    )
+
+    assert result["complete"] is True
+    assert legacy == [(1, 1, "session-progress", "extract")]
+    event_names = [event["event"] for event in events]
+    assert event_names[:4] == [
+        "stage_start",
+        "resume_check",
+        "resume_end",
+        "record_start",
+    ]
+    assert event_names[-4:] == [
+        "record_end",
+        "final_verify_start",
+        "final_verify",
+        "stage_end",
+    ]
+    detailed = [
+        event for event in events if event["event"] == "record_progress"
+    ]
+    phases = [event["phase"] for event in detailed]
+    assert phases[0] == "copy+sha"
+    assert "extract" in phases
+    assert phases[-2:] == ["verify", "publish"]
+    for event in events:
+        assert event["purpose"] == "official_train"
+        assert event["total_records"] == 1
+
+
 def test_persistent_stage_enforces_official_split_and_complete_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

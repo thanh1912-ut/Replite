@@ -46,6 +46,7 @@ _PERSISTENT_SHARD_COMPLETE = ".replite_sanpo_shard_complete.json"
 
 DetectionSource = Literal["packaged_json", "panoptic_on_load"]
 StagePurpose = Literal["official_train", "official_test"]
+_StageProgressCallback = Callable[[Mapping[str, object]], None]
 LedgerCandidate = tuple[str, Mapping[str, object]]
 
 
@@ -769,7 +770,11 @@ def create_or_load_group_split(
     )
 
 
-def _copy_verified(record: SanpoArchiveRecord, destination: Path) -> None:
+def _copy_verified(
+    record: SanpoArchiveRecord,
+    destination: Path,
+    progress: Callable[[int, int], None] | None = None,
+) -> None:
     digest = hashlib.sha256()
     size = 0
     with record.archive_path.open("rb") as source, destination.open("xb") as target:
@@ -777,6 +782,8 @@ def _copy_verified(record: SanpoArchiveRecord, destination: Path) -> None:
             target.write(block)
             digest.update(block)
             size += len(block)
+            if progress is not None:
+                progress(size, record.archive_bytes)
         target.flush()
         os.fsync(target.fileno())
     if size != record.archive_bytes or digest.hexdigest() != record.archive_sha256:
@@ -814,9 +821,14 @@ def _safe_tar_parts(name: str) -> tuple[str, ...]:
     return tuple(raw_parts)
 
 
-def _extract_tar_zst_safely(archive: Path, destination: Path) -> int:
+def _extract_tar_zst_safely(
+    archive: Path,
+    destination: Path,
+    progress: Callable[[int, int], None] | None = None,
+) -> int:
     seen: set[tuple[str, ...]] = set()
     member_count = 0
+    extracted_bytes = 0
     with _zstd_stream_reader(archive) as stream:
         with tarfile.open(fileobj=stream, mode="r|") as tar:
             for member in tar:
@@ -843,7 +855,11 @@ def _extract_tar_zst_safely(archive: Path, destination: Path) -> int:
                     if source is None:
                         raise ValueError(f"cannot read regular tar member: {member.name!r}")
                     with source, target.open("xb") as output:
-                        shutil.copyfileobj(source, output, length=1024 * 1024)
+                        while block := source.read(16 * 1024 * 1024):
+                            output.write(block)
+                            extracted_bytes += len(block)
+                            if progress is not None:
+                                progress(extracted_bytes, member_count + 1)
                 else:
                     raise ValueError(
                         f"tar links, devices, and special members are forbidden: {member.name!r}"
@@ -1361,7 +1377,12 @@ class LocalArchiveStage:
             )
         return plan
 
-    def materialize(self, record: SanpoArchiveRecord) -> Path:
+    def materialize(
+        self,
+        record: SanpoArchiveRecord,
+        *,
+        progress: _StageProgressCallback | None = None,
+    ) -> Path:
         """Return a persistent manifest, extracting atomically if necessary."""
 
         selected = self._records_by_key.get(record.key)
@@ -1398,11 +1419,50 @@ class LocalArchiveStage:
             )
             try:
                 local_archive = partial / record.archive_path.name
-                _copy_verified(record, local_archive)
+                if progress is None:
+                    _copy_verified(record, local_archive)
+                else:
+                    _copy_verified(
+                        record,
+                        local_archive,
+                        progress=lambda completed, total: progress(
+                            {
+                                "event": "record_progress",
+                                "phase": "copy+sha",
+                                "record": record,
+                                "bytes_completed": completed,
+                                "bytes_total": total,
+                            }
+                        ),
+                    )
                 extracted = partial / "extracted"
                 extracted.mkdir()
-                _extract_tar_zst_safely(local_archive, extracted)
+                if progress is None:
+                    _extract_tar_zst_safely(local_archive, extracted)
+                else:
+                    _extract_tar_zst_safely(
+                        local_archive,
+                        extracted,
+                        progress=lambda completed, members: progress(
+                            {
+                                "event": "record_progress",
+                                "phase": "extract",
+                                "record": record,
+                                "bytes_completed": completed,
+                                "bytes_total": self._estimated_unpacked_bytes(record),
+                                "members_completed": members,
+                            }
+                        ),
+                    )
                 local_archive.unlink()
+                if progress is not None:
+                    progress(
+                        {
+                            "event": "record_progress",
+                            "phase": "verify",
+                            "record": record,
+                        }
+                    )
                 manifest = _validate_materialized_manifest(record, extracted)
                 relative = manifest.relative_to(partial).as_posix()
                 payload_signature = _referenced_payload_signature(record, manifest)
@@ -1413,6 +1473,14 @@ class LocalArchiveStage:
                     payload_signature=payload_signature,
                 )
                 _atomic_json_file(partial / _PERSISTENT_SHARD_COMPLETE, complete)
+                if progress is not None:
+                    progress(
+                        {
+                            "event": "record_progress",
+                            "phase": "publish",
+                            "record": record,
+                        }
+                    )
                 final = self._record_root(record)
                 if final.exists():
                     raise RuntimeError(f"SANPO shard appeared concurrently: {final}")
@@ -1427,24 +1495,171 @@ class LocalArchiveStage:
     def prepare_all(
         self,
         progress: Callable[[int, int, SanpoArchiveRecord, str], None] | None = None,
+        *,
+        on_event: _StageProgressCallback | None = None,
     ) -> dict[str, object]:
-        """Preflight disk, resume missing shards, and return the stage manifest."""
+        """Preflight disk, resume missing shards, and return the stage manifest.
+
+        ``progress`` preserves the original per-record callback contract.
+        ``on_event`` is the detailed byte/phase stream used by the live Colab
+        dashboard.  Keeping them separate avoids silently breaking callers
+        that still expect ``(index, total, record, status)``.
+        """
 
         with self._locked():
             self._remove_owned_partials()
             plan = self._assert_disk_capacity()
         total = len(self.records)
+        total_bytes = sum(
+            self._estimated_unpacked_bytes(record) for record in self.records
+        )
+        ready_records = 0
+        ready_bytes = 0
+        if on_event is not None:
+            on_event(
+                {
+                    "event": "stage_start",
+                    "purpose": self.purpose,
+                    "total_records": total,
+                    "ready_records": ready_records,
+                    "total_bytes": total_bytes,
+                    "ready_bytes": ready_bytes,
+                }
+            )
+        existing_by_key: dict[
+            tuple[str, str, str, str, str], Path | None
+        ] = {}
         for index, record in enumerate(self.records, start=1):
             existing = self._existing_manifest(record, verify_payloads=True)
+            existing_by_key[record.key] = existing
+            if existing is not None:
+                ready_records += 1
+                ready_bytes += self._estimated_unpacked_bytes(record)
+            if on_event is not None:
+                on_event(
+                    {
+                        "event": "resume_check",
+                        "purpose": self.purpose,
+                        "index": index,
+                        "total_records": total,
+                        "record": record,
+                        "phase": "resume-check",
+                        "ready_records": ready_records,
+                        "ready_bytes": ready_bytes,
+                        "total_bytes": total_bytes,
+                    }
+                )
+        if on_event is not None:
+            on_event(
+                {
+                    "event": "resume_end",
+                    "purpose": self.purpose,
+                    "total_records": total,
+                    "ready_records": ready_records,
+                    "total_bytes": total_bytes,
+                    "ready_bytes": ready_bytes,
+                }
+            )
+        for index, record in enumerate(self.records, start=1):
+            existing = existing_by_key[record.key]
             status = "cached" if existing is not None else "extract"
             if progress is not None:
-                progress(index, total, record, status)
+                progress(
+                    index,
+                    total,
+                    record,
+                    status,
+                )
+            if on_event is not None:
+                on_event(
+                    {
+                        "event": "record_start",
+                        "purpose": self.purpose,
+                        "index": index,
+                        "total_records": total,
+                        "record": record,
+                        "status": status,
+                        "ready_records": ready_records,
+                        "ready_bytes": ready_bytes,
+                        "total_bytes": total_bytes,
+                    }
+                )
             if existing is None:
-                self.materialize(record)
+                self.materialize(
+                    record,
+                    progress=(
+                        None
+                        if on_event is None
+                        else lambda payload, index=index: on_event(
+                            {
+                                **dict(payload),
+                                "purpose": self.purpose,
+                                "index": index,
+                                "total_records": total,
+                                "ready_records": ready_records,
+                                "ready_bytes": ready_bytes,
+                                "total_bytes": total_bytes,
+                            }
+                        )
+                    ),
+                )
+                ready_records += 1
+                ready_bytes += self._estimated_unpacked_bytes(record)
+            if on_event is not None:
+                on_event(
+                    {
+                        "event": "record_end",
+                        "purpose": self.purpose,
+                        "index": index,
+                        "total_records": total,
+                        "record": record,
+                        "status": status,
+                        "ready_records": ready_records,
+                        "ready_bytes": ready_bytes,
+                        "total_bytes": total_bytes,
+                    }
+                )
+        if on_event is not None:
+            on_event(
+                {
+                    "event": "final_verify_start",
+                    "purpose": self.purpose,
+                    "total_records": total,
+                    "ready_records": ready_records,
+                    "total_bytes": total_bytes,
+                    "ready_bytes": ready_bytes,
+                    "phase": "final-verify",
+                }
+            )
         with self._locked():
-            for record in self.records:
+            for index, record in enumerate(self.records, start=1):
                 self._existing_manifest(record, verify_payloads=True)
+                if on_event is not None:
+                    on_event(
+                        {
+                            "event": "final_verify",
+                            "purpose": self.purpose,
+                            "index": index,
+                            "total_records": total,
+                            "record": record,
+                            "phase": "final-verify",
+                            "ready_records": ready_records,
+                            "ready_bytes": ready_bytes,
+                            "total_bytes": total_bytes,
+                        }
+                    )
             payload = self._write_status()
+        if on_event is not None:
+            on_event(
+                {
+                    "event": "stage_end",
+                    "purpose": self.purpose,
+                    "total_records": total,
+                    "ready_records": ready_records,
+                    "total_bytes": total_bytes,
+                    "ready_bytes": ready_bytes,
+                }
+            )
         return {**payload, "disk_plan": plan}
 
     def status(self) -> dict[str, object]:

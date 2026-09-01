@@ -383,7 +383,16 @@ scale down deterministically before constructing the production trainer. Cell
 results should `START_MAIN` be enabled and the token pasted into Cell 7; that
 cell strict-resumes epoch 2 with the same full-campaign scheduler.
 
-The console uses YOLO-style rows. `console.log` contains only the current/latest
+The console uses newline-safe YOLO-style rows that remain readable both inside
+the running cell and through `tail -F`. Before training it prints the exact
+train/validation sample counts, micro/effective batch size, batches per epoch,
+optimizer updates, warmup updates, workers, prefetch, and log cadence. During
+SSD staging it reports ready/total shards, overall GiB and percentage, current
+session-camera, copy/extract/verify phase, throughput, ETA, and remaining SSD
+space. Train and validation rows include current/total batch, percentage,
+iterations per second, ETA, task losses, VRAM, instances, resolution, and LR.
+Wrapper keepalives appear only after 30 seconds with no child output, so they do
+not obscure real progress. `console.log` contains only the current/latest
 command for `tail -F`; immutable per-invocation logs live below `logs/`. Every
 validation writes detection mAP50/mAP50--95 and per-class AP,
 segmentation mIoU/pixel accuracy/per-class IoU, and depth AbsRel/RMSE/delta1.
@@ -395,6 +404,14 @@ scans newest to oldest and rejects corrupt or source/config/catalog/split-
 incompatible snapshots. Each `RUN_ID` also writes an immutable source pin on
 Drive, so Cell 2 checks out the campaign's original commit even if `main` has
 advanced since the previous Colab session.
+
+Within the same live Colab runtime, the v5 logging-only campaign has a new
+source pin while retaining the v4 local stage cache ID. (`/content` is
+ephemeral, so no SSD cache survives a runtime reset.) `LocalArchiveStage`
+still verifies the dataset-owned stage
+marker, archive identity, and referenced payload signatures before reuse; this
+lets an in-progress v4 SSD extraction continue under the clearer UI without
+downloading completed shards again.
 
 The staged loader reuses the extracted official-train corpus directly from SSD
 for every epoch, so epochs do not reread Drive or re-extract archives. The stage

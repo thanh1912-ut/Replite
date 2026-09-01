@@ -263,19 +263,23 @@ def _stage_plan() -> dict[str, int | float]:
     }
 
 
-def test_stage_train_prepares_complete_official_train(monkeypatch) -> None:
+def test_stage_train_wires_detailed_progress_reporter(
+    tmp_path: Path, monkeypatch
+) -> None:
     class Stage:
-        local_root = Path("/content/unit-stage")
+        local_root = tmp_path / "unit-stage"
 
         def __init__(self) -> None:
             self.calls: list[str] = []
+            self.reporter = None
 
         def disk_plan(self):
             self.calls.append("plan")
             return _stage_plan()
 
-        def prepare_all(self, progress):
+        def prepare_all(self, *, on_event):
             self.calls.append("prepare")
+            self.reporter = on_event
             return {
                 "complete": True,
                 "completed_count": 186,
@@ -290,6 +294,101 @@ def test_stage_train_prepares_complete_official_train(monkeypatch) -> None:
     result = runner.stage_official_train("config.json")
     assert result["complete"] is True
     assert stage.calls == ["plan", "prepare"]
+    assert isinstance(stage.reporter, runner.StageProgressReporter)
+
+
+def test_stage_progress_reporter_is_newline_safe_and_shows_overall_eta(
+    tmp_path: Path, capsys
+) -> None:
+    tick = -1.0
+
+    def clock() -> float:
+        nonlocal tick
+        tick += 1.0
+        return tick
+
+    reporter = runner.StageProgressReporter(
+        tmp_path,
+        interval_seconds=0.0,
+        clock=clock,
+    )
+    gib = 1024**3
+    record = SimpleNamespace(session_id="session-123456789", sensor="camera_head")
+    common = {
+        "purpose": "official_train",
+        "total_records": 2,
+        "total_bytes": 2 * gib,
+    }
+    reporter(
+        {
+            **common,
+            "event": "stage_start",
+            "ready_records": 0,
+            "ready_bytes": 0,
+        }
+    )
+    reporter(
+        {
+            **common,
+            "event": "resume_end",
+            "ready_records": 0,
+            "ready_bytes": 0,
+        }
+    )
+    reporter(
+        {
+            **common,
+            "event": "record_start",
+            "record": record,
+            "status": "extract",
+            "ready_records": 0,
+            "ready_bytes": 0,
+        }
+    )
+    for completed in (gib // 4, 3 * gib // 4):
+        reporter(
+            {
+                **common,
+                "event": "record_progress",
+                "record": record,
+                "phase": "copy+sha",
+                "bytes_completed": completed,
+                "bytes_total": gib,
+                "ready_records": 0,
+                "ready_bytes": 0,
+            }
+        )
+    reporter(
+        {
+            **common,
+            "event": "record_end",
+            "record": record,
+            "index": 1,
+            "status": "extract",
+            "ready_records": 1,
+            "ready_bytes": gib,
+        }
+    )
+    reporter(
+        {
+            **common,
+            "event": "stage_end",
+            "ready_records": 2,
+            "ready_bytes": 2 * gib,
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "Stage          Shards [overall progress]" in output
+    assert "1/2" in output
+    assert " 50.0%" in output
+    assert "copy+sha" in output
+    assert "MB/s" in output
+    assert "ETA" in output
+    assert "free" in output
+    assert "Stage complete in" in output
+    assert "\r" not in output
+    assert "\x1b[" not in output
 
 
 def test_stage_test_requires_complete_campaign_then_cleans_train(
@@ -308,8 +407,9 @@ def test_stage_test_requires_complete_campaign_then_cleans_train(
             events.append("plan-test")
             return _stage_plan()
 
-        def prepare_all(self, progress):
+        def prepare_all(self, *, on_event):
             events.append("prepare-test")
+            assert isinstance(on_event, runner.StageProgressReporter)
             return {
                 "complete": True,
                 "completed_count": 48,
@@ -417,3 +517,42 @@ def test_cached_inspection_is_reused_only_when_context_matches(
     payload["context"]["source_sha256"] = "0" * 64
     path.write_text(json.dumps(payload), encoding="utf-8")
     assert runner._load_cached_inspection(prepared) is None
+
+
+def test_execution_plan_prints_exact_batches_updates_and_log_cadence(
+    capsys,
+) -> None:
+    class Loader:
+        def __init__(self, batches: int, samples: int) -> None:
+            self.batches = batches
+            self.sample_count = samples
+
+        def __len__(self) -> int:
+            return self.batches
+
+    prepared = SimpleNamespace(
+        config={
+            "data": {"batch_size": 4},
+            "train": {"progress_every_n_steps": 10},
+        },
+        train_loader=Loader(125, 500),
+        val_loader=Loader(25, 100),
+    )
+    objects = SimpleNamespace(
+        config=SimpleNamespace(grad_accum_steps=2, epochs=50),
+        total_steps=3_150,
+        warmup_steps=158,
+    )
+
+    runner._print_execution_plan(prepared, objects, start_epoch=1)
+
+    output = capsys.readouterr().out
+    assert "epochs 2->50" in output
+    assert "micro_batch=4" in output
+    assert "effective_batch=8" in output
+    assert "train=500 samples, 125 batches/epoch" in output
+    assert "optimizer=63 updates/epoch" in output
+    assert "validation=100 samples, 25 batches/epoch" in output
+    assert "campaign optimizer updates=3,150" in output
+    assert "warmup=158" in output
+    assert "progress every=10 batches" in output
