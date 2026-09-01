@@ -361,6 +361,7 @@ def _ledger_record(
     ledger_key: object,
     drive_root: Path,
     expected_annotation_policy: str,
+    validate_archive_file: bool,
 ) -> SanpoArchiveRecord:
     identity = _ledger_identity(
         raw,
@@ -376,14 +377,11 @@ def _ledger_record(
         raise ValueError("archive ledger path has an invalid basename")
 
     # Never trust the absolute path persisted by a previous Colab mount.
-    archive_path = (
-        drive_root / "archives" / identity.split / archive_name
-    ).resolve()
-    expected_parent = (drive_root / "archives" / identity.split).resolve()
-    try:
-        archive_path.relative_to(expected_parent)
-    except ValueError as exc:  # defensive; the basename regex already prevents this
-        raise ValueError("resolved archive escapes its official split") from exc
+    # `drive_root` is already absolute and `archive_name` is a validated
+    # basename. Avoid Path.resolve() here: on Colab's Drive FUSE it performs
+    # remote metadata lookups once per archive even when physical validation
+    # is intentionally deferred to local-SSD staging.
+    archive_path = drive_root / "archives" / identity.split / archive_name
 
     record = SanpoArchiveRecord(
         split=identity.split,
@@ -404,10 +402,17 @@ def _ledger_record(
             else None
         ),
     )
-    if not record.archive_path.is_file():
-        raise FileNotFoundError(f"SANPO archive is missing: {record.archive_path}")
-    if record.archive_path.stat().st_size != record.archive_bytes:
-        raise ValueError(f"SANPO archive byte count disagrees with ledger: {record.archive_path}")
+    if validate_archive_file:
+        try:
+            observed_bytes = record.archive_path.stat().st_size
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"SANPO archive is missing: {record.archive_path}"
+            ) from exc
+        if observed_bytes != record.archive_bytes:
+            raise ValueError(
+                f"SANPO archive byte count disagrees with ledger: {record.archive_path}"
+            )
     return record
 
 
@@ -461,6 +466,7 @@ def load_archive_catalog(
     selection_path: str | os.PathLike[str] | None = None,
     ledger_path: str | os.PathLike[str] | None = None,
     detection_manifest_path: str | os.PathLike[str] | None = None,
+    validate_archive_files: bool = True,
     validate_sidecars: bool = True,
 ) -> ArchiveCatalog:
     """Resolve the active packaged archive for every selected source shard.
@@ -470,7 +476,18 @@ def load_archive_catalog(
     source frames.  For each selected source key, a modern package matching the
     active detection config is preferred; otherwise its exact-keyed legacy
     archive is used and detection is derived from panoptic masks on load.
+
+    ``validate_archive_files=False, validate_sidecars=False`` is the metadata-
+    only mode for slow mounted filesystems. It still validates the immutable
+    selection/ledger identities and byte/SHA declarations. The persistent SSD
+    stage later opens every selected archive, verifies its exact byte count and
+    SHA-256 while copying, and validates the extracted manifest/payloads.
     """
+
+    if not isinstance(validate_archive_files, bool):
+        raise TypeError("validate_archive_files must be boolean")
+    if not isinstance(validate_sidecars, bool):
+        raise TypeError("validate_sidecars must be boolean")
 
     root = Path(drive_root).expanduser().resolve()
     selection_file = (
@@ -579,6 +596,7 @@ def load_archive_catalog(
                 ledger_key=ledger_key,
                 drive_root=root,
                 expected_annotation_policy=annotation_policy,
+                validate_archive_file=validate_archive_files,
             )
             ledger_by_key.setdefault(raw_key, []).append(record)
 

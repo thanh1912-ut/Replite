@@ -132,11 +132,25 @@ cells = [
         #@title 2) Cấu hình campaign — chỉnh ở đây trước khi chạy audit/pilot
         from datetime import datetime, timezone
 
-        DRIVE_DATA_ROOT = Path("/content/drive/MyDrive/nckh1m_data/sanpo_real_v0_joint_human_only_rgb3")
+        DRIVE_BASE_ROOT = Path("/content/drive/MyDrive/nckh1m_data")
+        SANPO_SUBDIR = "sanpo_real_v0_joint_human_only_rgb3"
+        known_roots = (DRIVE_BASE_ROOT / SANPO_SUBDIR, DRIVE_BASE_ROOT)
+        matching_roots = [
+            root for root in known_roots
+            if (root / "archive_manifest.json").is_file()
+            and (root / "metadata/current_download_selection.json").is_file()
+            and (root / "archives/train").is_dir()
+            and (root / "archives/test").is_dir()
+        ]
+        assert len(matching_roots) == 1, (
+            "Không xác định duy nhất SANPO root dưới "
+            f"{DRIVE_BASE_ROOT}: {matching_roots}"
+        )
+        DRIVE_DATA_ROOT = matching_roots[0]
         LOCAL_WORK_ROOT = Path("/content/replite_sanpo_main")
         DRIVE_RUNS_ROOT = DRIVE_DATA_ROOT / "main_runs"
 
-        RUN_ID = "replite_sanpo_mnv4convs_seed42_v3"  #@param {type:"string"}
+        RUN_ID = "replite_sanpo_mnv4convs_seed42_v4"  #@param {type:"string"}
         BACKBONE_NAME = "mobilenetv4_conv_small"  #@param ["mobilenetv4_conv_small", "mobilenetv3_small_050"]
         PRETRAINED_IN1K = True  #@param {type:"boolean"}
         EPOCHS = 50  #@param {type:"integer"}
@@ -420,6 +434,7 @@ cells = [
             print("Completed log:", command_log)
 
         print("Config:", CONFIG_PATH)
+        print("SANPO DATA ROOT:", DRIVE_DATA_ROOT)
         print("Run Drive:", DRIVE_RUNS_ROOT / RUN_ID)
         print("LƯU Ý: đổi config sau pilot sẽ làm approval token vô hiệu.")
         """

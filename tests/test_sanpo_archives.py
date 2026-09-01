@@ -198,6 +198,22 @@ def test_catalog_joins_manifests_and_resolves_only_below_current_drive_root(
         assert "/old-root/" not in str(record.archive_path)
 
 
+def test_catalog_metadata_only_mode_defers_drive_file_io(tmp_path: Path) -> None:
+    root, specifications = _catalog_fixture(tmp_path)
+    for path in (root / "archives").rglob("*"):
+        if path.is_file():
+            path.unlink()
+
+    catalog = load_archive_catalog(
+        root,
+        validate_archive_files=False,
+        validate_sidecars=False,
+    )
+    assert len(catalog.records) == len(specifications)
+    with pytest.raises(FileNotFoundError, match="archive is missing"):
+        load_archive_catalog(root)
+
+
 def test_catalog_matches_real_mixed_legacy_and_modern_ledger_shape(
     tmp_path: Path,
 ) -> None:

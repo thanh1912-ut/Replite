@@ -71,8 +71,8 @@ EXPECTED = {
     "train_frames": 14_718,
     "test_frames": 3_803,
 }
-PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v3"
-APPROVAL_KIND = "replite-sanpo-main-epoch1-approval-v2"
+PROTOCOL_ID = "replite-sanpo-real-human-v0-session-split-v4"
+APPROVAL_KIND = "replite-sanpo-main-epoch1-approval-v3"
 DETECTION_MIN_COMPONENT_PIXELS = int(
     SANPO_DERIVED_DETECTION_CONFIG["min_component_pixels"]
 )
@@ -240,13 +240,27 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
     data_root = Path(config["drive_data_root"]).expanduser().resolve()
     if not data_root.is_dir():
         raise FileNotFoundError(f"SANPO data root is missing: {data_root}")
-    catalog = load_archive_catalog(data_root, validate_sidecars=True)
+    print(
+        "[prepare] 1/3 metadata catalog từ Drive "
+        "(không stat 234 archive/sidecar)",
+        flush=True,
+    )
+    catalog = load_archive_catalog(
+        data_root,
+        validate_archive_files=False,
+        validate_sidecars=False,
+    )
     if catalog.detection_config_sha256 != SANPO_DERIVED_DETECTION_CONFIG_SHA256:
         raise ValueError(
             "archive catalog detection policy differs from the locked main "
             "training protocol"
         )
     _assert_catalog(catalog)
+    print(
+        f"[prepare] 2/3 catalog OK | {len(catalog.records)} archives | "
+        "byte/SHA vật lý sẽ kiểm đầy đủ khi stage",
+        flush=True,
+    )
     seed = int(config["data"]["split_seed"])
     fraction = float(config["data"]["validation_fraction"])
     basis_points = round(fraction * 10_000)
@@ -268,6 +282,12 @@ def prepare(filename: str | os.PathLike[str]) -> Prepared:
         item.key for item in catalog.train_records
     }:
         raise AssertionError("fit plus inner-validation does not cover official train")
+    print(
+        f"[prepare] 3/3 split OK | fit={len(split.train_records)} | "
+        f"inner-val={len(split.validation_records)} | "
+        f"official-test={len(split.official_test_records)}",
+        flush=True,
+    )
 
     config_sha = canonical_json_sha256(config)
     source_sha = canonical_json_sha256(
@@ -673,10 +693,14 @@ def inspection_payload(
 
 
 def inspect_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
+    print("[inspect] phase 1/4: metadata + split", flush=True)
     prepared = prepare(filename)
+    print("[inspect] phase 2/4: dựng model + pretrained IN-1K", flush=True)
     _seed_everything(int(prepared.config["train"]["seed"]))
     model = create_model(prepared)
+    print("[inspect] phase 3/4: optimizer + schedule", flush=True)
     optimizer, _, total, warmup = create_optimizer_schedule(prepared, model)
+    print("[inspect] phase 4/4: SSD plan + report", flush=True)
     result = inspection_payload(prepared, model, optimizer, total, warmup)
     _table(
         "DATA AUDIT",

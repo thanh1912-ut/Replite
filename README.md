@@ -368,7 +368,12 @@ was used for every shard.
 Run the notebook cells in order. Cell 3 prints the resolved architecture,
 MobileNet feature stages, ImageNet-1K weight provenance, parameter counts,
 optimizer groups, schedule, archive hashes, frozen split, and SSD capacity plan
-before any model update. Cell 4 copies, SHA-verifies, and atomically extracts
+before any model update. The notebook anchors Drive at
+`/content/drive/MyDrive/nckh1m_data` and accepts the locked SANPO marker layout
+either directly there or in `sanpo_real_v0_joint_human_only_rgb3`; it never
+searches arbitrary Drive locations. Inspection validates the three compact
+metadata manifests without issuing per-archive FUSE `resolve/stat` calls. Cell
+4 then copies, byte/SHA-verifies, and atomically extracts
 all 186 official-train shards (fit plus inner-validation) once to `/content`.
 Cell 5 performs a disposable one-batch preflight and then runs exactly campaign
 epoch 1 over the complete train split with complete validation. If FP16 scaled
