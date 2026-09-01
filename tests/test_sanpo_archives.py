@@ -185,6 +185,15 @@ def test_catalog_rejects_conflicting_active_package_entries(tmp_path: Path) -> N
 
 def test_catalog_selects_package_for_active_detection_config(tmp_path: Path) -> None:
     root, _ = _catalog_fixture(tmp_path)
+    detection_manifest_path = root / "metadata" / "derived_detection_classes.json"
+    detection_manifest = json.loads(
+        detection_manifest_path.read_text(encoding="utf-8")
+    )
+    # Reproduce early downloader metadata: taxonomy exists, but the wrapper
+    # does not expose the derived-box config or its digest.
+    detection_manifest.pop("detection_config")
+    detection_manifest.pop("detection_config_sha256")
+    _write_json(detection_manifest_path, detection_manifest)
     ledger_path = root / "archive_manifest.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     historical = dict(ledger["archives"]["entry-0"])
@@ -210,6 +219,37 @@ def test_catalog_selects_package_for_active_detection_config(tmp_path: Path) -> 
     )
     assert selected.detection_config_sha256 == _DETECTION_CONFIG_SHA
     assert selected.package_sha256 == _package_sha(selected.selection_sha256)
+
+
+def test_catalog_rejects_two_complete_package_families_without_metadata_hint(
+    tmp_path: Path,
+) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    detection_manifest_path = root / "metadata" / "derived_detection_classes.json"
+    detection_manifest = json.loads(
+        detection_manifest_path.read_text(encoding="utf-8")
+    )
+    detection_manifest.pop("detection_config")
+    detection_manifest.pop("detection_config_sha256")
+    _write_json(detection_manifest_path, detection_manifest)
+
+    ledger_path = root / "archive_manifest.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    second_config = _sha("second-complete-config")
+    for key, entry in list(ledger["archives"].items()):
+        alternative = dict(entry)
+        alternative["detection_config_sha256"] = second_config
+        alternative["package_sha256"] = _package_sha(
+            alternative["selection_sha256"], second_config
+        )
+        alternative["archive"] = (
+            f"/content/drive/old-root/{key}-second-family.tar.zst"
+        )
+        ledger["archives"][f"{key}-second"] = alternative
+    _write_json(ledger_path, ledger)
+
+    with pytest.raises(ValueError, match="cannot resolve one SANPO detection package"):
+        load_archive_catalog(root)
 
 
 def test_catalog_rejects_bad_sha_sidecar(tmp_path: Path) -> None:
@@ -258,7 +298,7 @@ def test_catalog_rejects_invalid_active_package_provenance(tmp_path: Path) -> No
     ledger["archives"]["entry-0"]["package_sha256"] = "0" * 64
     _write_json(ledger_path, ledger)
 
-    with pytest.raises(ValueError, match="invalid package_sha256"):
+    with pytest.raises(ValueError, match="cannot resolve one SANPO detection package"):
         load_archive_catalog(root)
 
 

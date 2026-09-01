@@ -122,8 +122,16 @@ def _package_sha256(selection_sha256: str, detection_config_sha256: str) -> str:
     )
 
 
-def _active_detection_config_sha256(path: Path) -> str:
-    payload = _read_json_object(path, "active SANPO derived-detection manifest")
+def _detection_config_sha256_hint(path: Path) -> str | None:
+    """Return a validated config hint when the metadata wrapper carries one.
+
+    Early downloader metadata contained only the derived class taxonomy.  In
+    that case the exact config can still be recovered from the unique package
+    family that covers the complete immutable selection in the append-only
+    ledger, so absence of these optional fields is not an error.
+    """
+
+    payload = _read_json_object(path, "SANPO derived-detection manifest")
     schema_version = payload.get("schema_version")
     if (
         isinstance(schema_version, bool)
@@ -137,11 +145,17 @@ def _active_detection_config_sha256(path: Path) -> str:
     # depends only on these two structurally validated fields, not on the
     # wrapper version, so compatible old/new manifests remain reproducible.
     config = payload.get("detection_config")
+    declared_raw = payload.get("detection_config_sha256")
+    if config is None and declared_raw is None:
+        return None
+    if config is None:
+        return _sha256(
+            declared_raw, "derived-detection detection_config_sha256"
+        )
     if not isinstance(config, Mapping):
-        raise ValueError("derived-detection manifest has no detection_config")
+        raise ValueError("derived-detection detection_config must be a mapping")
     declared = _sha256(
-        payload.get("detection_config_sha256"),
-        "derived-detection detection_config_sha256",
+        declared_raw, "derived-detection detection_config_sha256"
     )
     actual = canonical_json_sha256(dict(config))
     if actual != declared:
@@ -335,10 +349,10 @@ def load_archive_catalog(
 
     ``selection_sha256`` intentionally excludes the derived-box policy, so an
     append-only ledger may contain several legitimate packages for the same
-    source frames.  The active detection config is pinned by
-    ``metadata/derived_detection_classes.json`` and combined with the selection
-    digest to recover the exact downloader ``package_sha256``.  Historical
-    packages are retained on Drive but ignored here.
+    source frames.  A structurally valid metadata hint is preferred; otherwise
+    the active config is the unique package family covering every record in the
+    immutable current selection.  Historical partial package families are
+    retained on Drive but ignored here.
     """
 
     root = Path(drive_root).expanduser().resolve()
@@ -359,8 +373,10 @@ def load_archive_catalog(
     )
     selection = _read_json_object(selection_file, "SANPO download selection")
     ledger = _read_json_object(ledger_file, "SANPO archive ledger")
-    detection_config_sha256 = _active_detection_config_sha256(
-        detection_manifest_file
+    detection_config_hint = (
+        _detection_config_sha256_hint(detection_manifest_file)
+        if detection_manifest_file.is_file()
+        else None
     )
     if selection.get("schema_version") != 1:
         raise ValueError("unsupported SANPO download selection schema")
@@ -397,7 +413,10 @@ def load_archive_catalog(
         raise ValueError("selection joint_target_count does not match records")
 
     selected_key_set = set(selected_keys)
-    ledger_by_key: dict[tuple[str, str, str, str], list[SanpoArchiveRecord]] = {}
+    package_families: dict[
+        str,
+        dict[tuple[str, str, str, str], list[Mapping[str, object]]],
+    ] = {}
     for raw in ledger["archives"].values():
         # The ledger is append-only and can retain records from older download
         # selections.  Resolve/stat only entries that can join the current
@@ -412,25 +431,55 @@ def load_archive_catalog(
         )
         if raw_key not in selected_key_set:
             continue
-        if (
-            raw.get("annotation_policy") != annotation_policy
-            or raw.get("detection_config_sha256") != detection_config_sha256
-        ):
+        if raw.get("annotation_policy") != annotation_policy:
             continue
-        expected_package = _package_sha256(
-            str(raw.get("selection_sha256")), detection_config_sha256
-        )
-        if raw.get("package_sha256") != expected_package:
-            raise ValueError(
-                "active SANPO ledger entry has an invalid package_sha256"
+        try:
+            candidate_config = _sha256(
+                raw.get("detection_config_sha256"),
+                "archive detection_config_sha256",
             )
-        record = _ledger_record(
-            raw,
-            drive_root=root,
-            expected_annotation_policy=annotation_policy,
-            expected_detection_config_sha256=detection_config_sha256,
+            candidate_package = _sha256(
+                raw.get("package_sha256"), "archive package_sha256"
+            )
+        except ValueError:
+            continue
+        expected_package = _package_sha256(str(raw_key[3]), candidate_config)
+        if candidate_package != expected_package:
+            continue
+        package_families.setdefault(candidate_config, {}).setdefault(
+            raw_key, []
+        ).append(raw)
+
+    complete_families = sorted(
+        config_sha
+        for config_sha, by_key in package_families.items()
+        if set(by_key) == selected_key_set
+    )
+    if detection_config_hint in complete_families:
+        detection_config_sha256 = str(detection_config_hint)
+    elif len(complete_families) == 1:
+        detection_config_sha256 = complete_families[0]
+    else:
+        coverage = ", ".join(
+            f"{config_sha[:12]}={len(by_key)}/{len(selected_key_set)}"
+            for config_sha, by_key in sorted(package_families.items())
+        ) or "none"
+        raise ValueError(
+            "cannot resolve one SANPO detection package family covering the "
+            f"complete selection; metadata_hint={detection_config_hint!r}, "
+            f"coverage=[{coverage}]"
         )
-        ledger_by_key.setdefault(record.selection_key, []).append(record)
+
+    ledger_by_key: dict[tuple[str, str, str, str], list[SanpoArchiveRecord]] = {}
+    for raw_key, candidates in package_families[detection_config_sha256].items():
+        for raw in candidates:
+            record = _ledger_record(
+                raw,
+                drive_root=root,
+                expected_annotation_policy=annotation_policy,
+                expected_detection_config_sha256=detection_config_sha256,
+            )
+            ledger_by_key.setdefault(raw_key, []).append(record)
 
     joined: list[SanpoArchiveRecord] = []
     for item, key in zip(selected, selected_keys):
