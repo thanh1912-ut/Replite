@@ -33,6 +33,24 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+_ANNOTATION_POLICY = "human_only"
+_DETECTION_CONFIG = {
+    "schema_version": 1,
+    "component_connectivity": 8,
+    "min_component_pixels": 100,
+}
+_DETECTION_CONFIG_SHA = canonical_json_sha256(_DETECTION_CONFIG)
+
+
+def _package_sha(selection_sha: str, detection_sha: str = _DETECTION_CONFIG_SHA) -> str:
+    return canonical_json_sha256(
+        {
+            "selection_sha256": selection_sha,
+            "detection_config_sha256": detection_sha,
+        }
+    )
+
+
 def _catalog_fixture(tmp_path: Path):
     root = tmp_path / "mounted-drive"
     specifications = (
@@ -46,7 +64,8 @@ def _catalog_fixture(tmp_path: Path):
     ledger_entries = {}
     for index, (split, session_id, sensor, frames) in enumerate(specifications):
         selection_sha = _sha(f"selection-{index}")
-        name = f"{session_id}__{sensor}__{index:012d}.tar.zst"
+        package_sha = _package_sha(selection_sha)
+        name = f"{session_id}__{sensor}__{package_sha[:12]}.tar.zst"
         archive = root / "archives" / split / name
         archive.parent.mkdir(parents=True, exist_ok=True)
         archive.write_bytes(f"archive-{index}".encode())
@@ -64,7 +83,10 @@ def _catalog_fixture(tmp_path: Path):
             "split": split,
             "session_id": session_id,
             "sensor": sensor,
+            "annotation_policy": _ANNOTATION_POLICY,
             "selection_sha256": selection_sha,
+            "detection_config_sha256": _DETECTION_CONFIG_SHA,
+            "package_sha256": package_sha,
             # This old absolute mount path must never be trusted.
             "archive": f"/content/drive/old-root/{name}",
             "archive_bytes": archive.stat().st_size,
@@ -83,9 +105,18 @@ def _catalog_fixture(tmp_path: Path):
         root / "metadata" / "current_download_selection.json",
         {
             "schema_version": 1,
+            "annotation_policy": _ANNOTATION_POLICY,
             "session_camera_count": len(selection_records),
             "joint_target_count": sum(item[3] for item in specifications),
             "records": selection_records,
+        },
+    )
+    _write_json(
+        root / "metadata" / "derived_detection_classes.json",
+        {
+            "schema_version": 2,
+            "detection_config": _DETECTION_CONFIG,
+            "detection_config_sha256": _DETECTION_CONFIG_SHA,
         },
     )
     _write_json(
@@ -114,21 +145,118 @@ def test_catalog_joins_manifests_and_resolves_only_below_current_drive_root(
         assert "/old-root/" not in str(record.archive_path)
 
 
-def test_catalog_rejects_ambiguous_join_and_bad_sidecar(tmp_path: Path) -> None:
+def test_catalog_coalesces_equivalent_duplicate_ledger_entries(tmp_path: Path) -> None:
     root, _ = _catalog_fixture(tmp_path)
+    baseline = load_archive_catalog(root)
     ledger_path = root / "archive_manifest.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     ledger["archives"]["duplicate"] = dict(ledger["archives"]["entry-0"])
+    ledger["archives"]["duplicate"]["archive"] = ledger["archives"]["duplicate"][
+        "archive"
+    ].replace("/old-root/", "/another-old-mount/")
+    ledger["archives"]["duplicate"]["verified_utc"] = "2000-01-01T00:00:00Z"
     _write_json(ledger_path, ledger)
-    with pytest.raises(ValueError, match="exactly one ledger match"):
+
+    duplicate = load_archive_catalog(root)
+
+    assert duplicate.records == baseline.records
+    assert duplicate.catalog_sha256 == baseline.catalog_sha256
+
+
+def test_catalog_rejects_conflicting_active_package_entries(tmp_path: Path) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    ledger_path = root / "archive_manifest.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    conflicting = dict(ledger["archives"]["entry-0"])
+    conflicting_name = "session-a__camera_head__conflict.tar.zst"
+    conflicting_archive = root / "archives" / "train" / conflicting_name
+    conflicting_archive.write_bytes(b"different-active-package-bytes")
+    conflicting.update(
+        archive=f"/content/drive/old-root/{conflicting_name}",
+        archive_bytes=conflicting_archive.stat().st_size,
+        archive_sha256=hashlib.sha256(conflicting_archive.read_bytes()).hexdigest(),
+    )
+    ledger["archives"]["conflicting"] = conflicting
+    _write_json(ledger_path, ledger)
+
+    with pytest.raises(ValueError, match="exactly one active package"):
         load_archive_catalog(root)
 
-    del ledger["archives"]["duplicate"]
+
+def test_catalog_selects_package_for_active_detection_config(tmp_path: Path) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    ledger_path = root / "archive_manifest.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    historical = dict(ledger["archives"]["entry-0"])
+    historical_detection_sha = _sha("old-detection-config")
+    historical.update(
+        detection_config_sha256=historical_detection_sha,
+        package_sha256=_package_sha(
+            historical["selection_sha256"], historical_detection_sha
+        ),
+        archive="/content/drive/old-root/deleted-historical-package.tar.zst",
+        archive_bytes=123,
+        archive_sha256=_sha("deleted-historical-package"),
+    )
+    ledger["archives"]["historical-package"] = historical
     _write_json(ledger_path, ledger)
+
+    catalog = load_archive_catalog(root)
+
+    selected = next(
+        record
+        for record in catalog.records
+        if record.session_id == "session-a" and record.sensor == "camera_head"
+    )
+    assert selected.detection_config_sha256 == _DETECTION_CONFIG_SHA
+    assert selected.package_sha256 == _package_sha(selected.selection_sha256)
+
+
+def test_catalog_rejects_bad_sha_sidecar(tmp_path: Path) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    ledger_path = root / "archive_manifest.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+
     first_name = Path(ledger["archives"]["entry-0"]["archive"]).name
     sidecar = root / "archives" / "train" / f"{first_name}.sha256"
     sidecar.write_text(f"{'0' * 64}  {first_name}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="SHA sidecar"):
+        load_archive_catalog(root)
+
+
+def test_catalog_rejects_tampered_active_detection_config(tmp_path: Path) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    manifest_path = root / "metadata" / "derived_detection_classes.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["detection_config"]["min_component_pixels"] = 101
+    _write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="config SHA-256"):
+        load_archive_catalog(root)
+
+
+def test_catalog_rejects_invalid_active_package_provenance(tmp_path: Path) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    ledger_path = root / "archive_manifest.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["archives"]["entry-0"]["package_sha256"] = "0" * 64
+    _write_json(ledger_path, ledger)
+
+    with pytest.raises(ValueError, match="invalid package_sha256"):
+        load_archive_catalog(root)
+
+
+def test_catalog_rejects_sidecar_package_provenance_mismatch(tmp_path: Path) -> None:
+    root, _ = _catalog_fixture(tmp_path)
+    ledger = json.loads((root / "archive_manifest.json").read_text(encoding="utf-8"))
+    entry = ledger["archives"]["entry-0"]
+    archive_name = Path(entry["archive"]).name
+    sidecar_path = root / "archives" / "train" / f"{archive_name}.manifest.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["entry"]["detection_config_sha256"] = _sha("foreign-config")
+    _write_json(sidecar_path, sidecar)
+
+    with pytest.raises(ValueError, match="detection_config_sha256"):
         load_archive_catalog(root)
 
 
@@ -187,7 +315,13 @@ def test_group_split_is_session_stable_excludes_test_and_is_immutable(tmp_path: 
 
 
 def _joint_manifest_bytes(
-    *, split: str, session_id: str, sensor: str, selection_sha: str, frames: int = 1
+    *,
+    split: str,
+    session_id: str,
+    sensor: str,
+    selection_sha: str,
+    detection_config_sha: str = _DETECTION_CONFIG_SHA,
+    frames: int = 1,
 ) -> bytes:
     samples = [
         {
@@ -210,9 +344,14 @@ def _joint_manifest_bytes(
             "official_split": split,
             "session_id": session_id,
             "sensor": sensor,
+            "annotation_policy": _ANNOTATION_POLICY,
             "selection_sha256": selection_sha,
             "joint_frames": frames,
             "samples": samples,
+            "detection": {
+                "derived": True,
+                "config_sha256": detection_config_sha,
+            },
         }
     ).encode()
 
@@ -244,7 +383,10 @@ def _write_tar_archive(
         split=split,
         session_id=session_id,
         sensor=sensor,
+        annotation_policy=_ANNOTATION_POLICY,
         selection_sha256=selection_sha,
+        detection_config_sha256=_DETECTION_CONFIG_SHA,
+        package_sha256=_package_sha(selection_sha),
         archive_path=path.resolve(),
         archive_bytes=path.stat().st_size,
         archive_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -351,7 +493,10 @@ def _fake_records(tmp_path: Path) -> tuple[SanpoArchiveRecord, ...]:
                 split="train",
                 session_id=f"session-{index}",
                 sensor="camera_head",
+                annotation_policy=_ANNOTATION_POLICY,
                 selection_sha256=_sha(f"selection-{index}"),
+                detection_config_sha256=_DETECTION_CONFIG_SHA,
+                package_sha256=_package_sha(_sha(f"selection-{index}")),
                 archive_path=path,
                 archive_bytes=path.stat().st_size,
                 archive_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),

@@ -102,11 +102,41 @@ def _record_id(record: "SanpoArchiveRecord") -> dict[str, object]:
         "split": record.split,
         "session_id": record.session_id,
         "sensor": record.sensor,
+        "annotation_policy": record.annotation_policy,
         "selection_sha256": record.selection_sha256,
+        "detection_config_sha256": record.detection_config_sha256,
+        "package_sha256": record.package_sha256,
+        "archive_name": record.archive_path.name,
         "archive_sha256": record.archive_sha256,
         "archive_bytes": record.archive_bytes,
         "joint_frames": record.joint_frames,
     }
+
+
+def _package_sha256(selection_sha256: str, detection_config_sha256: str) -> str:
+    return canonical_json_sha256(
+        {
+            "selection_sha256": selection_sha256,
+            "detection_config_sha256": detection_config_sha256,
+        }
+    )
+
+
+def _active_detection_config_sha256(path: Path) -> str:
+    payload = _read_json_object(path, "active SANPO derived-detection manifest")
+    if payload.get("schema_version") != 2:
+        raise ValueError("unsupported SANPO derived-detection manifest schema")
+    config = payload.get("detection_config")
+    if not isinstance(config, Mapping):
+        raise ValueError("derived-detection manifest has no detection_config")
+    declared = _sha256(
+        payload.get("detection_config_sha256"),
+        "derived-detection detection_config_sha256",
+    )
+    actual = canonical_json_sha256(dict(config))
+    if actual != declared:
+        raise ValueError("derived-detection config SHA-256 does not match its content")
+    return declared
 
 
 @dataclass(frozen=True)
@@ -116,17 +146,26 @@ class SanpoArchiveRecord:
     split: str
     session_id: str
     sensor: str
+    annotation_policy: str
     selection_sha256: str
+    detection_config_sha256: str
+    package_sha256: str
     archive_path: Path
     archive_bytes: int
     archive_sha256: str
     joint_frames: int
 
     @property
-    def key(self) -> tuple[str, str, str, str]:
-        """Return the selection-to-ledger join key."""
+    def selection_key(self) -> tuple[str, str, str, str]:
+        """Return the source-selection identity, excluding derived labels."""
 
         return self.split, self.session_id, self.sensor, self.selection_sha256
+
+    @property
+    def key(self) -> tuple[str, str, str, str, str]:
+        """Return the immutable packaged-shard identity."""
+
+        return (*self.selection_key, self.package_sha256)
 
 
 @dataclass(frozen=True)
@@ -135,6 +174,8 @@ class ArchiveCatalog:
 
     drive_root: Path
     records: tuple[SanpoArchiveRecord, ...]
+    annotation_policy: str
+    detection_config_sha256: str
     catalog_sha256: str
 
     @property
@@ -168,7 +209,13 @@ def _selection_record(raw: object, index: int) -> dict[str, object]:
     }
 
 
-def _ledger_record(raw: object, *, drive_root: Path) -> SanpoArchiveRecord:
+def _ledger_record(
+    raw: object,
+    *,
+    drive_root: Path,
+    expected_annotation_policy: str,
+    expected_detection_config_sha256: str,
+) -> SanpoArchiveRecord:
     if not isinstance(raw, Mapping):
         raise ValueError("archive ledger entry must be a mapping")
     split = raw.get("split")
@@ -178,6 +225,26 @@ def _ledger_record(raw: object, *, drive_root: Path) -> SanpoArchiveRecord:
     if sensor not in _SENSORS:
         raise ValueError("archive ledger entry has an invalid sensor")
     session_id = _identity(raw.get("session_id"), "archive session_id")
+    annotation_policy = _identity(
+        raw.get("annotation_policy"), "archive annotation_policy"
+    )
+    if annotation_policy != expected_annotation_policy:
+        raise ValueError("archive annotation_policy disagrees with selection")
+    selection_sha256 = _sha256(
+        raw.get("selection_sha256"), "archive selection_sha256"
+    )
+    detection_config_sha256 = _sha256(
+        raw.get("detection_config_sha256"),
+        "archive detection_config_sha256",
+    )
+    if detection_config_sha256 != expected_detection_config_sha256:
+        raise ValueError("archive detection config is not the active Drive config")
+    package_sha256 = _sha256(raw.get("package_sha256"), "archive package_sha256")
+    expected_package_sha256 = _package_sha256(
+        selection_sha256, detection_config_sha256
+    )
+    if package_sha256 != expected_package_sha256:
+        raise ValueError("archive package_sha256 does not match its provenance")
     archive_value = raw.get("archive")
     if not isinstance(archive_value, str) or not archive_value:
         raise ValueError("archive ledger path must be a non-empty string")
@@ -197,9 +264,10 @@ def _ledger_record(raw: object, *, drive_root: Path) -> SanpoArchiveRecord:
         split=split,
         session_id=session_id,
         sensor=sensor,
-        selection_sha256=_sha256(
-            raw.get("selection_sha256"), "archive selection_sha256"
-        ),
+        annotation_policy=annotation_policy,
+        selection_sha256=selection_sha256,
+        detection_config_sha256=detection_config_sha256,
+        package_sha256=package_sha256,
         archive_path=archive_path,
         archive_bytes=_positive_int(raw.get("archive_bytes"), "archive_bytes"),
         archive_sha256=_sha256(raw.get("archive_sha256"), "archive_sha256"),
@@ -223,7 +291,10 @@ def _validate_sidecars(record: SanpoArchiveRecord) -> None:
             "split": record.split,
             "session_id": record.session_id,
             "sensor": record.sensor,
+            "annotation_policy": record.annotation_policy,
             "selection_sha256": record.selection_sha256,
+            "detection_config_sha256": record.detection_config_sha256,
+            "package_sha256": record.package_sha256,
             "archive_bytes": record.archive_bytes,
             "archive_sha256": record.archive_sha256,
             "joint_frames": record.joint_frames,
@@ -247,13 +318,17 @@ def load_archive_catalog(
     *,
     selection_path: str | os.PathLike[str] | None = None,
     ledger_path: str | os.PathLike[str] | None = None,
+    detection_manifest_path: str | os.PathLike[str] | None = None,
     validate_sidecars: bool = True,
 ) -> ArchiveCatalog:
-    """Join selection schema 1 to ledger schema 2 and resolve safe paths.
+    """Resolve the active packaged archive for every selected source shard.
 
-    The four-field join key is ``(split, session_id, sensor,
-    selection_sha256)``.  Every selected record must have exactly one ledger
-    match; unrelated historical ledger entries are ignored.
+    ``selection_sha256`` intentionally excludes the derived-box policy, so an
+    append-only ledger may contain several legitimate packages for the same
+    source frames.  The active detection config is pinned by
+    ``metadata/derived_detection_classes.json`` and combined with the selection
+    digest to recover the exact downloader ``package_sha256``.  Historical
+    packages are retained on Drive but ignored here.
     """
 
     root = Path(drive_root).expanduser().resolve()
@@ -267,12 +342,25 @@ def load_archive_catalog(
         if ledger_path is not None
         else root / "archive_manifest.json"
     )
+    detection_manifest_file = (
+        Path(detection_manifest_path).expanduser().resolve()
+        if detection_manifest_path is not None
+        else root / "metadata" / "derived_detection_classes.json"
+    )
     selection = _read_json_object(selection_file, "SANPO download selection")
     ledger = _read_json_object(ledger_file, "SANPO archive ledger")
+    detection_config_sha256 = _active_detection_config_sha256(
+        detection_manifest_file
+    )
     if selection.get("schema_version") != 1:
         raise ValueError("unsupported SANPO download selection schema")
     if ledger.get("schema_version") != 2:
         raise ValueError("unsupported SANPO archive ledger schema")
+    annotation_policy = _identity(
+        selection.get("annotation_policy"), "selection annotation_policy"
+    )
+    if ledger.get("dataset") != f"SANPO-Real-v0-joint-{annotation_policy}":
+        raise ValueError("archive ledger dataset disagrees with selection policy")
     if not isinstance(selection.get("records"), list) or not selection["records"]:
         raise ValueError("SANPO download selection has no records")
     if not isinstance(ledger.get("archives"), Mapping):
@@ -314,18 +402,40 @@ def load_archive_catalog(
         )
         if raw_key not in selected_key_set:
             continue
-        record = _ledger_record(raw, drive_root=root)
-        ledger_by_key.setdefault(record.key, []).append(record)
+        if (
+            raw.get("annotation_policy") != annotation_policy
+            or raw.get("detection_config_sha256") != detection_config_sha256
+        ):
+            continue
+        expected_package = _package_sha256(
+            str(raw.get("selection_sha256")), detection_config_sha256
+        )
+        if raw.get("package_sha256") != expected_package:
+            raise ValueError(
+                "active SANPO ledger entry has an invalid package_sha256"
+            )
+        record = _ledger_record(
+            raw,
+            drive_root=root,
+            expected_annotation_policy=annotation_policy,
+            expected_detection_config_sha256=detection_config_sha256,
+        )
+        ledger_by_key.setdefault(record.selection_key, []).append(record)
 
     joined: list[SanpoArchiveRecord] = []
     for item, key in zip(selected, selected_keys):
         matches = ledger_by_key.get(key, [])
-        if len(matches) != 1:
+        distinct = {
+            canonical_json_sha256(_record_id(record)): record
+            for record in matches
+        }
+        if len(distinct) != 1:
             raise ValueError(
-                "each selected SANPO shard needs exactly one ledger match; "
-                f"found {len(matches)} for {key[:3]}"
+                "each selected SANPO shard needs exactly one active package; "
+                f"found {len(distinct)} for {key[:3]} with detection config "
+                f"{detection_config_sha256[:12]}"
             )
-        record = matches[0]
+        record = next(iter(distinct.values()))
         if record.joint_frames != item["joint_frames"]:
             raise ValueError(f"selection and ledger joint_frames disagree for {key[:3]}")
         if validate_sidecars:
@@ -345,11 +455,15 @@ def load_archive_catalog(
     )
     fingerprint_payload = {
         "schema_version": 1,
+        "annotation_policy": annotation_policy,
+        "detection_config_sha256": detection_config_sha256,
         "records": [_record_id(record) for record in records],
     }
     return ArchiveCatalog(
         drive_root=root,
         records=records,
+        annotation_policy=annotation_policy,
+        detection_config_sha256=detection_config_sha256,
         catalog_sha256=canonical_json_sha256(fingerprint_payload),
     )
 
@@ -630,12 +744,17 @@ class ArchiveMaterializer:
                     "each SANPO archive must contain exactly one _sanpo_joint_manifest.json"
                 )
             manifest, info = load_sanpo_joint_manifest(manifests[0])
+            detection = manifest.get("detection")
             if (
                 info.official_split != self.record.split
                 or info.session_id != self.record.session_id
                 or info.sensor != self.record.sensor
                 or info.sample_count != self.record.joint_frames
+                or manifest.get("annotation_policy") != self.record.annotation_policy
                 or manifest.get("selection_sha256") != self.record.selection_sha256
+                or not isinstance(detection, Mapping)
+                or detection.get("config_sha256")
+                != self.record.detection_config_sha256
             ):
                 raise ValueError("extracted SANPO manifest disagrees with archive catalog")
             return manifests[0]

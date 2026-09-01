@@ -531,6 +531,8 @@ def inspection_payload(
         "context": prepared.context.as_dict(),
         "data": {
             "catalog_records": len(prepared.catalog.records),
+            "annotation_policy": prepared.catalog.annotation_policy,
+            "detection_config_sha256": prepared.catalog.detection_config_sha256,
             "train_archives": len(prepared.split.train_records),
             "val_archives": len(prepared.split.validation_records),
             "official_test_archives_reserved": len(
@@ -886,7 +888,10 @@ def _write_metadata(
                     "split": item.split,
                     "session_id": item.session_id,
                     "sensor": item.sensor,
+                    "annotation_policy": item.annotation_policy,
                     "selection_sha256": item.selection_sha256,
+                    "detection_config_sha256": item.detection_config_sha256,
+                    "package_sha256": item.package_sha256,
                     "archive_name": item.archive_path.name,
                     "archive_bytes": item.archive_bytes,
                     "archive_sha256": item.archive_sha256,

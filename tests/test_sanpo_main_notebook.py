@@ -46,6 +46,7 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
         "VAL_FRACTION = 0.15",
         '"monitor": "val/total"',
         'run_live(["pilot"])',
+        'run_live(["inspect"])',
         "START_MAIN = False",
         "MAIN_APPROVAL_TOKEN",
         'run_live(["train", "--approval-token", MAIN_APPROVAL_TOKEN])',
@@ -58,7 +59,8 @@ def test_main_notebook_has_visible_locked_config_and_one_epoch_gate() -> None:
 def test_main_notebook_delegates_audited_streaming_and_never_downloads() -> None:
     _, source = _source()
     assert "train_sanpo_main.py" in source
-    assert '"inspect", "--config"' in source
+    assert 'run_live(["inspect"])' in source
+    assert "RepLite command failed with exit code" in source
     assert "download_sanpo_real_pilot.py" not in source
     assert "gdown" not in source
     assert "official-test không được mở" in NOTEBOOK.read_text(encoding="utf-8").lower()

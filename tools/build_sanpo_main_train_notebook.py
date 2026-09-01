@@ -231,7 +231,13 @@ cells = [
                     log.write(line)
                 return_code = process.wait()
             if return_code:
-                raise subprocess.CalledProcessError(return_code, command)
+                tail = "\n".join(
+                    CONSOLE_LOG.read_text(encoding="utf-8").splitlines()[-80:]
+                )
+                raise RuntimeError(
+                    f"RepLite command failed with exit code {return_code}. "
+                    f"Full log: {CONSOLE_LOG}\n\n{tail}"
+                )
 
         print("Config:", CONFIG_PATH)
         print("Run Drive:", DRIVE_RUNS_ROOT / RUN_ID)
@@ -241,16 +247,7 @@ cells = [
     code(
         r"""
         #@title 3) Audit 234 archive + freeze split + xem cấu hình/model/parameter (KHÔNG train)
-        import subprocess, sys
-
-        subprocess.run(
-            [
-                sys.executable, "-u", str(REPO_DIR / "tools/train_sanpo_main.py"),
-                "inspect", "--config", str(CONFIG_PATH),
-            ],
-            cwd=REPO_DIR,
-            check=True,
-        )
+        run_live(["inspect"])
         """
     ),
     markdown(
