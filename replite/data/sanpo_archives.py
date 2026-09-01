@@ -124,8 +124,18 @@ def _package_sha256(selection_sha256: str, detection_config_sha256: str) -> str:
 
 def _active_detection_config_sha256(path: Path) -> str:
     payload = _read_json_object(path, "active SANPO derived-detection manifest")
-    if payload.get("schema_version") != 2:
-        raise ValueError("unsupported SANPO derived-detection manifest schema")
+    schema_version = payload.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version < 1
+    ):
+        raise ValueError(
+            "derived-detection manifest schema_version must be a positive integer"
+        )
+    # The downloader has used more than one wrapper schema.  Package selection
+    # depends only on these two structurally validated fields, not on the
+    # wrapper version, so compatible old/new manifests remain reproducible.
     config = payload.get("detection_config")
     if not isinstance(config, Mapping):
         raise ValueError("derived-detection manifest has no detection_config")

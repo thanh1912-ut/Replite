@@ -235,6 +235,22 @@ def test_catalog_rejects_tampered_active_detection_config(tmp_path: Path) -> Non
         load_archive_catalog(root)
 
 
+@pytest.mark.parametrize("schema_version", [1, 3])
+def test_catalog_accepts_structurally_compatible_detection_manifest_versions(
+    tmp_path: Path, schema_version: int
+) -> None:
+    root, specifications = _catalog_fixture(tmp_path)
+    manifest_path = root / "metadata" / "derived_detection_classes.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = schema_version
+    _write_json(manifest_path, manifest)
+
+    catalog = load_archive_catalog(root)
+
+    assert len(catalog.records) == len(specifications)
+    assert catalog.detection_config_sha256 == _DETECTION_CONFIG_SHA
+
+
 def test_catalog_rejects_invalid_active_package_provenance(tmp_path: Path) -> None:
     root, _ = _catalog_fixture(tmp_path)
     ledger_path = root / "archive_manifest.json"
