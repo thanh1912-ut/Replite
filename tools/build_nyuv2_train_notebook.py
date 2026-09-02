@@ -78,7 +78,7 @@ def build_notebook() -> dict[str, object]:
             drive.mount("/content/drive")
 
             REPO_URL = "https://github.com/thanh1912-ut/Replite.git"
-            REPO_REF = "8811440d23fda2dc6db1c9dddb80c870f6654d06"  #@param {type:"string"}
+            REPO_REF = "4de808842aa088001e0476fc1f1fb556853e37ac"  #@param {type:"string"}
             REPO_DIR = Path("/content/Replite")
 
             if not (REPO_DIR / ".git").is_dir():

@@ -44,7 +44,7 @@ def test_nyuv2_notebook_is_clean_generated_and_compiles() -> None:
 def test_nyuv2_notebook_locks_archive_schema_and_static_input() -> None:
     _, source, all_source = _sources()
     for marker in (
-        'REPO_REF = "8811440d23fda2dc6db1c9dddb80c870f6654d06"',
+        'REPO_REF = "4de808842aa088001e0476fc1f1fb556853e37ac"',
         'ARCHIVE_PATH = Path("/content/drive/MyDrive/datasets/NYUDv2/NYUDv2.tar.gz")',
         'ARCHIVE_DRIVE_FILE_ID = "14EAEMXmd3zs2hIMY63UhHPSFPDAkiTzw"',
         "ARCHIVE_EXPECTED_BYTES = 4_215_751_725",
