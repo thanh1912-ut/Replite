@@ -499,6 +499,35 @@ class MultiTaskCriterion(nn.Module):
             checked_weights[task] = float(value)
         self.task_weights = checked_weights
 
+    @property
+    def resolved_task_weights(self) -> dict[str, float]:
+        """Return all task weights, including explicit unit defaults.
+
+        A copy is returned so checkpoint/log metadata cannot accidentally
+        mutate the criterion used by an active training run.
+        """
+
+        return dict(self.task_weights)
+
+    @property
+    def loss_metadata(self) -> dict[str, Any]:
+        """JSON-serializable, resolved loss configuration for run manifests."""
+
+        return {
+            "schema_version": 1,
+            "criterion": "replite_multitask",
+            "task_weights": self.resolved_task_weights,
+            "segmentation_ignore_index": self.segmentation_ignore_index,
+            "classification_ignore_index": self.classification_ignore_index,
+            "depth": {
+                "loss_type": self.depth_loss_type,
+                "min": self.depth_min,
+                "max": self.depth_max,
+                "log_l1_weight": self.depth_log_l1_weight,
+                "silog_weight": self.depth_silog_weight,
+            },
+        }
+
     @staticmethod
     def _require_target(targets: Mapping[str, Any], task: str) -> Any:
         if task not in targets:

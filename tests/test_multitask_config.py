@@ -27,6 +27,36 @@ def test_dense_fusion_requires_both_dense_tasks() -> None:
     assert not segmentation_only.uses_dense_fusion
 
 
+def test_directional_dense_fusion_config_is_serialized_and_subset_stable() -> None:
+    tasks = TaskConfig(
+        segmentation_classes=4,
+        depth=True,
+        dense_fusion_direction="seg_to_depth",
+        dense_fusion_detach_source=True,
+    )
+    payload = RepLiteConfig(tasks=tasks).as_dict()["tasks"]
+
+    assert payload["dense_fusion_direction"] == "seg_to_depth"
+    assert payload["dense_fusion_detach_source"] is True
+    subset = tasks.subset(["depth"])
+    assert subset.dense_fusion_direction == "seg_to_depth"
+    assert subset.dense_fusion_detach_source is True
+    assert not subset.uses_dense_fusion
+
+
+def test_legacy_task_config_payload_keeps_bidirectional_defaults() -> None:
+    legacy_payload = {
+        "segmentation_classes": 4,
+        "depth": True,
+        "gated_dense_fusion": True,
+    }
+
+    tasks = TaskConfig(**legacy_payload)
+
+    assert tasks.dense_fusion_direction == "bidirectional"
+    assert tasks.dense_fusion_detach_source is False
+
+
 def test_task_subset_preserves_only_requested_head_metadata() -> None:
     config = RepLiteConfig(
         tasks=TaskConfig(
@@ -68,6 +98,16 @@ def test_config_is_json_serializable_and_immutable() -> None:
         {"classification_classes": -1},
         {"depth": 1},
         {"gated_dense_fusion": 1, "depth": True},
+        {
+            "segmentation_classes": 2,
+            "depth": True,
+            "dense_fusion_direction": "sideways",
+        },
+        {
+            "segmentation_classes": 2,
+            "depth": True,
+            "dense_fusion_detach_source": 1,
+        },
     ],
 )
 def test_task_config_rejects_empty_or_invalid_tasks(kwargs) -> None:

@@ -66,6 +66,7 @@ from .snapshot import (
     publish_epoch_snapshot,
     restore_latest_snapshot,
 )
+from .sampling import BalancedBatchSampler, balanced_batch_sizes
 from .trainer import Trainer, TrainerConfig, move_to_device
 
 __all__ = [
@@ -73,6 +74,7 @@ __all__ = [
     "DEFAULT_STRIDES",
     "CheckpointIntegrityError",
     "CheckpointManager",
+    "BalancedBatchSampler",
     "ClassificationMetrics",
     "DepthMetrics",
     "DetectionCriterion",
@@ -100,6 +102,7 @@ __all__ = [
     "WarmupCosineScheduler",
     "YoloProgressReporter",
     "assign_fcos_targets",
+    "balanced_batch_sizes",
     "box_iou",
     "build_adamw_param_groups",
     "capture_rng_state",

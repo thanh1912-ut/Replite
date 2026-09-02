@@ -120,6 +120,76 @@ def test_dense_cross_task_fusion_is_physically_optional() -> None:
     )
 
 
+def test_seg_to_depth_mode_protects_segmentation_and_prunes_reverse_branch() -> None:
+    tasks = TaskConfig(
+        segmentation_classes=2,
+        depth=True,
+        dense_fusion_direction="seg_to_depth",
+        dense_fusion_detach_source=True,
+    )
+    model = RepLiteMultiTaskModel(
+        _config("mobilenetv3_small_050", tasks)
+    ).eval()
+    assert model.dense_fusion.uses_seg_to_depth
+    assert not model.dense_fusion.uses_depth_to_seg
+
+    images = torch.randn(1, 3, 64, 96)
+    with torch.no_grad():
+        model.dense_fusion.seg_to_depth_scale.fill_(1.0)
+        before = model(images).segmentation
+        for parameter in model.depth_adapter.parameters():
+            parameter.add_(torch.randn_like(parameter))
+        after = model(images).segmentation
+
+    torch.testing.assert_close(after, before, rtol=0.0, atol=0.0)
+
+
+def test_directional_joint_model_has_no_disconnected_parameters() -> None:
+    tasks = TaskConfig(
+        segmentation_classes=2,
+        depth=True,
+        dense_fusion_direction="seg_to_depth",
+        dense_fusion_detach_source=True,
+    )
+    model = RepLiteMultiTaskModel(
+        _config("mobilenetv3_small_050", tasks)
+    ).train()
+    output = model(torch.randn(2, 3, 64, 96))
+    assert output.segmentation is not None
+    assert output.depth is not None
+
+    (output.segmentation.mean() + output.depth.mean()).backward()
+
+    missing = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert not missing, f"parameters disconnected from joint loss: {missing}"
+
+
+def test_directional_exports_keep_only_output_dependencies() -> None:
+    tasks = TaskConfig(
+        segmentation_classes=2,
+        depth=True,
+        dense_fusion_direction="seg_to_depth",
+        dense_fusion_detach_source=True,
+    )
+    model = RepLiteMultiTaskModel(
+        _config("mobilenetv3_small_050", tasks)
+    ).eval()
+
+    segmentation = model.export_task("segmentation")._task_model
+    depth = model.export_task("depth")._task_model
+
+    assert not hasattr(segmentation, "dense_fusion")
+    assert not hasattr(segmentation, "depth_adapter")
+    assert hasattr(depth, "dense_fusion")
+    assert hasattr(depth, "segmentation_adapter")
+    assert depth.dense_fusion.uses_seg_to_depth
+    assert not depth.dense_fusion.uses_depth_to_seg
+
+
 def test_static_refinement_runs_backbone_once_and_matches_repeated_clip() -> None:
     model = RepLiteMultiTaskModel(
         _config(

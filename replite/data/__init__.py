@@ -1,5 +1,18 @@
 """Dataset adapters and target conversion helpers."""
 
+from .nyuv2 import (
+    NYUV2_IMAGE_SIZE,
+    Nyuv2Augmentation,
+    Nyuv2Dataset,
+    Nyuv2Index,
+    Nyuv2Sample,
+    discover_nyuv2,
+    nyuv2_collate,
+    read_nyuv2_depth,
+    read_nyuv2_segmentation,
+    scan_nyuv2_label_ids,
+)
+
 from .sanpo_archives import (
     ArchiveCatalog,
     ArchiveGroupSplit,
@@ -39,6 +52,7 @@ from .sanpo_joint import (
 )
 
 __all__ = [
+    "NYUV2_IMAGE_SIZE",
     "ArchiveCatalog",
     "ArchiveGroupSplit",
     "ArchiveMaterializer",
@@ -55,6 +69,10 @@ __all__ = [
     "SANPO_SEGMENTATION_IGNORE_INDEX",
     "IMAGENET_RGB_MEAN",
     "IMAGENET_RGB_STD",
+    "Nyuv2Augmentation",
+    "Nyuv2Dataset",
+    "Nyuv2Index",
+    "Nyuv2Sample",
     "SanpoComponent",
     "SanpoArchiveRecord",
     "SanpoJointDataset",
@@ -63,11 +81,16 @@ __all__ = [
     "canonical_json_sha256",
     "create_or_load_group_split",
     "decode_sanpo_panoptic",
+    "discover_nyuv2",
     "extract_sanpo_components",
     "load_archive_catalog",
     "load_sanpo_detection",
     "load_sanpo_joint_manifest",
+    "nyuv2_collate",
+    "read_nyuv2_depth",
+    "read_nyuv2_segmentation",
     "read_sanpo_depth",
     "sanpo_joint_collate",
     "sanpo_panoptic_to_detection",
+    "scan_nyuv2_label_ids",
 ]

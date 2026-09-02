@@ -14,6 +14,7 @@ from replite.multitask.model import RepLiteMultiTaskModel
 from replite.training.checkpoint import CheckpointManager
 from replite.training.losses import MultiTaskCriterion
 from replite.training.logging import TrainingLogger
+from replite.training.sampling import BalancedBatchSampler, balanced_batch_sizes
 from replite.training.trainer import Trainer, TrainerConfig, move_to_device
 
 
@@ -77,6 +78,111 @@ def test_short_final_accumulation_window_is_normalized_by_actual_size() -> None:
     assert trainer.global_step == 2
     assert scheduler.steps == 2
     assert model.weight.grad is None
+
+
+def test_unequal_microbatches_and_epoch_losses_are_sample_weighted() -> None:
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        TrainerConfig(
+            epochs=1,
+            grad_accum_steps=2,
+            amp=False,
+            grad_clip_norm=None,
+        ),
+        device="cpu",
+    )
+    batches = [
+        (
+            torch.ones(2, 1, 1, 1),
+            torch.tensor([1.0, 1.0]),
+        ),
+        (
+            torch.ones(1, 1, 1, 1),
+            torch.tensor([3.0]),
+        ),
+    ]
+    result = trainer.train_epoch(batches, epoch=0)
+
+    # Combined mean loss is (1 + 1 + 9) / 3.  Its gradient at w=0 is
+    # (-2 - 2 - 6) / 3, so SGD(lr=.1) reaches exactly 1/3.
+    assert result["total"] == pytest.approx(11.0 / 3.0)
+    assert model.weight.item() == pytest.approx(1.0 / 3.0)
+
+    validation_model = ScalarModel()
+    validation = Trainer(
+        validation_model,
+        MSECriterion(),
+        torch.optim.SGD(validation_model.parameters(), lr=0.1),
+        TrainerConfig(epochs=1, amp=False),
+        device="cpu",
+    )
+    assert validation.validate(batches)["total"] == pytest.approx(11.0 / 3.0)
+
+
+def test_balanced_batch_sampler_uses_all_samples_without_singleton_tail() -> None:
+    sizes = balanced_batch_sizes(1809, 16)
+    assert len(sizes) == 114
+    assert sum(sizes) == 1809
+    assert min(sizes) == 15
+    assert max(sizes) == 16
+
+    sampler = BalancedBatchSampler(1809, 16, shuffle=True, seed=42)
+    epoch_zero = list(sampler)
+    assert [len(batch) for batch in epoch_zero] == list(sizes)
+    assert sorted(index for batch in epoch_zero for index in batch) == list(range(1809))
+    assert list(sampler) == epoch_zero
+
+    sampler.set_epoch(1)
+    epoch_one = list(sampler)
+    assert epoch_one != epoch_zero
+    assert sorted(index for batch in epoch_one for index in batch) == list(range(1809))
+
+
+def test_trainer_sets_epoch_on_balanced_sampler_and_dataset() -> None:
+    class EpochDataset(torch.utils.data.Dataset):
+        def __init__(self):
+            self.epoch = None
+
+        def __len__(self):
+            return 5
+
+        def __getitem__(self, index):
+            return torch.tensor([[[float(index + 1)]]]), torch.tensor(float(index))
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+    dataset = EpochDataset()
+    sampler = BalancedBatchSampler(dataset, 3, shuffle=True, seed=11)
+    loader = torch.utils.data.DataLoader(dataset, batch_sampler=sampler)
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.01),
+        TrainerConfig(epochs=5, amp=False, grad_clip_norm=None),
+        device="cpu",
+    )
+    trainer.train_epoch(loader, epoch=4)
+    assert dataset.epoch == 4
+    assert sampler.epoch == 4
+
+
+@pytest.mark.parametrize(
+    ("num_samples", "batch_size", "expected"),
+    [
+        (0, 16, ()),
+        (1, 16, (1,)),
+        (16, 16, (16,)),
+        (17, 16, (9, 8)),
+        (31, 16, (16, 15)),
+    ],
+)
+def test_balanced_batch_sizes_edges(num_samples, batch_size, expected) -> None:
+    assert balanced_batch_sizes(num_samples, batch_size) == expected
 
 
 def test_validation_restores_model_mode_and_updates_metric_adapter() -> None:
@@ -241,6 +347,109 @@ def test_fit_can_pause_after_first_campaign_epoch_and_resume_same_config(tmp_pat
     )
     assert [record["epoch"] for record in remainder] == [1, 2]
     assert resumed.start_epoch == 3
+
+
+def test_early_stopping_counter_resumes_exactly_and_saves_stop_boundary(tmp_path) -> None:
+    class ScriptedTrainer(Trainer):
+        def __init__(self, *args, validation_losses, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.validation_losses = validation_losses
+
+        def train_epoch(self, loader, *, epoch):
+            del loader, epoch
+            self.global_step += 1
+            return {"total": 1.0}
+
+        def validate(self, loader, *, epoch=None):
+            del loader
+            assert epoch is not None
+            return {"total": self.validation_losses[epoch]}
+
+    losses = [1.0, 1.1, 1.2, 1.3, 0.5, 0.4]
+    config = TrainerConfig(
+        epochs=6,
+        amp=False,
+        monitor="val/total",
+        early_stopping_patience=3,
+        checkpoint_every_n_epochs=6,
+    )
+    manager = CheckpointManager(tmp_path)
+    model = ScalarModel()
+    first = ScriptedTrainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        config,
+        validation_losses=losses,
+        device="cpu",
+        checkpoint_manager=manager,
+    )
+    first_history = first.fit([_batch(1, 1)], [_batch(1, 1)], stop_after_epoch=2)
+    assert [record["epoch"] for record in first_history] == [0, 1]
+    assert first.early_stopping_bad_epochs == 1
+    assert not first.early_stopping_triggered
+    assert manager.last_path.is_file()
+    assert (tmp_path / "best.pt").is_file()
+
+    resumed_model = ScalarModel()
+    resumed = ScriptedTrainer(
+        resumed_model,
+        MSECriterion(),
+        torch.optim.SGD(resumed_model.parameters(), lr=0.1),
+        config,
+        validation_losses=losses,
+        device="cpu",
+        checkpoint_manager=manager,
+    )
+    state = resumed.resume()
+    assert state.next_epoch == 2
+    assert resumed.early_stopping_bad_epochs == 1
+    assert not resumed.early_stopping_triggered
+
+    remainder = resumed.fit([_batch(1, 1)], [_batch(1, 1)])
+    assert [record["epoch"] for record in remainder] == [2, 3]
+    assert remainder[-1]["early_stopping"]["triggered"] is True
+    assert resumed.start_epoch == 4
+    assert resumed.early_stopping_bad_epochs == 3
+    assert resumed.early_stopping_triggered
+
+    terminal_model = ScalarModel()
+    terminal = ScriptedTrainer(
+        terminal_model,
+        MSECriterion(),
+        torch.optim.SGD(terminal_model.parameters(), lr=0.1),
+        config,
+        validation_losses=losses,
+        device="cpu",
+        checkpoint_manager=manager,
+    )
+    terminal_state = terminal.resume()
+    assert terminal_state.next_epoch == 4
+    assert terminal.early_stopping_bad_epochs == 3
+    assert terminal.early_stopping_triggered
+    assert terminal.fit([_batch(1, 1)], [_batch(1, 1)]) == []
+
+
+def test_early_stopping_requires_validation_and_honors_min_delta() -> None:
+    config = TrainerConfig(
+        epochs=2,
+        amp=False,
+        early_stopping_patience=1,
+        early_stopping_min_delta=0.1,
+    )
+    model = ScalarModel()
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        config,
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="validation loader"):
+        trainer.fit([_batch(1, 1)])
+    trainer.best_metrics[config.monitor] = 1.0
+    assert not trainer._is_better(0.95)
+    assert trainer._is_better(0.89)
 
 
 def test_resume_rejects_checkpoint_context_before_mutating_model(tmp_path) -> None:

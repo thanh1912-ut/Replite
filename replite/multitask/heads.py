@@ -395,7 +395,10 @@ class ResidualGatedFusion(nn.Module):
     Both cross-task residuals are calculated from the *pre-fusion* features.
     The two learnable residual scales start at zero, making the initialized
     module an exact identity while still allowing each direction to turn on
-    independently during optimization.
+    independently during optimization. ``direction`` can physically remove a
+    cross-task branch, avoiding dormant parameters in directional ablations.
+    ``detach_source`` blocks gradients into the source task adapter while the
+    gated projection itself remains trainable.
     """
 
     def __init__(
@@ -404,6 +407,8 @@ class ResidualGatedFusion(nn.Module):
         depth_channels: int | None = None,
         hidden_channels: int | None = None,
         enabled: bool = True,
+        direction: str = "bidirectional",
+        detach_source: bool = False,
     ) -> None:
         super().__init__()
         self.seg_channels = _positive_int(seg_channels, "seg_channels")
@@ -419,20 +424,39 @@ class ResidualGatedFusion(nn.Module):
         )
         if not isinstance(enabled, bool):
             raise ValueError("enabled must be a boolean")
+        if direction not in {"bidirectional", "seg_to_depth", "depth_to_seg"}:
+            raise ValueError(
+                "direction must be 'bidirectional', 'seg_to_depth', or "
+                "'depth_to_seg'"
+            )
+        if not isinstance(detach_source, bool):
+            raise ValueError("detach_source must be a boolean")
         self.enabled = enabled
+        self.direction = direction
+        self.detach_source = detach_source
 
-        self.depth_to_seg = _GatedCrossProjection(
-            self.depth_channels,
-            self.seg_channels,
-            hidden_channels,
-        )
-        self.seg_to_depth = _GatedCrossProjection(
-            self.seg_channels,
-            self.depth_channels,
-            hidden_channels,
-        )
-        self.depth_to_seg_scale = nn.Parameter(torch.zeros(()))
-        self.seg_to_depth_scale = nn.Parameter(torch.zeros(()))
+        if direction in {"bidirectional", "depth_to_seg"}:
+            self.depth_to_seg = _GatedCrossProjection(
+                self.depth_channels,
+                self.seg_channels,
+                hidden_channels,
+            )
+            self.depth_to_seg_scale = nn.Parameter(torch.zeros(()))
+        if direction in {"bidirectional", "seg_to_depth"}:
+            self.seg_to_depth = _GatedCrossProjection(
+                self.seg_channels,
+                self.depth_channels,
+                hidden_channels,
+            )
+            self.seg_to_depth_scale = nn.Parameter(torch.zeros(()))
+
+    @property
+    def uses_depth_to_seg(self) -> bool:
+        return hasattr(self, "depth_to_seg")
+
+    @property
+    def uses_seg_to_depth(self) -> bool:
+        return hasattr(self, "seg_to_depth")
 
     def _validate_inputs(
         self,
@@ -468,9 +492,10 @@ class ResidualGatedFusion(nn.Module):
         """Apply only the depth-to-segmentation residual direction."""
 
         self._validate_inputs(seg_features, depth_features)
-        if not self._use_fusion(enabled):
+        if not self._use_fusion(enabled) or not self.uses_depth_to_seg:
             return seg_features
-        seg_delta = self.depth_to_seg(depth_features)
+        source = depth_features.detach() if self.detach_source else depth_features
+        seg_delta = self.depth_to_seg(source)
         return seg_features + self.depth_to_seg_scale * seg_delta
 
     def forward_depth(
@@ -483,9 +508,10 @@ class ResidualGatedFusion(nn.Module):
         """Apply only the segmentation-to-depth residual direction."""
 
         self._validate_inputs(seg_features, depth_features)
-        if not self._use_fusion(enabled):
+        if not self._use_fusion(enabled) or not self.uses_seg_to_depth:
             return depth_features
-        depth_delta = self.seg_to_depth(seg_features)
+        source = seg_features.detach() if self.detach_source else seg_features
+        depth_delta = self.seg_to_depth(source)
         return depth_features + self.seg_to_depth_scale * depth_delta
 
     def forward(
@@ -499,12 +525,19 @@ class ResidualGatedFusion(nn.Module):
         if not self._use_fusion(enabled):
             return seg_features, depth_features
 
-        # Compute both deltas before either residual is applied.  Keeping these
-        # expressions separate makes accidental circular/sequential fusion hard.
-        seg_delta = self.depth_to_seg(depth_features)
-        depth_delta = self.seg_to_depth(seg_features)
-        fused_seg = seg_features + self.depth_to_seg_scale * seg_delta
-        fused_depth = depth_features + self.seg_to_depth_scale * depth_delta
+        # Each direction consumes the pre-fusion tensors. Calling the
+        # direction-specific functions independently makes circular/sequential
+        # fusion impossible and cleanly supports physically pruned branches.
+        fused_seg = self.forward_segmentation(
+            seg_features,
+            depth_features,
+            enabled=True,
+        )
+        fused_depth = self.forward_depth(
+            seg_features,
+            depth_features,
+            enabled=True,
+        )
         return fused_seg, fused_depth
 
 

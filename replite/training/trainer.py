@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import Any
 
@@ -55,6 +55,8 @@ class TrainerConfig:
     checkpoint_every_n_epochs: int = 1
     monitor: str = "val/total"
     monitor_mode: str = "min"
+    early_stopping_patience: int | None = None
+    early_stopping_min_delta: float = 0.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -82,6 +84,21 @@ class TrainerConfig:
             raise ValueError("monitor must be a non-empty string")
         if self.monitor_mode not in {"min", "max"}:
             raise ValueError("monitor_mode must be 'min' or 'max'")
+        if self.early_stopping_patience is not None and (
+            isinstance(self.early_stopping_patience, bool)
+            or not isinstance(self.early_stopping_patience, Integral)
+            or self.early_stopping_patience <= 0
+        ):
+            raise ValueError("early_stopping_patience must be a positive integer or None")
+        if (
+            isinstance(self.early_stopping_min_delta, bool)
+            or not isinstance(self.early_stopping_min_delta, Real)
+            or not math.isfinite(float(self.early_stopping_min_delta))
+            or float(self.early_stopping_min_delta) < 0.0
+        ):
+            raise ValueError("early_stopping_min_delta must be finite and non-negative")
+        if self.early_stopping_patience is not None and not self.monitor.startswith("val/"):
+            raise ValueError("early stopping requires a validation monitor beginning with 'val/'")
 
 
 def _split_batch(batch: Any) -> tuple[Tensor, Any]:
@@ -223,6 +240,8 @@ class Trainer:
         self.start_epoch = 0
         self.amp_skip_count = 0
         self.best_metrics: dict[str, float] = {}
+        self.early_stopping_bad_epochs = 0
+        self.early_stopping_triggered = False
 
     def _emit(self, event: str, **payload: Any) -> None:
         if self.event_callback is not None:
@@ -264,12 +283,12 @@ class Trainer:
             if parameter.grad is not None:
                 parameter.grad.div_(float(divisor))
 
-    def _optimizer_step(self, microbatches: int) -> tuple[bool, Tensor | None]:
-        if microbatches <= 0:
-            raise RuntimeError("optimizer step requires accumulated gradients")
+    def _optimizer_step(self, accumulated_samples: int) -> tuple[bool, Tensor | None]:
+        if accumulated_samples <= 0:
+            raise RuntimeError("optimizer step requires accumulated samples")
         if self.amp_enabled:
             self.scaler.unscale_(self.optimizer)
-        self._divide_gradients(microbatches)
+        self._divide_gradients(accumulated_samples)
         grad_norm: Tensor | None = None
         if self.config.grad_clip_norm is not None:
             norm = clip_grad_norm_(self.model.parameters(), float(self.config.grad_clip_norm))
@@ -315,9 +334,26 @@ class Trainer:
     def train_epoch(self, loader: Any, *, epoch: int) -> dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
+        # DistributedSampler and BalancedBatchSampler both use this standard
+        # hook.  Deriving sampler order from the campaign epoch makes a clean
+        # epoch-boundary resume reproduce the uninterrupted ordering.
+        seen_epoch_aware: set[int] = set()
+        for epoch_aware in (
+            getattr(loader, "batch_sampler", None),
+            getattr(loader, "sampler", None),
+            getattr(loader, "dataset", None),
+        ):
+            if epoch_aware is None or id(epoch_aware) in seen_epoch_aware:
+                continue
+            seen_epoch_aware.add(id(epoch_aware))
+            set_epoch = getattr(epoch_aware, "set_epoch", None)
+            if callable(set_epoch):
+                set_epoch(epoch)
         sums: dict[str, float] = {}
         batches = 0
+        samples = 0
         microbatches = 0
+        accumulated_samples = 0
         try:
             total_batches = len(loader)
         except TypeError:
@@ -338,21 +374,33 @@ class Trainer:
                 total, losses = _loss_mapping(self.criterion(outputs, targets))
             if not total.requires_grad:
                 raise RuntimeError("training loss is disconnected from the model graph")
-            self.scaler.scale(total).backward() if self.amp_enabled else total.backward()
+            batch_size = int(inputs.shape[0])
+            # Criteria return a mean loss.  Accumulate its sample sum, then
+            # divide gradients by the exact number of samples at the optimizer
+            # boundary.  Unequal microbatches therefore cannot overweight a
+            # short tail.
+            sample_sum_loss = total * batch_size
+            if self.amp_enabled:
+                self.scaler.scale(sample_sum_loss).backward()
+            else:
+                sample_sum_loss.backward()
             microbatches += 1
+            accumulated_samples += batch_size
             batches += 1
+            samples += batch_size
             current_losses = _loss_scalars(losses)
             for name, scalar in current_losses.items():
-                sums[name] = sums.get(name, 0.0) + scalar
+                sums[name] = sums.get(name, 0.0) + scalar * batch_size
             is_last = total_batches is not None and batch_index + 1 == total_batches
             boundary = microbatches == self.config.grad_accum_steps or is_last
             if boundary:
-                stepped, grad_norm = self._optimizer_step(microbatches)
+                stepped, grad_norm = self._optimizer_step(accumulated_samples)
                 microbatches = 0
+                accumulated_samples = 0
                 if not stepped:
                     self._log_amp_overflow_skip(epoch=epoch, batch_index=batch_index)
                 if stepped and self.logger is not None and self.global_step % self.config.log_every_n_steps == 0:
-                    metrics = {f"loss/{name}": value / batches for name, value in sums.items()}
+                    metrics = {f"loss/{name}": value / samples for name, value in sums.items()}
                     metrics.update(
                         {f"lr/group_{index}": float(group["lr"]) for index, group in enumerate(self.optimizer.param_groups)}
                     )
@@ -378,7 +426,7 @@ class Trainer:
                 batches_completed=batches,
                 total_batches=total_batches,
                 losses=current_losses,
-                running_losses={name: value / batches for name, value in sums.items()},
+                running_losses={name: value / samples for name, value in sums.items()},
                 global_step=self.global_step,
                 amp_skip_count=self.amp_skip_count,
                 lr=[float(group["lr"]) for group in self.optimizer.param_groups],
@@ -390,17 +438,18 @@ class Trainer:
                 **batch_summary,
             )
         if microbatches:
-            stepped, _ = self._optimizer_step(microbatches)
+            stepped, _ = self._optimizer_step(accumulated_samples)
             if not stepped:
                 self._log_amp_overflow_skip(epoch=epoch, batch_index=batch_index)
         if batches == 0:
             raise ValueError("training loader is empty")
-        result = {name: value / batches for name, value in sums.items()}
+        result = {name: value / samples for name, value in sums.items()}
         self._emit(
             "train_epoch_end",
             epoch=epoch,
             total_epochs=self.config.epochs,
             batches=batches,
+            samples=samples,
             result=result,
             global_step=self.global_step,
             amp_skip_count=self.amp_skip_count,
@@ -417,6 +466,7 @@ class Trainer:
             reset()
         sums: dict[str, float] = {}
         batches = 0
+        samples = 0
         try:
             total_batches = len(loader)
         except TypeError:
@@ -437,8 +487,9 @@ class Trainer:
                     with self._autocast():
                         outputs = self.model(inputs)
                         _, losses = _loss_mapping(self.criterion(outputs, targets))
+                    batch_size = int(inputs.shape[0])
                     for name, scalar in _loss_scalars(losses).items():
-                        sums[name] = sums.get(name, 0.0) + scalar
+                        sums[name] = sums.get(name, 0.0) + scalar * batch_size
                     if self.validation_metrics is not None:
                         metric_targets = targets
                         # Detection metrics retain targets on CPU for the full
@@ -455,6 +506,7 @@ class Trainer:
                             metric_targets["detection"] = host_targets["detection"]
                         self.validation_metrics.update(outputs, metric_targets)
                     batches += 1
+                    samples += batch_size
                     self._emit(
                         "validation_batch_end",
                         epoch=epoch,
@@ -466,7 +518,7 @@ class Trainer:
             self.model.train(was_training)
         if batches == 0:
             raise ValueError("validation loader is empty")
-        result: dict[str, Any] = {name: value / batches for name, value in sums.items()}
+        result: dict[str, Any] = {name: value / samples for name, value in sums.items()}
         if self.validation_metrics is not None:
             computed = self.validation_metrics.compute()
             if not isinstance(computed, Mapping):
@@ -512,8 +564,17 @@ class Trainer:
         self.global_step = state.global_step
         self.best_metrics = dict(state.best_metrics)
         self.amp_skip_count = int(state.extra.get("amp_skip_count", 0))
+        self.early_stopping_bad_epochs = int(
+            state.extra.get("early_stopping_bad_epochs", 0)
+        )
+        self.early_stopping_triggered = bool(
+            state.extra.get("early_stopping_triggered", False)
+        )
         if self.logger is not None:
-            resume_metrics = {"amp_skip_count": self.amp_skip_count}
+            resume_metrics = {
+                "amp_skip_count": self.amp_skip_count,
+                "early_stopping_bad_epochs": self.early_stopping_bad_epochs,
+            }
             if self.amp_enabled:
                 resume_metrics["amp_scale"] = float(self.scaler.get_scale())
             self.logger.log(
@@ -529,7 +590,10 @@ class Trainer:
         previous = self.best_metrics.get(self.config.monitor)
         if previous is None:
             return True
-        return value < previous if self.config.monitor_mode == "min" else value > previous
+        delta = float(self.config.early_stopping_min_delta)
+        if self.config.monitor_mode == "min":
+            return value < previous - delta
+        return value > previous + delta
 
     def fit(
         self,
@@ -565,6 +629,13 @@ class Trainer:
             raise ValueError(
                 "stop_after_epoch precedes the next epoch in the resumed state"
             )
+        if self.config.early_stopping_patience is not None and val_loader is None:
+            raise ValueError("early stopping requires a validation loader")
+        if self.early_stopping_triggered:
+            # A checkpoint written at the stopping boundary is terminal for
+            # this exact campaign.  Starting another epoch after resume would
+            # violate early-stopping parity with the uninterrupted run.
+            return []
         history: list[dict[str, Any]] = []
         for epoch in range(self.start_epoch, end_epoch):
             train_result = self.train_epoch(train_loader, epoch=epoch)
@@ -590,6 +661,26 @@ class Trainer:
                 improved = self._is_better(monitored)
                 if improved:
                     self.best_metrics[self.config.monitor] = monitored
+                    self.early_stopping_bad_epochs = 0
+                elif (
+                    val_result is not None
+                    and self.config.early_stopping_patience is not None
+                ):
+                    self.early_stopping_bad_epochs += 1
+            should_stop = bool(
+                self.config.early_stopping_patience is not None
+                and self.early_stopping_bad_epochs
+                >= self.config.early_stopping_patience
+            )
+            if should_stop:
+                self.early_stopping_triggered = True
+                record["early_stopping"] = {
+                    "triggered": True,
+                    "bad_epochs": self.early_stopping_bad_epochs,
+                    "patience": self.config.early_stopping_patience,
+                    "monitor": self.config.monitor,
+                    "best": self.best_metrics.get(self.config.monitor),
+                }
             if self.logger is not None:
                 self.logger.log(
                     "epoch_end",
@@ -597,6 +688,20 @@ class Trainer:
                     epoch=epoch,
                     global_step=self.global_step,
                 )
+                if should_stop:
+                    self.logger.log(
+                        "early_stopping",
+                        {
+                            "bad_epochs": float(self.early_stopping_bad_epochs),
+                            "patience": float(self.config.early_stopping_patience),
+                            "best": float(self.best_metrics[self.config.monitor]),
+                            "current": float(combined[self.config.monitor]),
+                        },
+                        epoch=epoch,
+                        global_step=self.global_step,
+                        split="val",
+                        extra={"monitor": self.config.monitor},
+                    )
             if self.checkpoint_manager is not None:
                 checkpoint_kwargs = {
                     "model": self.model,
@@ -612,6 +717,8 @@ class Trainer:
                         **self.checkpoint_extra,
                         "amp_skip_count": self.amp_skip_count,
                         "amp_scale": float(self.scaler.get_scale()),
+                        "early_stopping_bad_epochs": self.early_stopping_bad_epochs,
+                        "early_stopping_triggered": self.early_stopping_triggered,
                     },
                 }
                 if improved:
@@ -619,10 +726,23 @@ class Trainer:
                 if (
                     (epoch + 1) % self.config.checkpoint_every_n_epochs == 0
                     or epoch + 1 == end_epoch
+                    or should_stop
                 ):
                     self.checkpoint_manager.save_last(**checkpoint_kwargs)
             history.append(record)
             self.start_epoch = epoch + 1
+            if should_stop:
+                self._emit(
+                    "early_stopping",
+                    epoch=epoch,
+                    total_epochs=self.config.epochs,
+                    monitor=self.config.monitor,
+                    best=self.best_metrics.get(self.config.monitor),
+                    bad_epochs=self.early_stopping_bad_epochs,
+                    patience=self.config.early_stopping_patience,
+                    global_step=self.global_step,
+                )
+                break
         return history
 
 

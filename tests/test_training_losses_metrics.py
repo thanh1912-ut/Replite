@@ -109,6 +109,16 @@ def test_multitask_criterion_weights_losses_and_requires_active_targets() -> Non
         task_weights={"segmentation": 2.0, "depth": 0.5, "classification": 3.0},
         depth_loss_type="l1",
     )
+    assert criterion.resolved_task_weights == {
+        "detection": 1.0,
+        "segmentation": 2.0,
+        "depth": 0.5,
+        "classification": 3.0,
+    }
+    assert criterion.loss_metadata["task_weights"] == (
+        criterion.resolved_task_weights
+    )
+    assert criterion.loss_metadata["depth"]["loss_type"] == "l1"
     losses = criterion(output, targets)
     expected = (
         2.0 * losses["segmentation"]

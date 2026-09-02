@@ -437,6 +437,36 @@ This is explicitly a 20-session limited-data experiment. Its metrics must not
 be reported as full-corpus SANPO results; the selected session IDs and policy
 are stored in the immutable split manifest and bound into snapshot parity.
 
+## NYUDv2 segmentation + depth training
+
+Use
+[`notebooks/NYUDv2_SegDepth_Train.ipynb`](notebooks/NYUDv2_SegDepth_Train.ipynb)
+for the reproducible NYUDv2 semantic-segmentation and metric-depth campaign.
+The notebook verifies the pinned Drive archive by byte count and SHA-256, then
+extracts it directly to `/content/nyudv2`; it never makes a second 3.93 GiB
+archive copy on the Colab SSD. Inputs are static RGB tensors at 288x384. The
+model uses the ImageNet-1K MobileNetV4-Conv-S backbone, no detection path, and
+40 semantic classes: raw IDs 1--40 map to train IDs 0--39 while raw ID 0 is
+ignored. Depth values use an explicit scale of 1.0 metres.
+
+The joint-task default prevents depth gradients from corrupting the
+segmentation path: dense fusion is one-way `seg_to_depth`, its segmentation
+source is detached for the depth branch, and loss weights are segmentation
+1.0 and depth 0.25. Training uses only light synchronized flip/scale geometry
+plus mild RGB colour jitter. Losses and gradients are sample-weighted, and a
+balanced batch sampler spreads the remainder across batches instead of giving
+a singleton tail batch one full optimizer update.
+
+The official 795-image train list is split deterministically into fit and a
+10% inner-validation subset. `val/total` is the only checkpoint-selection and
+early-stopping signal; patience is 10 validations. The 654-image official
+held-out list is never used for tuning: it is opened exactly once only after
+selection ends and `best.pt` is strict-loaded. Selecting on train loss or the
+official held-out metric would invalidate the benchmark protocol. The notebook
+streams YOLO-style progress, prints an exact `tail -F` command for a Colab
+Terminal, supports exact resume, and keeps checkpoints, split/config
+provenance, history, and final test metrics on Drive.
+
 ## Standalone backbones
 
 Lightweight native-trunk feature backbones for dense prediction:

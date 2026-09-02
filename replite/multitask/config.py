@@ -7,6 +7,11 @@ from typing import Any
 
 
 _TASK_ORDER = ("detection", "segmentation", "depth", "classification")
+_DENSE_FUSION_DIRECTIONS = (
+    "bidirectional",
+    "seg_to_depth",
+    "depth_to_seg",
+)
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -29,6 +34,11 @@ class TaskConfig:
     by a boolean because its output contract is always one positive channel.
     Segmentation covers semantic, lane, drivable-area, or another dense label
     space; callers choose the class count and loss outside the model.
+
+    Dense fusion defaults to the historical bidirectional graph. Directional
+    modes physically keep only one cross-task projection. When
+    ``dense_fusion_detach_source`` is true, the destination task can learn from
+    a source feature without sending its loss gradient into the source adapter.
     """
 
     detection_classes: int | None = None
@@ -36,6 +46,8 @@ class TaskConfig:
     depth: bool = False
     classification_classes: int | None = None
     gated_dense_fusion: bool = True
+    dense_fusion_direction: str = "bidirectional"
+    dense_fusion_detach_source: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -57,6 +69,13 @@ class TaskConfig:
             raise ValueError("depth must be a boolean")
         if not isinstance(self.gated_dense_fusion, bool):
             raise ValueError("gated_dense_fusion must be a boolean")
+        if self.dense_fusion_direction not in _DENSE_FUSION_DIRECTIONS:
+            raise ValueError(
+                "dense_fusion_direction must be 'bidirectional', "
+                "'seg_to_depth', or 'depth_to_seg'"
+            )
+        if not isinstance(self.dense_fusion_detach_source, bool):
+            raise ValueError("dense_fusion_detach_source must be a boolean")
         if not self.active_tasks:
             raise ValueError("at least one task head must be enabled")
 
@@ -116,6 +135,8 @@ class TaskConfig:
                 self.classification_classes if "classification" in selected else None
             ),
             gated_dense_fusion=self.gated_dense_fusion,
+            dense_fusion_direction=self.dense_fusion_direction,
+            dense_fusion_detach_source=self.dense_fusion_detach_source,
         )
 
 

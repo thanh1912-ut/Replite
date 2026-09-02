@@ -216,6 +216,82 @@ def test_gated_fusion_all_parameters_receive_gradients() -> None:
     )
 
 
+@pytest.mark.parametrize("direction", ["seg_to_depth", "depth_to_seg"])
+def test_directional_gated_fusion_physically_prunes_inactive_branch(
+    direction: str,
+) -> None:
+    fusion = ResidualGatedFusion(6, direction=direction)
+
+    assert fusion.uses_seg_to_depth is (direction == "seg_to_depth")
+    assert fusion.uses_depth_to_seg is (direction == "depth_to_seg")
+    assert hasattr(fusion, "seg_to_depth_scale") is (direction == "seg_to_depth")
+    assert hasattr(fusion, "depth_to_seg_scale") is (direction == "depth_to_seg")
+    state_keys = set(fusion.state_dict())
+    assert any(key.startswith("seg_to_depth.") for key in state_keys) is (
+        direction == "seg_to_depth"
+    )
+    assert any(key.startswith("depth_to_seg.") for key in state_keys) is (
+        direction == "depth_to_seg"
+    )
+    assert all(
+        ("seg_to_depth" in name) == (direction == "seg_to_depth")
+        for name, _ in fusion.named_parameters()
+        if "_to_" in name
+    )
+
+
+def test_default_gated_fusion_keeps_legacy_bidirectional_state_dict() -> None:
+    fusion = ResidualGatedFusion(4)
+    state = fusion.state_dict()
+
+    assert fusion.direction == "bidirectional"
+    assert fusion.detach_source is False
+    assert "depth_to_seg_scale" in state
+    assert "seg_to_depth_scale" in state
+    assert any(key.startswith("depth_to_seg.") for key in state)
+    assert any(key.startswith("seg_to_depth.") for key in state)
+    restored = ResidualGatedFusion(4)
+    incompatible = restored.load_state_dict(state, strict=True)
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+
+
+def test_directional_fusion_stop_gradient_protects_source_adapter() -> None:
+    fusion = ResidualGatedFusion(
+        5,
+        direction="seg_to_depth",
+        detach_source=True,
+    )
+    with torch.no_grad():
+        fusion.seg_to_depth_scale.fill_(1.0)
+    segmentation = torch.randn(2, 5, 4, 6, requires_grad=True)
+    depth = torch.randn(2, 5, 4, 6, requires_grad=True)
+
+    fused_segmentation, fused_depth = fusion(segmentation, depth)
+
+    assert fused_segmentation is segmentation
+    _assert_all_parameters_receive_grad(fusion, fused_depth.square().mean())
+    assert segmentation.grad is None
+    assert depth.grad is not None
+
+
+def test_directional_fusion_without_stop_gradient_updates_source() -> None:
+    fusion = ResidualGatedFusion(
+        5,
+        direction="seg_to_depth",
+        detach_source=False,
+    )
+    with torch.no_grad():
+        fusion.seg_to_depth_scale.fill_(1.0)
+    segmentation = torch.randn(2, 5, 4, 6, requires_grad=True)
+    depth = torch.randn(2, 5, 4, 6, requires_grad=True)
+
+    fusion.forward_depth(segmentation, depth).square().mean().backward()
+
+    assert segmentation.grad is not None
+    assert torch.count_nonzero(segmentation.grad) > 0
+
+
 @pytest.mark.parametrize(
     "factory",
     [
@@ -230,6 +306,8 @@ def test_gated_fusion_all_parameters_receive_gradients() -> None:
         lambda: DepthHead(8, min_depth=1.0, max_depth=1.0),
         lambda: ClassificationHead(8, num_classes=2, dropout=1.0),
         lambda: ResidualGatedFusion(8, enabled="yes"),
+        lambda: ResidualGatedFusion(8, direction="sideways"),
+        lambda: ResidualGatedFusion(8, detach_source=1),
     ],
 )
 def test_invalid_head_configuration_raises(factory: Callable[[], nn.Module]) -> None:

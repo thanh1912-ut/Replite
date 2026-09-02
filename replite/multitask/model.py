@@ -147,6 +147,8 @@ class RepLiteMultiTaskModel(nn.Module):
             self.dense_fusion = ResidualGatedFusion(
                 config.task_adapter_channels,
                 config.task_adapter_channels,
+                direction=config.tasks.dense_fusion_direction,
+                detach_source=config.tasks.dense_fusion_detach_source,
             )
 
         if config.tasks.classification_classes is not None:
@@ -226,18 +228,26 @@ class RepLiteMultiTaskModel(nn.Module):
         depth_feature: Tensor | None = None
         wants_segmentation = "segmentation" in requested
         wants_depth = "depth" in requested
-        needs_fusion_pair = (
-            hasattr(self, "dense_fusion")
+        needs_depth_for_segmentation = (
+            wants_segmentation
+            and hasattr(self, "dense_fusion")
             and self.dense_fusion.enabled
-            and (wants_segmentation or wants_depth)
+            and self.dense_fusion.uses_depth_to_seg
         )
-        if wants_segmentation or needs_fusion_pair:
+        needs_segmentation_for_depth = (
+            wants_depth
+            and hasattr(self, "dense_fusion")
+            and self.dense_fusion.enabled
+            and self.dense_fusion.uses_seg_to_depth
+        )
+        needs_fusion_pair = needs_depth_for_segmentation or needs_segmentation_for_depth
+        if wants_segmentation or needs_segmentation_for_depth:
             if dense_feature is None:
                 raise RuntimeError(
                     "segmentation head is enabled but dense path is absent"
                 )
             segmentation_feature = self.segmentation_adapter(dense_feature)
-        if wants_depth or needs_fusion_pair:
+        if wants_depth or needs_depth_for_segmentation:
             if dense_feature is None:
                 raise RuntimeError("depth head is enabled but dense path is absent")
             depth_feature = self.depth_adapter(dense_feature)
@@ -423,9 +433,12 @@ class TaskExportWrapper(nn.Module):
         self._export_config = model.config.for_tasks([task]).as_dict()
         self._source_metadata = deepcopy(model.model_metadata)
         self._uses_fusion_dependency = (
-            task in ("segmentation", "depth")
-            and hasattr(model, "dense_fusion")
+            hasattr(model, "dense_fusion")
             and model.dense_fusion.enabled
+            and (
+                (task == "segmentation" and model.dense_fusion.uses_depth_to_seg)
+                or (task == "depth" and model.dense_fusion.uses_seg_to_depth)
+            )
         )
         # A newly-created nn.Module defaults to training mode. Mirror the
         # wrapped model immediately so ONNX/export utilities cannot restore the
@@ -463,18 +476,26 @@ class TaskExportWrapper(nn.Module):
 
         source_tasks = source.config.tasks
         uses_fusion_dependency = (
-            task in ("segmentation", "depth")
-            and hasattr(source, "dense_fusion")
+            hasattr(source, "dense_fusion")
             and source.dense_fusion.enabled
+            and (
+                (
+                    task == "segmentation"
+                    and source.dense_fusion.uses_depth_to_seg
+                )
+                or (task == "depth" and source.dense_fusion.uses_seg_to_depth)
+            )
         )
         if uses_fusion_dependency:
-            # Both adapters and the bidirectional fusion are part of either
-            # trained dense task's semantics, even when only one final head is
-            # exported. The unused final predictor is deleted after loading.
+            # Both adapters and the required directional fusion branch are
+            # part of the exported dense task's semantics. The unused final
+            # predictor is deleted after loading.
             target_tasks = TaskConfig(
                 segmentation_classes=source_tasks.segmentation_classes,
                 depth=True,
                 gated_dense_fusion=True,
+                dense_fusion_direction=source_tasks.dense_fusion_direction,
+                dense_fusion_detach_source=source_tasks.dense_fusion_detach_source,
             )
         else:
             target_tasks = source_tasks.subset([task])
@@ -538,12 +559,14 @@ class TaskExportWrapper(nn.Module):
             target.dense_fusion.enabled = source.dense_fusion.enabled
             if task == "segmentation":
                 del target.depth_head
-                del target.dense_fusion.seg_to_depth
-                del target.dense_fusion.seg_to_depth_scale
+                if target.dense_fusion.uses_seg_to_depth:
+                    del target.dense_fusion.seg_to_depth
+                    del target.dense_fusion.seg_to_depth_scale
             else:
                 del target.segmentation_head
-                del target.dense_fusion.depth_to_seg
-                del target.dense_fusion.depth_to_seg_scale
+                if target.dense_fusion.uses_depth_to_seg:
+                    del target.dense_fusion.depth_to_seg
+                    del target.dense_fusion.depth_to_seg_scale
         # The private execution model exposes only the wrapper task. Extra
         # directional fusion modules above are retained dependencies, not an
         # additional output contract.
