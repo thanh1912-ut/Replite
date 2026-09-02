@@ -42,12 +42,14 @@ def test_nyuv2_notebook_is_clean_generated_and_compiles() -> None:
 
 
 def test_nyuv2_notebook_locks_archive_schema_and_static_input() -> None:
-    _, source, _ = _sources()
+    _, source, all_source = _sources()
     for marker in (
         'REPO_REF = "8811440d23fda2dc6db1c9dddb80c870f6654d06"',
         'ARCHIVE_PATH = Path("/content/drive/MyDrive/datasets/NYUDv2/NYUDv2.tar.gz")',
+        'ARCHIVE_DRIVE_FILE_ID = "14EAEMXmd3zs2hIMY63UhHPSFPDAkiTzw"',
         "ARCHIVE_EXPECTED_BYTES = 4_215_751_725",
         'ARCHIVE_SHA256 = "33338d895404a9144a2c6892a8b0d6d5c26b02021f945b12e36c431fb369fcb2"',
+        'LOCAL_ARCHIVE_STAGE = Path("/content/.replite_nyuv2_cache/NYUDv2.tar.gz")',
         'LOCAL_DATASET_ROOT = Path("/content/nyudv2")',
         '"expected_train_samples": 795',
         '"expected_test_samples": 654',
@@ -57,6 +59,10 @@ def test_nyuv2_notebook_locks_archive_schema_and_static_input() -> None:
         '"source_ignore_labels": [0]',
         '"expected_raw_label_ids": list(range(41))',
         '"depth_unit_scale": 1.0',
+        '"google_drive_file_id": ARCHIVE_DRIVE_FILE_ID',
+        '"local_stage_path": str(LOCAL_ARCHIVE_STAGE)',
+        '"download_retries": 4',
+        '"download_timeout_seconds": 900',
         'raw_label_mapping = {str(raw_id): raw_id - 1 for raw_id in range(1, 41)}',
         'SOURCE_PIN = DRIVE_RUN_DIR / "source_pin.json"',
         '["git", "-C", str(REPO_DIR), "checkout", "--detach", pinned_commit]',
@@ -70,7 +76,9 @@ def test_nyuv2_notebook_locks_archive_schema_and_static_input() -> None:
         "Source pin cũ/không tương thích; dùng RUN_ID mới",
     ):
         assert marker in source
-    assert 'Path("/content/NYUDv2.tar.gz").exists()' in source
+    assert 'not LOCAL_ARCHIVE_STAGE.exists()' in source
+    assert '"gdown>=6,<7"' in source
+    assert 'gdown --continue' in all_source
     assert "copy2" not in source
     assert "shutil.copy" not in source
 
@@ -133,7 +141,7 @@ def test_nyuv2_notebook_has_runner_actions_resume_and_visible_live_log() -> None
     assert 'run_cli("inspect")' in source
     assert 'run_cli("train", *resume_arguments)' in source
     assert 'RESUME = False  #@param {type:"boolean"}' in source
-    assert 'RUN_ID = "replite_nyuv2_mnv4convs_segdepth_seed42_v2_r1"' in source
+    assert 'RUN_ID = "replite_nyuv2_mnv4convs_segdepth_seed42_v2_r2"' in source
     assert 'SEG_ONLY_MIOU_ANCHOR = 0.0' in source
     assert 'DEPTH_ONLY_ABSREL_ANCHOR = 0.0' in source
     assert 'resume_arguments = ["--resume"] if RESUME else []' in source

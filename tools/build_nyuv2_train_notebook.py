@@ -113,6 +113,7 @@ def build_notebook() -> dict[str, object]:
                     sys.executable, "-m", "pip", "install", "-q",
                     "timm==1.0.28", "huggingface_hub>=0.34,<2",
                     "safetensors>=0.5,<1", "Pillow>=10,<13", "tqdm>=4.66,<5",
+                    "gdown>=6,<7",
                 ],
                 check=True,
             )
@@ -134,13 +135,15 @@ def build_notebook() -> dict[str, object]:
             r"""
             #@title 2) Khóa protocol, cấu hình model/train và đường dẫn artifact
             ARCHIVE_PATH = Path("/content/drive/MyDrive/datasets/NYUDv2/NYUDv2.tar.gz")
+            ARCHIVE_DRIVE_FILE_ID = "14EAEMXmd3zs2hIMY63UhHPSFPDAkiTzw"
             ARCHIVE_EXPECTED_BYTES = 4_215_751_725
             ARCHIVE_SHA256 = "33338d895404a9144a2c6892a8b0d6d5c26b02021f945b12e36c431fb369fcb2"
+            LOCAL_ARCHIVE_STAGE = Path("/content/.replite_nyuv2_cache/NYUDv2.tar.gz")
             LOCAL_DATASET_ROOT = Path("/content/nyudv2")
             LOCAL_WORK_ROOT = Path("/content/replite_nyuv2")
             DRIVE_RUNS_ROOT = Path("/content/drive/MyDrive/datasets/NYUDv2/replite_runs")
 
-            RUN_ID = "replite_nyuv2_mnv4convs_segdepth_seed42_v2_r1"  #@param {type:"string"}
+            RUN_ID = "replite_nyuv2_mnv4convs_segdepth_seed42_v2_r2"  #@param {type:"string"}
             BATCH_SIZE = 16  #@param {type:"integer"}
             NUM_WORKERS = 4  #@param {type:"integer"}
             EPOCHS = 100  #@param {type:"integer"}
@@ -162,7 +165,7 @@ def build_notebook() -> dict[str, object]:
                     "depth_abs_rel": DEPTH_ONLY_ABSREL_ANCHOR,
                 }
             )
-            assert ARCHIVE_PATH.is_file(), f"Không tìm thấy archive: {ARCHIVE_PATH}"
+            assert ARCHIVE_DRIVE_FILE_ID, "Thiếu public Google Drive file ID của archive"
 
             DRIVE_RUN_DIR = DRIVE_RUNS_ROOT / RUN_ID
             CONFIG_DIR = LOCAL_WORK_ROOT / "configs"
@@ -267,6 +270,10 @@ def build_notebook() -> dict[str, object]:
                 "source_commit": SOURCE_COMMIT,
                 "archive": {
                     "path": str(ARCHIVE_PATH),
+                    "google_drive_file_id": ARCHIVE_DRIVE_FILE_ID,
+                    "local_stage_path": str(LOCAL_ARCHIVE_STAGE),
+                    "download_retries": 4,
+                    "download_timeout_seconds": 900,
                     "expected_bytes": ARCHIVE_EXPECTED_BYTES,
                     "sha256": ARCHIVE_SHA256,
                     "expected_train_samples": 795,
@@ -408,21 +415,21 @@ def build_notebook() -> dict[str, object]:
         ),
         markdown(
             r"""
-            ## Giải nén vào SSD Colab
+            ## Tải resumable và giải nén vào SSD Colab
 
-            Cell này đọc archive trực tiếp từ Drive, kiểm kích thước và SHA-256,
-            preflight dung lượng, rồi safe-extract vào `/content/nyudv2`. Archive
-            không được copy thành `/content/NYUDv2.tar.gz`. Lần chạy lại sẽ dùng
-            completion manifest nếu dataset local còn nguyên; `/content` sẽ mất khi
-            Colab reset nên lúc đó chỉ cần chạy lại cell này.
+            Cell này dùng `gdown --continue` với file ID công khai để tải archive
+            resumable vào SSD, tránh treo `DriveFS/FUSE`. Sau đó nó kiểm kích thước
+            và SHA-256 trên SSD, safe-extract vào `/content/nyudv2`, rồi tự xóa
+            archive tạm. Nếu kết nối bị ngắt, file `.part` được giữ để lần chạy lại
+            tiếp tục. File nguồn trên Drive và mọi checkpoint không bị thay đổi.
             """
         ),
         code(
             r"""
-            #@title 3) Verify archive và extract trực tiếp Drive → /content/nyudv2
+            #@title 3) Download resumable, verify và extract → /content/nyudv2
             run_cli("extract")
             assert LOCAL_DATASET_ROOT.is_dir(), LOCAL_DATASET_ROOT
-            assert not Path("/content/NYUDv2.tar.gz").exists(), "Notebook không được copy archive vào SSD"
+            assert not LOCAL_ARCHIVE_STAGE.exists(), "Archive tạm phải được xóa sau extract thành công"
             print("Dataset local:", LOCAL_DATASET_ROOT)
             print("SSD free:", f"{shutil.disk_usage('/content').free / 1024**3:.1f} GiB")
             """

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
 import tarfile
 from collections import namedtuple
 from pathlib import Path
@@ -227,6 +228,241 @@ def test_extracts_directly_to_local_disk_and_is_idempotent(tmp_path: Path) -> No
     assert first["official_test_samples"] == 1
     assert (root / "images" / "0001.jpg").is_file()
     assert not (root.parent / archive.name).exists()
+
+
+def test_extract_stages_with_resumable_gdown_then_removes_local_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _archive(tmp_path)
+    config = _config(tmp_path, archive)
+    staged = tmp_path / "cache" / "NYUDv2.tar.gz"
+    config["archive"].update(  # type: ignore[union-attr]
+        path=str(tmp_path / "unreadable-drive-mount" / "NYUDv2.tar.gz"),
+        google_drive_file_id="public_drive_file_id_123",
+        local_stage_path=str(staged),
+        download_retries=3,
+        download_timeout_seconds=90,
+    )
+    path = _write_config(tmp_path, config)
+    calls: list[list[str]] = []
+
+    def fake_gdown(
+        command, *, destination, expected_bytes, timeout_seconds
+    ):
+        calls.append(list(command))
+        assert destination == staged
+        assert expected_bytes == archive.stat().st_size
+        assert timeout_seconds == 90
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(archive.read_bytes())
+        return 0
+
+    monkeypatch.setattr(runner, "_run_gdown_attempt", fake_gdown)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    result = runner.extract_campaign(path)
+
+    assert result["archive_transport"] == "gdown"
+    assert len(calls) == 2
+    assert all("--quiet" in command for command in calls)
+    assert all("--continue" in command for command in calls)
+    assert all("public_drive_file_id_123" in command for command in calls)
+    assert not staged.exists()
+    assert (Path(config["paths"]["local_dataset_root"]) / "images/0001.jpg").is_file()  # type: ignore[index]
+
+
+def test_gdown_checksum_failure_removes_bad_completed_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _archive(tmp_path)
+    config = _config(tmp_path, archive)
+    staged = tmp_path / "cache" / "NYUDv2.tar.gz"
+    config["archive"].update(  # type: ignore[union-attr]
+        path=str(tmp_path / "missing-drive-archive.tar.gz"),
+        google_drive_file_id="public_drive_file_id_123",
+        local_stage_path=str(staged),
+        download_retries=1,
+        download_timeout_seconds=90,
+    )
+    path = _write_config(tmp_path, config)
+
+    def fake_corrupt_download(
+        command, *, destination, expected_bytes, timeout_seconds
+    ):
+        del command, destination, expected_bytes, timeout_seconds
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(b"x" * archive.stat().st_size)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_gdown_attempt", fake_corrupt_download)
+
+    with pytest.raises(ValueError, match="archive SHA-256 mismatch"):
+        runner.extract_campaign(path)
+    assert not staged.exists()
+
+
+def test_gdown_failure_preserves_partial_file_for_next_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "cache" / "NYUDv2.tar.gz"
+    partial = destination.with_name(f"{destination.name}.session.part")
+    archive = {
+        "google_drive_file_id": "public_drive_file_id_123",
+        "local_stage_path": str(destination),
+        "expected_bytes": 1024,
+        "download_retries": 1,
+        "download_timeout_seconds": 90,
+    }
+
+    def fake_failed_download(
+        command, *, destination, expected_bytes, timeout_seconds
+    ):
+        del command, destination, expected_bytes, timeout_seconds
+        partial.parent.mkdir(parents=True, exist_ok=True)
+        partial.write_bytes(b"partial")
+        return 1
+
+    monkeypatch.setattr(runner, "_run_gdown_attempt", fake_failed_download)
+
+    with pytest.raises(RuntimeError, match="partial data was preserved for resume"):
+        runner._download_google_drive_archive(archive)
+    assert partial.read_bytes() == b"partial"
+
+
+def test_gdown_attempt_reports_progress_with_newline_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    destination = tmp_path / "cache" / "NYUDv2.tar.gz"
+    destination.parent.mkdir(parents=True)
+    partial = destination.with_name(f"{destination.name}.download.part")
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.poll_count = 0
+
+        def poll(self) -> int | None:
+            self.poll_count += 1
+            if self.poll_count == 1:
+                partial.write_bytes(b"x" * 512)
+                return None
+            partial.write_bytes(b"x" * 1024)
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("completed process must not be terminated")
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not be killed")
+
+        def wait(self, timeout=None) -> int:
+            del timeout
+            return 0
+
+    process = FakeProcess()
+    clock = iter((0.0, 6.0, 12.0))
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda _command: process)
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    result = runner._run_gdown_attempt(
+        ["python", "-m", "gdown"],
+        destination=destination,
+        expected_bytes=1024,
+        timeout_seconds=90,
+        progress_interval_seconds=5.0,
+    )
+
+    assert result == 0
+    output = capsys.readouterr().out
+    assert "[download]" in output
+    assert "GiB" in output
+    assert "MiB/s" in output
+    assert "ETA" in output
+
+
+def test_gdown_attempt_timeout_has_bounded_process_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "cache" / "NYUDv2.tar.gz"
+    destination.parent.mkdir(parents=True)
+
+    class FakeProcess:
+        terminated = False
+        killed = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout=None) -> int:
+            del timeout
+            return 0
+
+    process = FakeProcess()
+    clock = iter((0.0, 91.0))
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda _command: process)
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner._run_gdown_attempt(
+            ["python", "-m", "gdown"],
+            destination=destination,
+            expected_bytes=1024,
+            timeout_seconds=90,
+            progress_interval_seconds=5.0,
+        )
+    assert process.terminated is True
+    assert process.killed is False
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"google_drive_file_id": "bad/id"}, "google_drive_file_id"),
+        (
+            {
+                "google_drive_file_id": "valid_file_id_123",
+                "local_stage_path": "relative/archive.tar.gz",
+            },
+            "local_stage_path",
+        ),
+        (
+            {
+                "google_drive_file_id": "valid_file_id_123",
+                "local_stage_path": "/content/cache/archive.tar.gz",
+                "download_retries": 0,
+            },
+            "download_retries",
+        ),
+        ({"local_stage_path": "/content/cache/archive.tar.gz"}, "google_drive_file_id"),
+    ],
+)
+def test_load_campaign_rejects_invalid_resumable_archive_transport(
+    tmp_path: Path,
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    archive = _archive(tmp_path)
+    config = _config(tmp_path, archive)
+    config["archive"].update(updates)  # type: ignore[union-attr]
+    path = _write_config(tmp_path, config)
+
+    with pytest.raises(ValueError, match=message):
+        runner.load_campaign(path)
 
 
 def test_prepare_freezes_inner_validation_without_test_leakage(tmp_path: Path) -> None:

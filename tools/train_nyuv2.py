@@ -382,6 +382,53 @@ def load_campaign(filename: str | os.PathLike[str]) -> tuple[Path, dict[str, Any
             or archive[name] <= 0
         ):
             raise ValueError(f"archive.{name} must be a positive integer")
+    drive_file_id = archive.get("google_drive_file_id")
+    if drive_file_id is not None:
+        if (
+            not isinstance(drive_file_id, str)
+            or len(drive_file_id) < 10
+            or any(
+                not (character.isalnum() or character in "_-")
+                for character in drive_file_id
+            )
+        ):
+            raise ValueError("archive.google_drive_file_id is invalid")
+        local_stage = archive.get("local_stage_path")
+        if not isinstance(local_stage, str) or not local_stage:
+            raise ValueError(
+                "archive.local_stage_path is required with google_drive_file_id"
+            )
+        local_stage_path = Path(local_stage).expanduser()
+        if not local_stage_path.is_absolute():
+            raise ValueError("archive.local_stage_path must be absolute")
+        if local_stage_path == Path(archive.get("path", "")).expanduser():
+            raise ValueError("archive.local_stage_path must differ from archive.path")
+        if str(local_stage_path).startswith("/content/drive/"):
+            raise ValueError("archive.local_stage_path must be on local SSD, not Drive")
+        for name, minimum, maximum in (
+            ("download_retries", 1, 10),
+            ("download_timeout_seconds", 60, 3600),
+        ):
+            item = archive.get(name)
+            if (
+                isinstance(item, bool)
+                or not isinstance(item, int)
+                or not minimum <= item <= maximum
+            ):
+                raise ValueError(
+                    f"archive.{name} must be an integer in [{minimum},{maximum}]"
+                )
+    elif any(
+        name in archive
+        for name in (
+            "local_stage_path",
+            "download_retries",
+            "download_timeout_seconds",
+        )
+    ):
+        raise ValueError(
+            "archive.google_drive_file_id is required for resumable download fields"
+        )
 
     for name in ("local_dataset_root", "local_work_root", "drive_run_root"):
         if not isinstance(value["paths"].get(name), str) or not value["paths"][name]:
@@ -644,40 +691,262 @@ def _stream_extract_tar(archive: Path, staging: Path) -> dict[str, int]:
     }
 
 
+def _gdown_partial_paths(destination: Path) -> tuple[Path, ...]:
+    if not destination.parent.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            path
+            for path in destination.parent.iterdir()
+            if path.is_file()
+            and path.name.startswith(destination.name)
+            and path.name.endswith(".part")
+        )
+    )
+
+
+def _local_archive_cache_bytes(destination: Path) -> int:
+    candidates = (destination, *_gdown_partial_paths(destination))
+    sizes = [path.stat().st_size for path in candidates if path.is_file()]
+    return max(sizes, default=0)
+
+
+def _cleanup_local_archive_cache(destination: Path) -> None:
+    destination.unlink(missing_ok=True)
+    for partial in _gdown_partial_paths(destination):
+        partial.unlink(missing_ok=True)
+    try:
+        destination.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _format_eta(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0.0:
+        return "--:--"
+    rounded = int(math.ceil(seconds))
+    hours, remainder = divmod(rounded, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+    return f"{minutes:02d}:{remaining_seconds:02d}"
+
+
+def _stop_subprocess(process: subprocess.Popen[Any]) -> None:
+    """Best-effort bounded shutdown without losing gdown's partial file."""
+
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        process.kill()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        # A process in uninterruptible kernel I/O cannot be reaped yet.  Never
+        # turn this cleanup path into another unbounded Colab cell hang.
+        pass
+
+
+def _run_gdown_attempt(
+    command: Sequence[str],
+    *,
+    destination: Path,
+    expected_bytes: int,
+    timeout_seconds: int,
+    progress_interval_seconds: float = 5.0,
+) -> int:
+    """Run one quiet gdown attempt and emit newline-delimited progress."""
+
+    process = subprocess.Popen(list(command))
+    started = time.monotonic()
+    initial_bytes = _local_archive_cache_bytes(destination)
+    next_report = started + progress_interval_seconds
+    try:
+        while True:
+            return_code = process.poll()
+            now = time.monotonic()
+            elapsed = max(now - started, 1e-6)
+            if now >= next_report or return_code is not None:
+                available = _local_archive_cache_bytes(destination)
+                downloaded = max(available - initial_bytes, 0)
+                speed = downloaded / elapsed
+                eta = (
+                    _format_eta(max(expected_bytes - available, 0) / speed)
+                    if speed > 0.0
+                    else "--:--"
+                )
+                print(
+                    f"[download] {available / 1024**3:.2f}/"
+                    f"{expected_bytes / 1024**3:.2f} GiB | "
+                    f"{speed / 1024**2:.1f} MiB/s | ETA {eta}",
+                    flush=True,
+                )
+                next_report = now + progress_interval_seconds
+            if return_code is not None:
+                return int(return_code)
+            if elapsed >= timeout_seconds:
+                _stop_subprocess(process)
+                raise subprocess.TimeoutExpired(list(command), timeout_seconds)
+            time.sleep(min(0.5, max(next_report - now, 0.05)))
+    except BaseException:
+        _stop_subprocess(process)
+        raise
+
+
+def _download_google_drive_archive(archive: Mapping[str, Any]) -> Path:
+    """Download a public Drive file to SSD with bounded retries and resume."""
+
+    destination = Path(str(archive["local_stage_path"])).expanduser().resolve()
+    expected_bytes = int(archive["expected_bytes"])
+    if destination.is_file() and destination.stat().st_size == expected_bytes:
+        print(
+            f"[download] reuse completed local archive: {destination} "
+            f"({expected_bytes / 1024**3:.2f} GiB)",
+            flush=True,
+        )
+        return destination
+    if destination.exists():
+        if not destination.is_file():
+            raise ValueError(f"local archive stage is not a file: {destination}")
+        print(
+            f"[download] remove invalid completed stage: {destination} "
+            f"({destination.stat().st_size} != {expected_bytes} bytes)",
+            flush=True,
+        )
+        destination.unlink()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    retries = int(archive["download_retries"])
+    timeout = int(archive["download_timeout_seconds"])
+    file_id = str(archive["google_drive_file_id"])
+    command = [
+        sys.executable,
+        "-m",
+        "gdown",
+        "--quiet",
+        "--continue",
+        file_id,
+        "-O",
+        str(destination),
+    ]
+    last_failure = "unknown error"
+    for attempt in range(1, retries + 1):
+        resumed_bytes = _local_archive_cache_bytes(destination)
+        print(
+            f"[download] gdown attempt {attempt}/{retries} | "
+            f"resume={resumed_bytes / 1024**3:.2f}/{expected_bytes / 1024**3:.2f} GiB",
+            flush=True,
+        )
+        try:
+            return_code = _run_gdown_attempt(
+                command,
+                destination=destination,
+                expected_bytes=expected_bytes,
+                timeout_seconds=timeout,
+            )
+            last_failure = f"exit code {return_code}"
+        except subprocess.TimeoutExpired:
+            last_failure = f"timeout after {timeout}s"
+        except OSError as exc:
+            last_failure = f"{type(exc).__name__}: {exc}"
+        if destination.is_file() and destination.stat().st_size == expected_bytes:
+            print(
+                f"[download] READY: {destination} "
+                f"({expected_bytes / 1024**3:.2f} GiB)",
+                flush=True,
+            )
+            return destination
+        available = _local_archive_cache_bytes(destination)
+        print(
+            f"[download] attempt {attempt} incomplete ({last_failure}); "
+            f"preserved={available / 1024**3:.2f} GiB",
+            flush=True,
+        )
+        if attempt < retries:
+            time.sleep(min(2 ** (attempt - 1), 4))
+    raise RuntimeError(
+        "cannot download the NYUDv2 archive with gdown after "
+        f"{retries} attempts ({last_failure}); partial data was preserved for resume. "
+        "Confirm the Drive file is shared as 'Anyone with the link'."
+    )
+
+
 def extract_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
-    """Verify the Drive archive and extract it directly onto Colab SSD."""
+    """Verify the locked archive and safely extract it onto Colab SSD."""
 
     _, config = load_campaign(filename)
     archive_config = config["archive"]
-    archive = Path(archive_config["path"]).expanduser().resolve()
+    configured_archive = Path(archive_config["path"]).expanduser()
+    source_archive = (
+        configured_archive
+        if archive_config.get("google_drive_file_id") is not None
+        else configured_archive.resolve()
+    )
     output = Path(config["paths"]["local_dataset_root"]).expanduser().resolve()
+    local_archive = (
+        Path(str(archive_config["local_stage_path"])).expanduser().resolve()
+        if archive_config.get("google_drive_file_id") is not None
+        else None
+    )
+    if local_archive is not None and (
+        local_archive == output or output in local_archive.parents
+    ):
+        raise ValueError("archive.local_stage_path must be outside local_dataset_root")
     if output.exists():
         _, marker = _validate_extracted(output, config)
+        if local_archive is not None:
+            _cleanup_local_archive_cache(local_archive)
         print("[extract] verified local dataset already exists:", output)
         return marker
-    if not archive.is_file():
-        raise FileNotFoundError(f"NYUDv2 archive is missing: {archive}")
-    actual_bytes = archive.stat().st_size
-    if actual_bytes != archive_config["expected_bytes"]:
-        raise ValueError(
-            f"archive size mismatch: expected {archive_config['expected_bytes']}, got {actual_bytes}"
-        )
-    print("[extract] verifying archive SHA-256 directly on Drive", flush=True)
-    actual_sha = _sha256_file(archive, progress=True)
-    if actual_sha != archive_config["sha256"]:
-        raise ValueError(
-            f"archive SHA-256 mismatch: expected {archive_config['sha256']}, got {actual_sha}"
-        )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(output.parent).free
     reserve = 2 * 1024**3
-    conservative_need = math.ceil(actual_bytes * 3.0) + reserve
+    expected_bytes = int(archive_config["expected_bytes"])
+    remaining_download = (
+        max(expected_bytes - _local_archive_cache_bytes(local_archive), 0)
+        if local_archive is not None
+        else 0
+    )
+    conservative_need = math.ceil(expected_bytes * 3.0) + remaining_download + reserve
     if free < conservative_need:
         raise OSError(
             "not enough Colab SSD for safe NYUDv2 extraction: "
             f"free={free / 1024**3:.1f} GiB, required~={conservative_need / 1024**3:.1f} GiB"
         )
+
+    if local_archive is not None:
+        archive = _download_google_drive_archive(archive_config)
+        archive_transport = "gdown"
+        print("[extract] verifying staged archive SHA-256 on local SSD", flush=True)
+    else:
+        archive = source_archive
+        archive_transport = "direct_path"
+        if not archive.is_file():
+            raise FileNotFoundError(f"NYUDv2 archive is missing: {archive}")
+        actual_bytes = archive.stat().st_size
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"archive size mismatch: expected {expected_bytes}, got {actual_bytes}"
+            )
+        print("[extract] verifying archive SHA-256", flush=True)
+    actual_bytes = archive.stat().st_size
+    if actual_bytes != expected_bytes:
+        raise ValueError(
+            f"archive size mismatch: expected {expected_bytes}, got {actual_bytes}"
+        )
+    actual_sha = _sha256_file(archive, progress=True)
+    if actual_sha != archive_config["sha256"]:
+        if local_archive is not None:
+            _cleanup_local_archive_cache(local_archive)
+        raise ValueError(
+            f"archive SHA-256 mismatch: expected {archive_config['sha256']}, got {actual_sha}"
+        )
+
     staging = output.parent / f".{output.name}.extracting.{uuid.uuid4().hex}"
     staging.mkdir(parents=False, exist_ok=False)
     published = False
@@ -702,7 +971,8 @@ def extract_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
         marker = {
             "schema_version": 1,
             "protocol_id": config["protocol_id"],
-            "archive_path": str(archive),
+            "archive_path": str(source_archive),
+            "archive_transport": archive_transport,
             "archive_bytes": actual_bytes,
             "archive_sha256": actual_sha,
             "official_train_samples": len(index.train),
@@ -711,6 +981,9 @@ def extract_campaign(filename: str | os.PathLike[str]) -> dict[str, Any]:
         }
         _atomic_json(_extraction_marker(output), marker)
         _validate_extracted(output, config)
+        if local_archive is not None:
+            _cleanup_local_archive_cache(local_archive)
+            print("[extract] removed local archive cache:", local_archive, flush=True)
         print("[extract] READY:", output, flush=True)
         return marker
     finally:

@@ -442,9 +442,12 @@ are stored in the immutable split manifest and bound into snapshot parity.
 Use
 [`notebooks/NYUDv2_SegDepth_Train.ipynb`](notebooks/NYUDv2_SegDepth_Train.ipynb)
 for the reproducible NYUDv2 semantic-segmentation and metric-depth campaign.
-The notebook verifies the pinned Drive archive by byte count and SHA-256, then
-extracts it directly to `/content/nyudv2`; it never makes a second 3.93 GiB
-archive copy on the Colab SSD. Inputs are static RGB tensors at 288x384. The
+The notebook downloads the locked public Drive file ID to a resumable SSD cache
+with `gdown --continue`, verifies byte count and SHA-256 locally, then safely
+extracts it to `/content/nyudv2`. This avoids large sequential reads through the
+DriveFS/FUSE mount. The 3.93 GiB staging archive is deleted after successful
+extraction, while an interrupted `.part` is retained for retry. Inputs are
+static RGB tensors at 288x384. The
 model uses the ImageNet-1K MobileNetV4-Conv-S backbone, no detection path, and
 40 semantic classes: raw IDs 1--40 map to train IDs 0--39 while raw ID 0 is
 ignored. Depth values use an explicit scale of 1.0 metres.
