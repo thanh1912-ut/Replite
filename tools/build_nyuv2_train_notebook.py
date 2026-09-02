@@ -47,10 +47,11 @@ def build_notebook() -> dict[str, object]:
               vào SSD `/content/nyudv2`; notebook **không copy file 3.93 GiB** sang SSD;
             - official train (795 ảnh) được chia cố định bằng seed 42 thành fit và
               10% inner-validation;
-            - `best.pt` và early stopping chỉ theo `val/total`, patience 10;
+            - `best.pt` và early stopping của multitask theo `val/selection/joint`, patience 10;
             - official held-out split (654 ảnh; bundle gọi là `val`) bị khóa trong
-              toàn bộ quá trình chọn model. Runner chỉ được mở split này **sau khi
-              strict-load `best.pt`**, rồi test đúng một lần.
+              toàn bộ quá trình chọn model. Runner chỉ được mở split này trong
+              Cell 7, **sau khi strict-load `best.pt`**, rồi test đúng một lần
+              (official test only after strict best.pt).
 
             Không chọn checkpoint theo train loss và tuyệt đối không nhìn official
             test để tuning. Làm vậy sẽ biến test thành validation và làm kết quả
@@ -139,14 +140,28 @@ def build_notebook() -> dict[str, object]:
             LOCAL_WORK_ROOT = Path("/content/replite_nyuv2")
             DRIVE_RUNS_ROOT = Path("/content/drive/MyDrive/datasets/NYUDv2/replite_runs")
 
-            RUN_ID = "replite_nyuv2_mnv4convs_segdepth_seed42_v1"  #@param {type:"string"}
+            RUN_ID = "replite_nyuv2_mnv4convs_segdepth_seed42_v2_r1"  #@param {type:"string"}
             BATCH_SIZE = 16  #@param {type:"integer"}
             NUM_WORKERS = 4  #@param {type:"integer"}
             EPOCHS = 100  #@param {type:"integer"}
             RESUME = False  #@param {type:"boolean"}
+            SEG_ONLY_MIOU_ANCHOR = 0.0  #@param {type:"number"}
+            DEPTH_ONLY_ABSREL_ANCHOR = 0.0  #@param {type:"number"}
 
             assert RUN_ID and "/" not in RUN_ID and "\\" not in RUN_ID and RUN_ID not in {".", ".."}
             assert BATCH_SIZE > 0 and NUM_WORKERS >= 0 and EPOCHS > 0
+            assert SEG_ONLY_MIOU_ANCHOR >= 0.0 and DEPTH_ONLY_ABSREL_ANCHOR >= 0.0
+            assert (SEG_ONLY_MIOU_ANCHOR == 0.0) == (DEPTH_ONLY_ABSREL_ANCHOR == 0.0), (
+                "Phải nhập cả hai single-task anchor hoặc để cả hai bằng 0."
+            )
+            SINGLE_TASK_ANCHORS = (
+                None
+                if SEG_ONLY_MIOU_ANCHOR == 0.0
+                else {
+                    "segmentation_miou": SEG_ONLY_MIOU_ANCHOR,
+                    "depth_abs_rel": DEPTH_ONLY_ABSREL_ANCHOR,
+                }
+            )
             assert ARCHIVE_PATH.is_file(), f"Không tìm thấy archive: {ARCHIVE_PATH}"
 
             DRIVE_RUN_DIR = DRIVE_RUNS_ROOT / RUN_ID
@@ -160,11 +175,44 @@ def build_notebook() -> dict[str, object]:
             # Pin the source commit per RUN_ID so a Colab reconnect remains an
             # exact resume even when the repository's main branch advances.
             SOURCE_PIN = DRIVE_RUN_DIR / "source_pin.json"
-            if SOURCE_PIN.exists():
+            EXPECTED_PROTOCOL_ID = "replite-nyuv2-segdepth-v2"
+
+            def probe_runner_protocol():
+                command = [
+                    sys.executable,
+                    str(REPO_DIR / "tools/train_nyuv2.py"),
+                    "protocol-info",
+                ]
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                assert result.returncode == 0, (
+                    f"Source {SOURCE_COMMIT} không có protocol-info tương thích. "
+                    f"stdout={result.stdout[-1000:]!r}, stderr={result.stderr[-1000:]!r}"
+                )
+                try:
+                    info = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    raise AssertionError(
+                        f"protocol-info không trả JSON hợp lệ: {result.stdout[-1000:]!r}"
+                    ) from exc
+                assert info.get("schema_version") == 1, info
+                assert EXPECTED_PROTOCOL_ID in info.get("supported_protocol_ids", []), (
+                    f"Source {SOURCE_COMMIT} không hỗ trợ {EXPECTED_PROTOCOL_ID}: {info}"
+                )
+                assert info.get("default_protocol_id") == EXPECTED_PROTOCOL_ID, info
+                assert info.get("source_commit") == SOURCE_COMMIT, info
+                return info
+
+            probe_runner_protocol()
+            source_pin_exists = SOURCE_PIN.exists()
+            if source_pin_exists:
                 source_pin = json.loads(SOURCE_PIN.read_text(encoding="utf-8"))
-                assert source_pin.get("schema_version") == 1, source_pin
+                assert source_pin.get("schema_version") == 2, (
+                    "Source pin cũ/không tương thích; dùng RUN_ID mới để không ghi đè campaign: "
+                    f"{source_pin}"
+                )
                 assert source_pin.get("run_id") == RUN_ID, source_pin
                 assert source_pin.get("source_repository") == REPO_URL, source_pin
+                assert source_pin.get("protocol_id") == EXPECTED_PROTOCOL_ID, source_pin
                 pinned_commit = source_pin.get("source_commit")
                 assert (
                     isinstance(pinned_commit, str)
@@ -189,13 +237,16 @@ def build_notebook() -> dict[str, object]:
                         ["git", "-C", str(REPO_DIR), "rev-parse", "HEAD"], text=True
                     ).strip()
                 assert SOURCE_COMMIT == pinned_commit
+                probe_runner_protocol()
                 print("RESUME SOURCE PIN:", SOURCE_COMMIT)
-            else:
+
+            if not source_pin_exists:
                 source_pin = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "run_id": RUN_ID,
                     "source_repository": REPO_URL,
                     "source_commit": SOURCE_COMMIT,
+                    "protocol_id": EXPECTED_PROTOCOL_ID,
                 }
                 temporary_pin = SOURCE_PIN.with_suffix(".json.tmp")
                 temporary_pin.write_text(
@@ -208,7 +259,9 @@ def build_notebook() -> dict[str, object]:
             raw_label_mapping = {str(raw_id): raw_id - 1 for raw_id in range(1, 41)}
             CONFIG = {
                 "schema_version": 1,
-                "protocol_id": "replite-nyuv2-segdepth-v1",
+                "protocol_id": EXPECTED_PROTOCOL_ID,
+                "mode": "multitask",
+                "stage": "main",
                 "run_id": RUN_ID,
                 "source_repository": REPO_URL,
                 "source_commit": SOURCE_COMMIT,
@@ -237,6 +290,8 @@ def build_notebook() -> dict[str, object]:
                     "use_sppf": False,
                     "dense_fusion_direction": "seg_to_depth",
                     "dense_fusion_detach_source": True,
+                    "dense_decoder": "dense_v2_s",
+                    "segmentation_auxiliary": True,
                 },
                 "data": {
                     "image_size": [288, 384],
@@ -255,11 +310,15 @@ def build_notebook() -> dict[str, object]:
                     "split_seed": 42,
                     "augmentation": {
                         "horizontal_flip_probability": 0.5,
-                        "scale_min": 1.0,
-                        "scale_max": 1.10,
+                        "scale_min": 0.75,
+                        "scale_max": 1.25,
                         "brightness": 0.10,
                         "contrast": 0.10,
                         "saturation": 0.08,
+                        "class_aware_crop_probability": 0.35,
+                        "rare_classes": [18, 22, 23, 24, 32, 34, 35],
+                        "blur_probability": 0.08,
+                        "blur_kernel_size": 3,
                     },
                 },
                 "train": {
@@ -276,11 +335,22 @@ def build_notebook() -> dict[str, object]:
                     "amp_dtype": "float16",
                     "amp_initial_scale": 1024.0,
                     "progress_every_n_steps": 10,
-                    "monitor": "val/total",
-                    "monitor_mode": "min",
+                    "monitor": "val/selection/joint",
+                    "monitor_mode": "max",
                     "early_stopping_patience": 10,
                     "early_stopping_min_delta": 0.0,
-                    "task_weights": {"segmentation": 1.0, "depth": 0.25},
+                    "task_weights": {"segmentation": 1.0, "depth": 1.0},
+                    "single_task_anchors": SINGLE_TASK_ANCHORS,
+                    "loss": {
+                        "segmentation_normalize_weighted_loss": True,
+                        "segmentation_lovasz_weight": 0.25,
+                        "segmentation_auxiliary_weight": 0.25,
+                        "depth_loss_type": "per_image_silog_log_l1_gradient",
+                        "depth_log_l1_weight": 0.5,
+                        "depth_silog_weight": 1.0,
+                        "depth_gradient_weight": 0.25,
+                        "depth_silog_lambda": 0.5,
+                    },
                 },
             }
 
@@ -328,7 +398,11 @@ def build_notebook() -> dict[str, object]:
             print("DRIVE RUN:", DRIVE_RUN_DIR)
             print("INPUT: B×3×288×384 (static RGB)")
             print("TASKS: segmentation(40) + depth(m); detection=OFF")
-            print("SELECTION: inner val/total; patience=10; official test only after strict best.pt")
+            print("SELECTION: inner val/selection/joint; patience=10; official test only in Cell 7")
+            print(
+                "JOINT NORMALIZATION:",
+                SINGLE_TASK_ANCHORS if SINGLE_TASK_ANCHORS is not None else "bounded fallback (chưa có S0/D0 anchors)",
+            )
             print("TERMINAL:", f"tail -n 80 -F {CONSOLE_LOG}")
             """
         ),
@@ -379,11 +453,10 @@ def build_notebook() -> dict[str, object]:
             đều thay vì tạo singleton tail batch. Vì vậy batch cuối không còn có sức
             nặng gấp nhiều lần batch thường.
 
-            `val/total` trên inner-validation là metric duy nhất để lưu `best.pt` và
-            early stop. Nếu không giảm trong 10 epoch validation liên tiếp, train dừng.
-            Sau đó runner tạo model đánh giá riêng, strict-load `best.pt`, mới mở
-            official held-out split và chạy test đúng một lần. Không dùng official-test
-            metric để quay lại chỉnh campaign này.
+            `val/selection/joint` trên inner-validation là metric duy nhất để lưu
+            `best.pt` và early stop. Nếu không tăng trong 10 epoch validation liên
+            tiếp, train dừng. Cell 5 chỉ train; Cell 7 mới strict-load `best.pt`,
+            mở official held-out split và chạy test đúng một lần.
             """
         ),
         code(
@@ -395,21 +468,30 @@ def build_notebook() -> dict[str, object]:
         ),
         code(
             r"""
-            #@title 6) Xem artifact và metric final
+            #@title 6) Xem artifact và metric inner-validation
             print("DRIVE RUN:", DRIVE_RUN_DIR)
             print("BEST:", DRIVE_RUN_DIR / "checkpoints/best.pt")
             print("LAST:", DRIVE_RUN_DIR / "checkpoints/last.pt")
-            print("FINAL TEST:", DRIVE_RUN_DIR / "official_test_metrics.json")
+            print("BEST mIoU:", DRIVE_RUN_DIR / "checkpoints/best_miou.pt")
+            print("BEST AbsRel:", DRIVE_RUN_DIR / "checkpoints/best_absrel.pt")
+            print("BEST joint:", DRIVE_RUN_DIR / "checkpoints/best_joint.pt")
             print("SPLIT MANIFEST:", DRIVE_RUN_DIR / "inner_split_manifest.json")
             print("RESOLVED CONFIG:", DRIVE_RUN_DIR / "resolved_config.json")
             print("LOG hiện tại:", CONSOLE_LOG)
-            if (DRIVE_RUN_DIR / "official_test_metrics.json").is_file():
-                final_metrics = json.loads(
-                    (DRIVE_RUN_DIR / "official_test_metrics.json").read_text(encoding="utf-8")
-                )
-                print(json.dumps(final_metrics, indent=2, ensure_ascii=False))
-            else:
-                print("Chưa có final test metric; xem console log để biết train đang ở đâu.")
+            history_path = DRIVE_RUN_DIR / "history.json"
+            if history_path.is_file():
+                history = json.loads(history_path.read_text(encoding="utf-8"))
+                for record in history[-5:]:
+                    print(record.get("epoch"), record.get("val", {}))
+            print("Official test chưa chạy; dùng Cell 7 sau khi duyệt inner-val.")
+            # official test only after strict best.pt
+            print("FINAL TEST ARTIFACT:", DRIVE_RUN_DIR / "official_test_metrics.json")
+            """
+        ),
+        code(
+            r"""
+            #@title 7) Chạy official held-out test đúng một lần (sau khi train xong)
+            run_cli("evaluate-test")
             """
         ),
         markdown(

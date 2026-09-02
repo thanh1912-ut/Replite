@@ -14,7 +14,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .blocks import ConvBNAct, DepthwiseSeparableConv, RepDepthwiseBlock
-from .recurrent import LiteConvLSTM
+from .recurrent import LiteConvLSTM, ResidualLiteConvLSTM
 
 
 RecurrentLevelState = tuple[Tensor, Tensor]
@@ -41,6 +41,7 @@ class NeckOutput(NamedTuple):
     f2: Tensor | None
     r4: Tensor | None
     r5: Tensor | None
+    f3: Tensor | None = None
 
     @property
     def detection(self) -> tuple[Tensor, Tensor, Tensor] | None:
@@ -109,6 +110,81 @@ class _LiteSPPF(nn.Module):
         return self.expand(torch.cat((x0, x1, x2, x3), dim=1))
 
 
+class LiteASPP(nn.Module):
+    """Mobile-friendly multi-scale context at the stride-32 dense level.
+
+    Four inexpensive branches capture local, dilated and global context. The
+    global branch projects before pooling so BatchNorm remains valid for a
+    one-image training batch. All operations are export-friendly convolutions,
+    pooling, interpolation and concatenation.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.in_channels = _positive_int(in_channels, "in_channels")
+        self.out_channels = _positive_int(out_channels, "out_channels")
+        branch_channels = max(self.out_channels // 4, 8)
+        self.branch_channels = branch_channels
+
+        self.local = ConvBNAct(
+            self.in_channels,
+            branch_channels,
+            kernel_size=1,
+            activation="silu",
+        )
+        self.dilated2 = nn.Sequential(
+            ConvBNAct(
+                self.in_channels,
+                branch_channels,
+                kernel_size=1,
+                activation="silu",
+            ),
+            DepthwiseSeparableConv(
+                branch_channels,
+                branch_channels,
+                dilation=2,
+                activation="silu",
+            ),
+        )
+        self.dilated4 = nn.Sequential(
+            ConvBNAct(
+                self.in_channels,
+                branch_channels,
+                kernel_size=1,
+                activation="silu",
+            ),
+            DepthwiseSeparableConv(
+                branch_channels,
+                branch_channels,
+                dilation=4,
+                activation="silu",
+            ),
+        )
+        self.global_projection = ConvBNAct(
+            self.in_channels,
+            branch_channels,
+            kernel_size=1,
+            activation="silu",
+        )
+        self.fuse = ConvBNAct(
+            4 * branch_channels,
+            self.out_channels,
+            kernel_size=1,
+            activation="silu",
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        local = self.local(x)
+        global_context = F.adaptive_avg_pool2d(self.global_projection(x), 1)
+        global_context = _resize_like(global_context, local)
+        return self.fuse(
+            torch.cat(
+                (local, self.dilated2(x), self.dilated4(x), global_context),
+                dim=1,
+            )
+        )
+
+
 class RecurrentMultiTaskNeck(nn.Module):
     """LiteConvLSTM feature refinement plus prunable task-specific decoders.
 
@@ -142,6 +218,7 @@ class RecurrentMultiTaskNeck(nn.Module):
         enable_dense: bool = True,
         enable_level4: bool = True,
         enable_level5: bool = True,
+        dense_decoder: str = "legacy",
     ) -> None:
         super().__init__()
         if isinstance(in_channels, (str, bytes)) or not isinstance(
@@ -172,12 +249,16 @@ class RecurrentMultiTaskNeck(nn.Module):
             raise ValueError("enable_level4 must be a boolean")
         if not isinstance(enable_level5, bool):
             raise ValueError("enable_level5 must be a boolean")
+        if dense_decoder not in {"legacy", "dense_v2_s"}:
+            raise ValueError("dense_decoder must be 'legacy' or 'dense_v2_s'")
         if enable_detection and not (enable_level4 and enable_level5):
             raise ValueError("detection requires recurrent levels 4 and 5")
         if enable_dense and not enable_level4:
             raise ValueError("the dense path requires recurrent level 4")
         if enable_level5 and len(self.in_channels) != 4:
             raise ValueError("recurrent level 5 requires C5 input channels")
+        if enable_dense and dense_decoder == "dense_v2_s" and len(self.in_channels) != 4:
+            raise ValueError("dense_v2_s requires C5 input channels")
         if not enable_level4 and not enable_level5:
             raise ValueError("at least one recurrent level must be enabled")
         self.use_sppf = use_sppf
@@ -185,6 +266,7 @@ class RecurrentMultiTaskNeck(nn.Module):
         self.enable_dense = enable_dense
         self.enable_level4 = enable_level4
         self.enable_level5 = enable_level5
+        self.dense_decoder = dense_decoder
 
         c2_channels, c3_channels, c4_channels = self.in_channels[:3]
         c5_channels = self.in_channels[3] if len(self.in_channels) == 4 else None
@@ -193,9 +275,19 @@ class RecurrentMultiTaskNeck(nn.Module):
             self.c4_projection = ConvBNAct(
                 c4_channels, r4_channels, kernel_size=1, activation="silu"
             )
-            self.recurrent4 = LiteConvLSTM(
-                r4_channels, r4_channels, steps=self.refine_steps
-            )
+            # Keep the C4 recurrence type tied to the architecture config,
+            # not to the currently exported task subset.  Otherwise exporting
+            # detection from a mixed DenseV2-S model would replace this module
+            # with plain LiteConvLSTM and strict state copying would fail.
+            if self.dense_decoder == "dense_v2_s":
+                self.recurrent4 = ResidualLiteConvLSTM(
+                    r4_channels,
+                    steps=self.refine_steps,
+                )
+            else:
+                self.recurrent4 = LiteConvLSTM(
+                    r4_channels, r4_channels, steps=self.refine_steps
+                )
         if self.enable_level5:
             assert c5_channels is not None
             self.c5_projection = ConvBNAct(
@@ -248,7 +340,7 @@ class RecurrentMultiTaskNeck(nn.Module):
                 detection_path["sppf"] = _LiteSPPF(self.detection_channels)
             self.detection_path = nn.ModuleDict(detection_path)
 
-        if self.enable_dense:
+        if self.enable_dense and self.dense_decoder == "legacy":
             self.dense_path = nn.ModuleDict(
                 {
                     "lateral4": ConvBNAct(
@@ -271,6 +363,67 @@ class RecurrentMultiTaskNeck(nn.Module):
                         activation="silu",
                     ),
                     "refine2": RepDepthwiseBlock(self.dense_channels),
+                }
+            )
+        elif self.enable_dense:
+            assert c5_channels is not None
+            self.dense_path = nn.ModuleDict(
+                {
+                    "context5": LiteASPP(c5_channels, self.dense_channels),
+                    "lateral4": ConvBNAct(
+                        r4_channels,
+                        self.dense_channels,
+                        kernel_size=1,
+                        activation="silu",
+                    ),
+                    "refine4": nn.Sequential(
+                        DepthwiseSeparableConv(
+                            self.dense_channels,
+                            self.dense_channels,
+                            activation="silu",
+                        ),
+                        DepthwiseSeparableConv(
+                            self.dense_channels,
+                            self.dense_channels,
+                            activation="silu",
+                        ),
+                    ),
+                    "lateral3": ConvBNAct(
+                        c3_channels,
+                        self.dense_channels,
+                        kernel_size=1,
+                        activation="silu",
+                    ),
+                    "refine3": nn.Sequential(
+                        DepthwiseSeparableConv(
+                            self.dense_channels,
+                            self.dense_channels,
+                            activation="silu",
+                        ),
+                        DepthwiseSeparableConv(
+                            self.dense_channels,
+                            self.dense_channels,
+                            activation="silu",
+                        ),
+                    ),
+                    "lateral2": ConvBNAct(
+                        c2_channels,
+                        self.dense_channels,
+                        kernel_size=1,
+                        activation="silu",
+                    ),
+                    "refine2": nn.Sequential(
+                        DepthwiseSeparableConv(
+                            self.dense_channels,
+                            self.dense_channels,
+                            activation="silu",
+                        ),
+                        DepthwiseSeparableConv(
+                            self.dense_channels,
+                            self.dense_channels,
+                            activation="silu",
+                        ),
+                    ),
                 }
             )
 
@@ -422,6 +575,7 @@ class RecurrentMultiTaskNeck(nn.Module):
         self,
         c2: Tensor,
         c3: Tensor,
+        c5: Tensor | None,
         r4: Tensor | None,
         r5: Tensor | None,
         *,
@@ -432,6 +586,7 @@ class RecurrentMultiTaskNeck(nn.Module):
         d4: Tensor | None = None
         d5: Tensor | None = None
         f2: Tensor | None = None
+        f3: Tensor | None = None
 
         decode_detection = self._resolve_path_flag(
             decode_detection, self.enable_detection, "decode_detection"
@@ -464,13 +619,42 @@ class RecurrentMultiTaskNeck(nn.Module):
             if r4 is None:
                 raise RuntimeError("dense decoding requires recurrent level 4")
             path = self.dense_path
-            f3_lateral = path["lateral3"](c3)
-            f4_lateral = path["lateral4"](r4)
-            f3 = path["refine3"](f3_lateral + _resize_like(f4_lateral, f3_lateral))
-            f2_lateral = path["lateral2"](c2)
-            f2 = path["refine2"](f2_lateral + _resize_like(f3, f2_lateral))
+            if self.dense_decoder == "legacy":
+                f3_lateral = path["lateral3"](c3)
+                f4_lateral = path["lateral4"](r4)
+                f3 = path["refine3"](
+                    f3_lateral + _resize_like(f4_lateral, f3_lateral)
+                )
+                f2_lateral = path["lateral2"](c2)
+                f2 = path["refine2"](
+                    f2_lateral + _resize_like(f3, f2_lateral)
+                )
+            else:
+                if c5 is None:
+                    raise RuntimeError("dense_v2_s decoding requires C5")
+                f5 = path["context5"](c5)
+                f4_lateral = path["lateral4"](r4)
+                f4 = path["refine4"](
+                    f4_lateral + _resize_like(f5, f4_lateral)
+                )
+                f3_lateral = path["lateral3"](c3)
+                f3 = path["refine3"](
+                    f3_lateral + _resize_like(f4, f3_lateral)
+                )
+                f2_lateral = path["lateral2"](c2)
+                f2 = path["refine2"](
+                    f2_lateral + _resize_like(f3, f2_lateral)
+                )
 
-        return NeckOutput(d3=d3, d4=d4, d5=d5, f2=f2, r4=r4, r5=r5)
+        return NeckOutput(
+            d3=d3,
+            d4=d4,
+            d5=d5,
+            f2=f2,
+            r4=r4,
+            r5=r5,
+            f3=f3,
+        )
 
     def refine(
         self,
@@ -510,6 +694,7 @@ class RecurrentMultiTaskNeck(nn.Module):
             self._decode(
                 c2,
                 c3,
+                c5,
                 r4,
                 r5,
                 decode_detection=decode_detection,
@@ -556,7 +741,7 @@ class RecurrentMultiTaskNeck(nn.Module):
             include_level4=self.enable_level4,
             include_level5=self.enable_level5,
         )
-        return self._decode(c2, c3, r4, r5), next_state
+        return self._decode(c2, c3, c5, r4, r5), next_state
 
     def forward(
         self,
@@ -578,13 +763,15 @@ class RecurrentMultiTaskNeck(nn.Module):
             f"enable_detection={self.enable_detection}, "
             f"enable_dense={self.enable_dense}, "
             f"enable_level4={self.enable_level4}, "
-            f"enable_level5={self.enable_level5}"
+            f"enable_level5={self.enable_level5}, "
+            f"dense_decoder={self.dense_decoder!r}"
         )
 
 
 __all__ = [
     "NeckOutput",
     "NeckState",
+    "LiteASPP",
     "RecurrentLevelState",
     "RecurrentMultiTaskNeck",
 ]

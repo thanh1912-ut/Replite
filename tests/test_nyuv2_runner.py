@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import tarfile
+from collections import namedtuple
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,34 @@ import pytest
 from PIL import Image
 
 from tools import train_nyuv2 as runner
+
+
+_DiskUsage = namedtuple("_DiskUsage", ("total", "used", "free"))
+
+
+@pytest.fixture(autouse=True)
+def _stable_test_disk_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep synthetic extraction tests independent of host SSD pressure."""
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        runner.shutil,
+        "disk_usage",
+        lambda _path: _DiskUsage(total=128 * gib, used=1 * gib, free=127 * gib),
+    )
+
+
+def test_protocol_info_is_machine_readable_and_reports_runtime_source(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert runner.main(["protocol-info"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "schema_version": 1,
+        "default_protocol_id": runner.PROTOCOL_ID,
+        "supported_protocol_ids": list(runner.SUPPORTED_PROTOCOL_IDS),
+        "source_commit": runner._runtime_source_commit(),
+    }
 
 
 def _write_sample(root: Path, key: str, label: int) -> None:
@@ -44,7 +73,7 @@ def _config(tmp_path: Path, archive: Path) -> dict[str, object]:
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     return {
         "schema_version": 1,
-        "protocol_id": runner.PROTOCOL_ID,
+        "protocol_id": runner.LEGACY_PROTOCOL_ID,
         "run_id": "nyu_unit_seed42",
         "source_repository": "https://example.test/Replite.git",
         "source_commit": "a" * 40,
@@ -121,6 +150,63 @@ def _config(tmp_path: Path, archive: Path) -> dict[str, object]:
     }
 
 
+def _v2_config(
+    tmp_path: Path,
+    archive: Path,
+    *,
+    mode: str = "multitask",
+    stage: str = "main",
+) -> dict[str, object]:
+    value = _config(tmp_path, archive)
+    tasks = {
+        "seg-only": ["segmentation"],
+        "depth-only": ["depth"],
+        "multitask": ["segmentation", "depth"],
+    }[mode]
+    monitor = {
+        "seg-only": ("val/segmentation/miou", "max"),
+        "depth-only": ("val/depth/abs_rel", "min"),
+        "multitask": ("val/selection/joint", "max"),
+    }[mode]
+    value.update(
+        protocol_id=runner.PROTOCOL_ID,
+        mode=mode,
+        stage=stage,
+        source_commit=runner._runtime_source_commit(),
+    )
+    value["model"].update(  # type: ignore[union-attr]
+        active_tasks=tasks,
+        dense_decoder="dense_v2_s",
+        segmentation_auxiliary="segmentation" in tasks,
+    )
+    value["data"]["augmentation"].update(  # type: ignore[index,union-attr]
+        scale_min=0.75,
+        scale_max=1.25,
+        class_aware_crop_probability=0.35,
+        rare_classes=[0],
+        blur_probability=0.08,
+        blur_kernel_size=3,
+    )
+    value["train"].update(  # type: ignore[union-attr]
+        monitor=monitor[0],
+        monitor_mode=monitor[1],
+        early_stopping_patience=10 if stage == "main" else None,
+        task_weights={task: 1.0 for task in tasks},
+        single_task_anchors=None,
+        loss={
+            "segmentation_normalize_weighted_loss": True,
+            "segmentation_lovasz_weight": 0.25,
+            "segmentation_auxiliary_weight": 0.25,
+            "depth_loss_type": "per_image_silog_log_l1_gradient",
+            "depth_log_l1_weight": 0.5,
+            "depth_silog_weight": 1.0,
+            "depth_gradient_weight": 0.25,
+            "depth_silog_lambda": 0.5,
+        },
+    )
+    return value
+
+
 def _write_config(tmp_path: Path, value: dict[str, object]) -> Path:
     path = tmp_path / "campaign.json"
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -182,6 +268,172 @@ def test_runner_builds_directional_detached_model_and_weighted_loss(
     assert model_config.tasks.dense_fusion_detach_source is True
     assert criterion.resolved_task_weights["segmentation"] == 1.0
     assert criterion.resolved_task_weights["depth"] == 0.25
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_tasks", "monitor"),
+    [
+        ("seg-only", ("segmentation",), "val/segmentation/miou"),
+        ("depth-only", ("depth",), "val/depth/abs_rel"),
+        ("multitask", ("segmentation", "depth"), "val/selection/joint"),
+    ],
+)
+def test_v2_modes_build_only_requested_tasks_and_metric(
+    tmp_path: Path, mode: str, expected_tasks: tuple[str, ...], monitor: str
+) -> None:
+    archive = _archive(tmp_path)
+    value = _v2_config(tmp_path, archive, mode=mode)
+    # Explicit inactive zero is accepted as documented.
+    inactive = set(runner.ACTIVE_TASKS) - set(expected_tasks)
+    value["train"]["task_weights"].update(  # type: ignore[index,union-attr]
+        {task: 0.0 for task in inactive}
+    )
+    path = _write_config(tmp_path, value)
+    runner.extract_campaign(path)
+    prepared = runner.prepare(path)
+
+    model_config = runner._model_config(prepared)
+    criterion = runner._create_criterion(prepared)
+    metrics = runner._create_metrics(prepared)
+
+    assert model_config.active_tasks == expected_tasks
+    assert runner._trainer_config(prepared).monitor == monitor
+    assert (metrics.segmentation is not None) == ("segmentation" in expected_tasks)
+    assert (metrics.depth is not None) == ("depth" in expected_tasks)
+    assert model_config.segmentation_auxiliary == ("segmentation" in expected_tasks)
+    assert set(criterion.task_weights) >= set(expected_tasks)
+
+
+def test_v2_prepare_rejects_runtime_source_commit_mismatch(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    value = _v2_config(tmp_path, archive)
+    value["source_commit"] = "b" * 40
+    path = _write_config(tmp_path, value)
+    runner.extract_campaign(path)
+
+    with pytest.raises(ValueError, match="runtime source commit"):
+        runner.prepare(path)
+
+
+def test_v2_official_test_is_locked_without_completed_training(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    path = _write_config(tmp_path, _v2_config(tmp_path, archive))
+    runner.extract_campaign(path)
+
+    with pytest.raises(RuntimeError, match="locked until a completed training"):
+        runner.evaluate_test_campaign(path)
+
+
+def test_v2_one_epoch_train_aliases_and_one_shot_official_test(
+    tmp_path: Path,
+) -> None:
+    archive = _archive(tmp_path)
+    value = _v2_config(tmp_path, archive)
+    value["model"].update(  # type: ignore[union-attr]
+        recurrence_steps=1,
+        recurrent_c4_channels=8,
+        recurrent_c5_channels=8,
+        neck_channels=8,
+        dense_channels=8,
+        task_adapter_channels=8,
+    )
+    value["data"].update(batch_size=2, num_workers=0)  # type: ignore[union-attr]
+    value["train"].update(  # type: ignore[union-attr]
+        epochs=1,
+        amp=False,
+        progress_every_n_steps=100,
+    )
+    path = _write_config(tmp_path, value)
+    runner.extract_campaign(path)
+
+    summary = runner.train_campaign(path, resume=False)
+    drive_run = Path(value["paths"]["drive_run_root"])  # type: ignore[index]
+    checkpoint_dir = drive_run / "checkpoints"
+
+    assert summary["training_complete"] is True
+    assert summary["official_test_used"] is False
+    for name in ("best.pt", "best_miou.pt", "best_absrel.pt", "best_joint.pt", "last.pt"):
+        assert (checkpoint_dir / name).is_file()
+        assert (checkpoint_dir / f"{name}.sha256").is_file()
+
+    first = runner.evaluate_test_campaign(path)
+    second = runner.evaluate_test_campaign(path)
+    assert second == first
+    assert first["official_test"]["used_once_after_best_strict_load"] is True
+    metrics = first["official_test"]["metrics"]
+    assert "segmentation/miou" in metrics
+    assert "depth/abs_rel" in metrics
+    assert "selection/joint" in metrics
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda value: value["model"].update(dense_decoder="legacy"),
+            "dense_decoder",
+        ),
+        (
+            lambda value: value["model"].update(segmentation_auxiliary=False),
+            "segmentation_auxiliary",
+        ),
+        (
+            lambda value: value["train"]["loss"].update(  # type: ignore[index]
+                segmentation_lovasz_weight=0.0
+            ),
+            "Lovasz",
+        ),
+        (
+            lambda value: value["train"]["loss"].update(  # type: ignore[index]
+                depth_loss_type="l1"
+            ),
+            "per-image SiLog",
+        ),
+        (
+            lambda value: value["data"]["augmentation"].update(  # type: ignore[index]
+                class_aware_crop_probability=0.0
+            ),
+            "class-aware crop",
+        ),
+        (
+            lambda value: value["train"].update(early_stopping_patience=None),
+            "exactly 10",
+        ),
+    ],
+)
+def test_v2_main_rejects_disabled_improvement_components(
+    tmp_path: Path, mutate, message: str
+) -> None:
+    archive = _archive(tmp_path)
+    value = _v2_config(tmp_path, archive)
+    mutate(value)
+
+    with pytest.raises(ValueError, match=message):
+        runner.load_campaign(_write_config(tmp_path, value))
+
+
+def test_v2_ablation_allows_components_off_but_disables_early_stop(
+    tmp_path: Path,
+) -> None:
+    archive = _archive(tmp_path)
+    value = _v2_config(tmp_path, archive, stage="ablation")
+    value["model"].update(  # type: ignore[union-attr]
+        dense_decoder="legacy",
+        segmentation_auxiliary=False,
+    )
+    value["data"]["augmentation"].update(  # type: ignore[index,union-attr]
+        class_aware_crop_probability=0.0,
+        rare_classes=[],
+    )
+    value["train"]["loss"].update(  # type: ignore[index,union-attr]
+        segmentation_lovasz_weight=0.0,
+        segmentation_auxiliary_weight=0.0,
+        depth_loss_type="l1",
+        depth_gradient_weight=0.0,
+    )
+
+    _, loaded = runner.load_campaign(_write_config(tmp_path, value))
+    assert loaded["stage"] == "ablation"
 
 
 def test_inspection_and_static_loader_contract_run_end_to_end(tmp_path: Path) -> None:

@@ -78,11 +78,15 @@ class Nyuv2Augmentation:
     """Light, synchronized augmentation for the official training split."""
 
     horizontal_flip_probability: float = 0.5
-    scale_min: float = 1.0
-    scale_max: float = 1.10
+    scale_min: float = 0.75
+    scale_max: float = 1.25
     brightness: float = 0.10
     contrast: float = 0.10
     saturation: float = 0.08
+    class_aware_crop_probability: float = 0.35
+    rare_classes: tuple[int, ...] = ()
+    blur_probability: float = 0.08
+    blur_kernel_size: int = 3
 
     def __post_init__(self) -> None:
         values = {
@@ -92,6 +96,8 @@ class Nyuv2Augmentation:
             "brightness": self.brightness,
             "contrast": self.contrast,
             "saturation": self.saturation,
+            "class_aware_crop_probability": self.class_aware_crop_probability,
+            "blur_probability": self.blur_probability,
         }
         if any(
             isinstance(value, bool)
@@ -102,11 +108,28 @@ class Nyuv2Augmentation:
             raise ValueError("NYUv2 augmentation values must be finite numbers")
         if not 0.0 <= self.horizontal_flip_probability <= 1.0:
             raise ValueError("horizontal_flip_probability must be in [0,1]")
-        if self.scale_min < 1.0 or self.scale_max < self.scale_min:
-            raise ValueError("augmentation scale range must satisfy 1 <= min <= max")
+        for name in ("class_aware_crop_probability", "blur_probability"):
+            if not 0.0 <= float(getattr(self, name)) <= 1.0:
+                raise ValueError(f"{name} must be in [0,1]")
+        if self.scale_min <= 0.0 or self.scale_max < self.scale_min:
+            raise ValueError("augmentation scale range must satisfy 0 < min <= max")
         for name in ("brightness", "contrast", "saturation"):
             if not 0.0 <= float(getattr(self, name)) <= 1.0:
                 raise ValueError(f"{name} must be in [0,1]")
+        if not isinstance(self.rare_classes, (tuple, list)) or any(
+            isinstance(value, bool) or not isinstance(value, (int, np.integer))
+            or int(value) < 0
+            for value in self.rare_classes
+        ):
+            raise ValueError("rare_classes must contain non-negative integers")
+        object.__setattr__(self, "rare_classes", tuple(int(value) for value in self.rare_classes))
+        if (
+            isinstance(self.blur_kernel_size, bool)
+            or not isinstance(self.blur_kernel_size, int)
+            or self.blur_kernel_size < 3
+            or self.blur_kernel_size % 2 == 0
+        ):
+            raise ValueError("blur_kernel_size must be an odd integer >= 3")
 
 
 def _positive_hw(value: Sequence[int], name: str) -> tuple[int, int]:
@@ -562,13 +585,15 @@ def _resize_and_crop(
     output_hw: tuple[int, int],
     scale_multiplier: float,
     generator: torch.Generator | None,
+    focus_coordinate: tuple[int, int] | None = None,
+    segmentation_pad_value: int = 255,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     source_h, source_w = segmentation.shape
     output_h, output_w = output_hw
     base_scale = max(output_h / source_h, output_w / source_w)
     scale = base_scale * scale_multiplier
-    resized_h = max(output_h, int(math.ceil(source_h * scale)))
-    resized_w = max(output_w, int(math.ceil(source_w * scale)))
+    resized_h = int(math.ceil(source_h * scale))
+    resized_w = int(math.ceil(source_w * scale))
     rgb = F.interpolate(
         rgb.unsqueeze(0),
         size=(resized_h, resized_w),
@@ -580,15 +605,47 @@ def _resize_and_crop(
         size=(resized_h, resized_w),
         mode="nearest",
     )[0, 0].long()
-    depth = F.interpolate(
-        depth[None], size=(resized_h, resized_w), mode="nearest"
+    valid_coverage = F.interpolate(
+        depth_valid[None].float(), size=(resized_h, resized_w), mode="bilinear", align_corners=False
     )[0]
-    depth_valid = F.interpolate(
-        depth_valid[None].float(), size=(resized_h, resized_w), mode="nearest"
-    )[0].bool()
+    depth = F.interpolate(
+        (depth * depth_valid.float())[None],
+        size=(resized_h, resized_w),
+        mode="bilinear",
+        align_corners=False,
+    )[0] / valid_coverage.clamp_min(1e-6)
+    depth_valid = valid_coverage > 1e-6
+    pad_h = max(output_h - resized_h, 0)
+    pad_w = max(output_w - resized_w, 0)
+    if pad_h or pad_w:
+        if generator is None:
+            pad_top = pad_h // 2
+            pad_left = pad_w // 2
+        else:
+            pad_top = int(torch.randint(pad_h + 1, (), generator=generator))
+            pad_left = int(torch.randint(pad_w + 1, (), generator=generator))
+        pad_bottom = pad_h - pad_top
+        pad_right = pad_w - pad_left
+        padding = (pad_left, pad_right, pad_top, pad_bottom)
+        rgb = F.pad(rgb, padding, mode="replicate")
+        segmentation = F.pad(
+            segmentation,
+            padding,
+            value=int(segmentation_pad_value),
+        )
+        depth = F.pad(depth, padding, value=0.0)
+        depth_valid = F.pad(depth_valid, padding, value=False)
+        resized_h += pad_h
+        resized_w += pad_w
     excess_h = resized_h - output_h
     excess_w = resized_w - output_w
-    if generator is None:
+    if focus_coordinate is not None:
+        focus_y, focus_x = focus_coordinate
+        focus_y = int(round((focus_y + 0.5) * scale - 0.5))
+        focus_x = int(round((focus_x + 0.5) * scale - 0.5))
+        top = min(max(focus_y - output_h // 2, 0), excess_h)
+        left = min(max(focus_x - output_w // 2, 0), excess_w)
+    elif generator is None:
         top = excess_h // 2
         left = excess_w // 2
     else:
@@ -620,6 +677,22 @@ def _colour_jitter(
         0.2989 * rgb[0:1] + 0.5870 * rgb[1:2] + 0.1140 * rgb[2:3]
     )
     return (gray + (rgb - gray) * saturation).clamp_(0.0, 1.0)
+
+
+def _light_blur(rgb: Tensor, kernel_size: int) -> Tensor:
+    """Apply a tiny channel-wise average blur without extra dependencies."""
+
+    channels = rgb.shape[0]
+    kernel = torch.ones(
+        channels, 1, kernel_size, kernel_size, dtype=rgb.dtype, device=rgb.device
+    ) / float(kernel_size * kernel_size)
+    radius = kernel_size // 2
+    padded = F.pad(
+        rgb.unsqueeze(0),
+        (radius, radius, radius, radius),
+        mode="replicate",
+    )
+    return F.conv2d(padded, kernel, groups=channels)[0]
 
 
 class Nyuv2Dataset(Dataset[tuple[Tensor, dict[str, Tensor]]]):
@@ -767,6 +840,8 @@ class Nyuv2Dataset(Dataset[tuple[Tensor, dict[str, Tensor]]]):
         generator: torch.Generator | None = None
         scale_multiplier = 1.0
         do_flip = False
+        focus_coordinate: tuple[int, int] | None = None
+        do_blur = False
         if self.split == "train" and self.augmentation is not None:
             generator = self._generator(index)
             scale_multiplier = _uniform(
@@ -776,6 +851,31 @@ class Nyuv2Dataset(Dataset[tuple[Tensor, dict[str, Tensor]]]):
                 torch.rand((), generator=generator)
                 < self.augmentation.horizontal_flip_probability
             )
+            do_blur = bool(
+                torch.rand((), generator=generator)
+                < self.augmentation.blur_probability
+            )
+            if (
+                self.augmentation.rare_classes
+                and bool(
+                    torch.rand((), generator=generator)
+                    < self.augmentation.class_aware_crop_probability
+                )
+            ):
+                present = [
+                    int(class_id)
+                    for class_id in self.augmentation.rare_classes
+                    if bool((segmentation == int(class_id)).any())
+                ]
+                if present:
+                    selected_class = present[
+                        int(torch.randint(len(present), (), generator=generator))
+                    ]
+                    coordinates = torch.nonzero(segmentation == selected_class, as_tuple=False)
+                    selected = coordinates[
+                        int(torch.randint(coordinates.shape[0], (), generator=generator))
+                    ]
+                    focus_coordinate = (int(selected[0]), int(selected[1]))
         rgb, segmentation, depth, depth_valid = _resize_and_crop(
             rgb,
             segmentation,
@@ -784,6 +884,8 @@ class Nyuv2Dataset(Dataset[tuple[Tensor, dict[str, Tensor]]]):
             output_hw=self.image_size,
             scale_multiplier=scale_multiplier,
             generator=generator,
+            focus_coordinate=focus_coordinate,
+            segmentation_pad_value=self.ignore_index,
         )
         if do_flip:
             rgb = rgb.flip(-1)
@@ -793,6 +895,8 @@ class Nyuv2Dataset(Dataset[tuple[Tensor, dict[str, Tensor]]]):
         if generator is not None:
             assert self.augmentation is not None
             rgb = _colour_jitter(rgb, self.augmentation, generator)
+            if do_blur:
+                rgb = _light_blur(rgb, self.augmentation.blur_kernel_size).clamp_(0.0, 1.0)
         depth = depth.contiguous()
         depth_valid = depth_valid.contiguous()
         depth[~depth_valid] = 0.0

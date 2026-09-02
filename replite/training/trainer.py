@@ -240,6 +240,7 @@ class Trainer:
         self.start_epoch = 0
         self.amp_skip_count = 0
         self.best_metrics: dict[str, float] = {}
+        self.alias_best_metrics: dict[str, float] = {}
         self.early_stopping_bad_epochs = 0
         self.early_stopping_triggered = False
 
@@ -563,6 +564,18 @@ class Trainer:
         self.start_epoch = state.next_epoch
         self.global_step = state.global_step
         self.best_metrics = dict(state.best_metrics)
+        raw_alias_metrics = state.extra.get("alias_best_metrics", {})
+        if not isinstance(raw_alias_metrics, Mapping):
+            raise ValueError("checkpoint alias_best_metrics must be a mapping")
+        self.alias_best_metrics = {
+            str(name): float(value)
+            for name, value in raw_alias_metrics.items()
+        }
+        if any(
+            not math.isfinite(value)
+            for value in self.alias_best_metrics.values()
+        ):
+            raise ValueError("checkpoint alias_best_metrics must be finite")
         self.amp_skip_count = int(state.extra.get("amp_skip_count", 0))
         self.early_stopping_bad_epochs = int(
             state.extra.get("early_stopping_bad_epochs", 0)
@@ -719,10 +732,37 @@ class Trainer:
                         "amp_scale": float(self.scaler.get_scale()),
                         "early_stopping_bad_epochs": self.early_stopping_bad_epochs,
                         "early_stopping_triggered": self.early_stopping_triggered,
+                        "alias_best_metrics": dict(self.alias_best_metrics),
                     },
                 }
                 if improved:
                     self.checkpoint_manager.save_named("best.pt", **checkpoint_kwargs)
+                # Keep task-specific aliases alongside the campaign monitor.
+                # This makes the selected segmentation/depth checkpoints
+                # auditable without changing which metric controls stopping.
+                aliases = (
+                    ("best_miou.pt", "val/segmentation/miou", "max"),
+                    ("best_absrel.pt", "val/depth/abs_rel", "min"),
+                    ("best_joint.pt", "val/selection/joint", "max"),
+                )
+                for alias, metric_name, mode in aliases:
+                    if metric_name not in combined:
+                        continue
+                    current = float(combined[metric_name])
+                    previous = self.alias_best_metrics.get(metric_name)
+                    # Aliases mean literal per-task best, independent of the
+                    # campaign monitor's early-stopping min_delta.
+                    alias_improved = previous is None or (
+                        current < previous
+                        if mode == "min"
+                        else current > previous
+                    )
+                    if alias_improved:
+                        self.alias_best_metrics[metric_name] = current
+                        checkpoint_kwargs["extra"]["alias_best_metrics"] = dict(
+                            self.alias_best_metrics
+                        )
+                        self.checkpoint_manager.save_named(alias, **checkpoint_kwargs)
                 if (
                     (epoch + 1) % self.config.checkpoint_every_n_epochs == 0
                     or epoch + 1 == end_epoch

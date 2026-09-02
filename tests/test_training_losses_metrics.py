@@ -13,6 +13,8 @@ from replite.multitask.model import RepLiteOutput
 from replite.training.losses import (
     MultiTaskCriterion,
     classification_loss,
+    inverse_sqrt_class_weights,
+    lovasz_softmax_loss,
     masked_depth_loss,
     segmentation_loss,
 )
@@ -76,6 +78,92 @@ def test_depth_all_invalid_returns_differentiable_zero() -> None:
     assert loss.item() == 0.0
     loss.backward()
     assert prediction.grad is not None
+
+
+def test_v2_class_weights_are_bounded_and_fit_frequency_normalized() -> None:
+    counts = torch.tensor([10_000.0, 100.0, 1.0, 0.0])
+    weights = inverse_sqrt_class_weights(counts, min_weight=0.25, max_weight=5.0)
+
+    assert weights.min().item() >= 0.25
+    assert weights.max().item() <= 5.0
+    frequencies = counts / counts.sum()
+    assert torch.dot(frequencies, weights).item() == pytest.approx(1.0, abs=1e-6)
+    assert weights[1] > weights[0]
+    assert weights[2] >= weights[1]
+    assert weights[3].item() == pytest.approx(5.0)
+
+
+def test_lovasz_rewards_correct_segmentation_and_has_finite_gradient() -> None:
+    target = torch.tensor([[[0, 1], [1, 0]]])
+    correct = torch.tensor(
+        [[[[8.0, -8.0], [-8.0, 8.0]], [[-8.0, 8.0], [8.0, -8.0]]]],
+        requires_grad=True,
+    )
+    incorrect = -correct.detach()
+
+    correct_loss = lovasz_softmax_loss(correct, target)
+    incorrect_loss = lovasz_softmax_loss(incorrect, target)
+
+    assert correct_loss < incorrect_loss
+    correct_loss.backward()
+    assert correct.grad is not None
+    assert torch.isfinite(correct.grad).all()
+
+
+def test_v2_depth_loss_averages_images_instead_of_pixels() -> None:
+    prediction = torch.tensor(
+        [
+            [[[2.0, 2.0], [2.0, 2.0]]],
+            [[[1.0, 3.0], [4.0, 2.0]]],
+        ]
+    )
+    target = torch.full_like(prediction, 2.0)
+    valid = torch.tensor(
+        [
+            [[[True, False], [False, False]]],
+            [[[True, True], [True, True]]],
+        ]
+    )
+    options = {
+        "valid_mask": valid,
+        "loss_type": "per_image_silog_log_l1_gradient",
+        "silog_weight": 1.0,
+        "log_l1_weight": 0.5,
+        "gradient_weight": 0.25,
+    }
+
+    batched = masked_depth_loss(prediction, target, **options)
+    separate = torch.stack(
+        [
+            masked_depth_loss(
+                prediction[index : index + 1],
+                target[index : index + 1],
+                valid_mask=valid[index : index + 1],
+                loss_type=options["loss_type"],
+                silog_weight=options["silog_weight"],
+                log_l1_weight=options["log_l1_weight"],
+                gradient_weight=options["gradient_weight"],
+            )
+            for index in range(2)
+        ]
+    ).mean()
+    torch.testing.assert_close(batched, separate)
+
+
+def test_auxiliary_segmentation_loss_contributes_only_when_present() -> None:
+    main = torch.randn(1, 3, 2, 2, requires_grad=True)
+    auxiliary = torch.randn(1, 3, 2, 2, requires_grad=True)
+    target = torch.tensor([[[0, 1], [2, 1]]])
+    criterion = MultiTaskCriterion(segmentation_auxiliary_weight=0.25)
+
+    losses = criterion(
+        RepLiteOutput(None, main, None, None, auxiliary),
+        {"segmentation": target},
+    )
+
+    assert "segmentation_auxiliary" in losses
+    expected = losses["segmentation"] + 0.25 * losses["segmentation_auxiliary"]
+    torch.testing.assert_close(losses["total"], expected)
 
 
 def test_classification_ignore_index_and_explicit_valid_mask() -> None:
@@ -267,6 +355,92 @@ def test_classification_and_multitask_metric_adapter() -> None:
     assert result["segmentation/miou"] == pytest.approx(1.0)
     assert result["depth/abs_rel"] == pytest.approx(0.0)
     assert result["classification/top1_accuracy"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("anchors", "expected_seg_quality", "expected_depth_quality", "expected_joint"),
+    [
+        (None, 1.0, 0.5, 2.0 / 3.0),
+        (
+            {"segmentation_miou": 0.5, "depth_abs_rel": 0.25},
+            2.0,
+            0.25,
+            4.0 / 9.0,
+        ),
+    ],
+)
+def test_multitask_selection_score_uses_documented_single_task_anchors_or_fallback(
+    anchors: dict[str, float] | None,
+    expected_seg_quality: float,
+    expected_depth_quality: float,
+    expected_joint: float,
+) -> None:
+    adapter = MultiTaskMetrics(
+        segmentation=SegmentationMetrics(2),
+        depth=DepthMetrics(),
+        selection_anchors=anchors,
+    )
+    adapter.update(
+        RepLiteOutput(
+            None,
+            torch.tensor([[[[5.0, 0.0]], [[0.0, 5.0]]]]),
+            torch.tensor([[[[4.0]]]]),
+            None,
+        ),
+        {
+            "segmentation": torch.tensor([[[0, 1]]]),
+            "depth": torch.tensor([[[[2.0]]]]),
+            "depth_valid": torch.ones(1, 1, 1, 1, dtype=torch.bool),
+        },
+    )
+
+    result = adapter.compute()
+    assert result["segmentation/miou"] == pytest.approx(1.0)
+    assert result["depth/abs_rel"] == pytest.approx(1.0)
+    assert result["selection/segmentation_quality"] == pytest.approx(
+        expected_seg_quality
+    )
+    assert result["selection/depth_quality"] == pytest.approx(expected_depth_quality)
+    assert result["selection/joint"] == pytest.approx(expected_joint)
+
+
+def test_multitask_selection_anchors_are_validated_and_part_of_metric_state() -> None:
+    with pytest.raises(ValueError, match="requires segmentation_miou and depth_abs_rel"):
+        MultiTaskMetrics(
+            segmentation=SegmentationMetrics(2),
+            depth=DepthMetrics(),
+            selection_anchors={"segmentation_miou": 0.5},
+        )
+    with pytest.raises(ValueError, match="finite and positive"):
+        MultiTaskMetrics(
+            segmentation=SegmentationMetrics(2),
+            depth=DepthMetrics(),
+            selection_anchors={"segmentation_miou": 0.5, "depth_abs_rel": 0.0},
+        )
+
+    anchors = {"segmentation_miou": 0.5, "depth_abs_rel": 0.25}
+    source = MultiTaskMetrics(
+        segmentation=SegmentationMetrics(2),
+        depth=DepthMetrics(),
+        selection_anchors=anchors,
+    )
+    restored = MultiTaskMetrics(
+        segmentation=SegmentationMetrics(2),
+        depth=DepthMetrics(),
+        selection_anchors=anchors,
+    )
+    restored.load_state_dict(source.state_dict())
+    assert restored.selection_anchors == anchors
+
+    incompatible = MultiTaskMetrics(
+        segmentation=SegmentationMetrics(2),
+        depth=DepthMetrics(),
+        selection_anchors={"segmentation_miou": 0.4, "depth_abs_rel": 0.25},
+    )
+    with pytest.raises(ValueError, match="selection anchor configurations do not match"):
+        restored.merge_state(incompatible)
+    with pytest.raises(ValueError, match="multi-task metric configuration mismatch"):
+        incompatible.load_state_dict(source.state_dict())
 
 
 def _detection(boxes, scores, labels):

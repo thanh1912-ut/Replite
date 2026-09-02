@@ -51,6 +51,24 @@ class CountingScheduler:
         self.steps = state["steps"]
 
 
+class SequenceMetric:
+    def __init__(self, name: str, values: list[float]) -> None:
+        self.name = name
+        self.values = values
+        self.index = 0
+
+    def reset(self):
+        return None
+
+    def update(self, prediction, target):
+        return None
+
+    def compute(self):
+        value = self.values[self.index]
+        self.index += 1
+        return {self.name: value}
+
+
 def _batch(x: float, y: float):
     return torch.tensor([[[[x]]]]), torch.tensor([y])
 
@@ -183,6 +201,48 @@ def test_trainer_sets_epoch_on_balanced_sampler_and_dataset() -> None:
 )
 def test_balanced_batch_sizes_edges(num_samples, batch_size, expected) -> None:
     assert balanced_batch_sizes(num_samples, batch_size) == expected
+
+
+@pytest.mark.parametrize(
+    ("metric_name", "alias", "monitor_mode", "values"),
+    [
+        ("segmentation/miou", "best_miou.pt", "max", [0.40, 0.45]),
+        ("depth/abs_rel", "best_absrel.pt", "min", [0.40, 0.35]),
+        ("selection/joint", "best_joint.pt", "max", [0.40, 0.45]),
+    ],
+)
+def test_task_alias_tracks_literal_best_independent_of_monitor_delta(
+    tmp_path, metric_name, alias, monitor_mode, values
+) -> None:
+    model = ScalarModel()
+    manager = CheckpointManager(tmp_path)
+    trainer = Trainer(
+        model,
+        MSECriterion(),
+        torch.optim.SGD(model.parameters(), lr=0.01),
+        TrainerConfig(
+            epochs=2,
+            amp=False,
+            monitor=f"val/{metric_name}",
+            monitor_mode=monitor_mode,
+            early_stopping_min_delta=0.1,
+        ),
+        device="cpu",
+        checkpoint_manager=manager,
+        validation_metrics=SequenceMetric(metric_name, values),
+    )
+
+    trainer.fit([_batch(1, 1)], [_batch(1, 1)])
+
+    alias_path = tmp_path / alias
+    assert alias_path.is_file()
+    assert alias_path.with_name(alias_path.name + ".sha256").is_file()
+    payload = torch.load(alias_path, map_location="cpu", weights_only=False)
+    assert payload["progress"]["next_epoch"] == 2
+    assert trainer.alias_best_metrics[f"val/{metric_name}"] == values[-1]
+    # The early-stop monitor still honors min_delta rather than being mutated
+    # by the independently tracked literal-best alias.
+    assert trainer.best_metrics[f"val/{metric_name}"] == values[0]
 
 
 def test_validation_restores_model_mode_and_updates_metric_adapter() -> None:

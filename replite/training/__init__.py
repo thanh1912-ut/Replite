@@ -29,7 +29,9 @@ from .logging import TrainingLogger
 from .losses import (
     MultiTaskCriterion,
     classification_loss,
+    inverse_sqrt_class_weights,
     masked_depth_loss,
+    lovasz_softmax_loss,
     segmentation_loss,
 )
 from .metrics import (
@@ -108,6 +110,7 @@ __all__ = [
     "capture_rng_state",
     "class_aware_nms",
     "classification_loss",
+    "inverse_sqrt_class_weights",
     "create_adamw",
     "decode_box_regression",
     "decode_detections",
@@ -118,6 +121,7 @@ __all__ = [
     "load_training_checkpoint",
     "make_detection_points",
     "masked_depth_loss",
+    "lovasz_softmax_loss",
     "move_to_device",
     "nms",
     "publish_epoch_snapshot",

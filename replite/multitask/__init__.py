@@ -18,8 +18,13 @@ from .model import (
     create_replite_model,
     detach_state,
 )
-from .neck import NeckOutput, NeckState, RecurrentMultiTaskNeck
-from .recurrent import LSTMState, LiteConvLSTM, LiteConvLSTMCell
+from .neck import LiteASPP, NeckOutput, NeckState, RecurrentMultiTaskNeck
+from .recurrent import (
+    LSTMState,
+    LiteConvLSTM,
+    LiteConvLSTMCell,
+    ResidualLiteConvLSTM,
+)
 
 __all__ = [
     "ClassificationHead",
@@ -32,6 +37,7 @@ __all__ = [
     "LSTMState",
     "LiteConvLSTM",
     "LiteConvLSTMCell",
+    "LiteASPP",
     "NeckOutput",
     "NeckState",
     "RepDepthwiseBlock",
@@ -40,6 +46,7 @@ __all__ = [
     "RepLiteOutput",
     "RecurrentMultiTaskNeck",
     "ResidualGatedFusion",
+    "ResidualLiteConvLSTM",
     "TaskAdapter",
     "TaskConfig",
     "TaskExportWrapper",

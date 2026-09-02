@@ -12,6 +12,7 @@ _DENSE_FUSION_DIRECTIONS = (
     "seg_to_depth",
     "depth_to_seg",
 )
+_DENSE_DECODERS = ("legacy", "dense_v2_s")
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -157,6 +158,8 @@ class RepLiteConfig:
     detection_head_blocks: int = 2
     detection_reg_max: int = 0
     use_sppf: bool = False
+    dense_decoder: str = "legacy"
+    segmentation_auxiliary: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.backbone_name, str) or not self.backbone_name.strip():
@@ -184,6 +187,17 @@ class RepLiteConfig:
             raise ValueError("detection_reg_max must be a non-negative integer")
         if not isinstance(self.use_sppf, bool):
             raise ValueError("use_sppf must be a boolean")
+        if self.dense_decoder not in _DENSE_DECODERS:
+            raise ValueError("dense_decoder must be 'legacy' or 'dense_v2_s'")
+        if not isinstance(self.segmentation_auxiliary, bool):
+            raise ValueError("segmentation_auxiliary must be a boolean")
+        if (
+            self.segmentation_auxiliary
+            and self.tasks.segmentation_classes is None
+        ):
+            raise ValueError(
+                "segmentation_auxiliary requires a segmentation task"
+            )
 
     @property
     def active_tasks(self) -> tuple[str, ...]:
@@ -198,7 +212,10 @@ class RepLiteConfig:
         """Return the same architecture with a statically pruned task set."""
 
         values = asdict(self)
-        values["tasks"] = self.tasks.subset(tasks)
+        selected_tasks = self.tasks.subset(tasks)
+        values["tasks"] = selected_tasks
+        if selected_tasks.segmentation_classes is None:
+            values["segmentation_auxiliary"] = False
         return RepLiteConfig(**values)
 
 

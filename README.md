@@ -449,23 +449,31 @@ model uses the ImageNet-1K MobileNetV4-Conv-S backbone, no detection path, and
 40 semantic classes: raw IDs 1--40 map to train IDs 0--39 while raw ID 0 is
 ignored. Depth values use an explicit scale of 1.0 metres.
 
-The joint-task default prevents depth gradients from corrupting the
+The v2 joint-task default prevents depth gradients from corrupting the
 segmentation path: dense fusion is one-way `seg_to_depth`, its segmentation
-source is detached for the depth branch, and loss weights are segmentation
-1.0 and depth 0.25. Training uses only light synchronized flip/scale geometry
-plus mild RGB colour jitter. Losses and gradients are sample-weighted, and a
-balanced batch sampler spreads the remainder across batches instead of giving
-a singleton tail batch one full optimizer update.
+source is detached for the depth branch, and both task weights start at 1.0.
+DenseV2-S retains C5 through Lite-ASPP, uses an identity-initialized residual
+LiteConvLSTM, and adds a training-only stride-8 auxiliary segmentation head.
+Fit-only bounded inverse-square-root class weights, Lovasz-Softmax, class-aware
+crop, masked-bilinear depth resize and mild RGB jitter/blur address the observed
+rare-class collapse and depth underfit. Losses and gradients are sample-weighted,
+and a balanced batch sampler spreads the remainder across batches instead of
+giving a singleton tail batch one full optimizer update.
 
 The official 795-image train list is split deterministically into fit and a
-10% inner-validation subset. `val/total` is the only checkpoint-selection and
-early-stopping signal; patience is 10 validations. The 654-image official
-held-out list is never used for tuning: it is opened exactly once only after
+10% inner-validation subset while preserving class/depth-bin presence.
+Multitask selection and early stopping use `val/selection/joint`. When S0/D0
+single-task anchors are supplied it is normalized against those anchors;
+before they exist, the runner explicitly records and uses the bounded fallback
+harmonic mean of mIoU and `1/(1+AbsRel)`. Single-task campaigns use validation
+mIoU or AbsRel; patience is 10 only for the main campaign. The 654-image official held-out list is never used for
+tuning: it is opened exactly once by the explicit `evaluate-test` command after
 selection ends and `best.pt` is strict-loaded. Selecting on train loss or the
 official held-out metric would invalidate the benchmark protocol. The notebook
 streams YOLO-style progress, prints an exact `tail -F` command for a Colab
-Terminal, supports exact resume, and keeps checkpoints, split/config
-provenance, history, and final test metrics on Drive.
+Terminal, supports exact resume, writes fit-only statistics and task-specific
+best checkpoint aliases, and keeps checkpoints, split/config provenance and
+history on Drive.
 
 ## Standalone backbones
 

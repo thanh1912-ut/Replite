@@ -13,6 +13,8 @@ from replite.multitask.model import (
     TaskExportWrapper,
     detach_state,
 )
+from replite.multitask.neck import LiteASPP
+from replite.multitask.recurrent import ResidualLiteConvLSTM
 
 
 def _config(backbone: str, tasks: TaskConfig, **kwargs) -> RepLiteConfig:
@@ -61,6 +63,74 @@ def test_full_model_outputs_every_enabled_task(backbone) -> None:
     assert output.classification.shape == (2, 5)
     assert torch.all(output.depth > 0)
     assert [tensor.shape[1] for tensor in output.detection.cls_logits] == [3, 3, 3]
+
+
+def test_dense_v2_s_retains_c5_and_emits_training_only_auxiliary() -> None:
+    model = RepLiteMultiTaskModel(
+        _config(
+            "mobilenetv4_conv_small",
+            TaskConfig(
+                segmentation_classes=4,
+                depth=True,
+                dense_fusion_direction="seg_to_depth",
+                dense_fusion_detach_source=True,
+            ),
+            dense_decoder="dense_v2_s",
+            segmentation_auxiliary=True,
+        )
+    )
+
+    assert model.backbone.out_indices == (0, 1, 2, 3)
+    assert isinstance(model.neck.recurrent4, ResidualLiteConvLSTM)
+    assert model.neck.recurrent4.alpha.item() == 0.0
+    assert isinstance(model.neck.dense_path["context5"], LiteASPP)
+    for level in (2, 3, 4):
+        assert len(model.neck.dense_path[f"refine{level}"]) == 2
+
+    images = torch.randn(1, 3, 64, 96)
+    model.train()
+    training = model(images)
+    assert training.segmentation.shape == (1, 4, 64, 96)
+    assert training.depth.shape == (1, 1, 64, 96)
+    assert training.segmentation_aux.shape == (1, 4, 64, 96)
+
+    model.eval()
+    with torch.no_grad():
+        evaluation = model(images)
+    assert evaluation.segmentation_aux is None
+
+
+def test_residual_lite_convlstm_is_exact_identity_at_initialization() -> None:
+    module = ResidualLiteConvLSTM(8, steps=3)
+    inputs = torch.randn(2, 8, 5, 7)
+
+    output, state = module.forward_final(inputs)
+
+    torch.testing.assert_close(output, inputs, rtol=0.0, atol=0.0)
+    assert state[0].shape == inputs.shape
+
+
+def test_dense_v2_s_detection_export_preserves_recurrent_module_type() -> None:
+    model = RepLiteMultiTaskModel(
+        _config(
+            "mobilenetv4_conv_small",
+            TaskConfig(detection_classes=2, segmentation_classes=3, depth=True),
+            dense_decoder="dense_v2_s",
+            segmentation_auxiliary=True,
+        )
+    ).eval()
+    images = torch.randn(1, 3, 64, 96)
+
+    with torch.no_grad():
+        expected = model(images).detection
+        exported = model.export_task("detection")
+        actual = exported(images)
+
+    assert isinstance(exported._task_model.neck.recurrent4, ResidualLiteConvLSTM)
+    assert expected is not None
+    expected_tensors = tuple(tensor for group in expected for tensor in group)
+    for actual_tensor, expected_tensor in zip(actual, expected_tensors):
+        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize(

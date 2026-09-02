@@ -311,4 +311,95 @@ class LiteConvLSTM(nn.Module):
         )
 
 
-__all__ = ["LSTMState", "LiteConvLSTMCell", "LiteConvLSTM"]
+class ResidualLiteConvLSTM(nn.Module):
+    """Identity-initialized recurrent refinement for pretrained features.
+
+    The recurrent branch evolves exactly like :class:`LiteConvLSTM`, while
+    the feature consumed by the decoder is ``x + alpha * hidden``. ``alpha``
+    starts at zero, so enabling this module cannot perturb a pretrained
+    backbone before optimization has learned that recurrent context is useful.
+
+    Input and hidden widths intentionally match. This keeps the residual free
+    of an additional projection and makes the bypass an exact identity.
+    """
+
+    def __init__(self, channels: int, steps: int = 3) -> None:
+        super().__init__()
+        channels = _positive_int(channels, "channels")
+        steps = _positive_int(steps, "steps")
+        self.channels = channels
+        self.steps = steps
+        self.recurrent = LiteConvLSTM(channels, channels, steps=steps)
+        self.alpha = nn.Parameter(torch.zeros(()))
+
+    @property
+    def cell(self) -> LiteConvLSTMCell:
+        """Expose the underlying cell for deployment and inspection tools."""
+
+        return self.recurrent.cell
+
+    def zero_state(
+        self,
+        batch_size: int,
+        spatial_size: tuple[int, int],
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> LSTMState:
+        """Create the recurrent state used by the residual branch."""
+
+        return self.recurrent.zero_state(
+            batch_size,
+            spatial_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        state: LSTMState | None = None,
+        *,
+        steps: int | None = None,
+    ) -> tuple[Tensor, LSTMState, Tensor]:
+        """Return residual features, raw recurrent state and per-step features."""
+
+        hidden, next_state, hidden_steps = self.recurrent(
+            x,
+            state=state,
+            steps=steps,
+        )
+        if x.ndim == 4:
+            residual_inputs = x.unsqueeze(1)
+        else:
+            residual_inputs = x
+        residual_steps = residual_inputs + self.alpha * hidden_steps
+        return residual_steps[:, -1], next_state, residual_steps
+
+    def forward_final(
+        self,
+        x: Tensor,
+        state: LSTMState | None = None,
+        *,
+        steps: int | None = None,
+    ) -> tuple[Tensor, LSTMState]:
+        """Low-allocation residual path used by the multi-task neck."""
+
+        hidden, next_state = self.recurrent.forward_final(
+            x,
+            state=state,
+            steps=steps,
+        )
+        residual_input = x if x.ndim == 4 else x[:, -1]
+        return residual_input + self.alpha * hidden, next_state
+
+    def extra_repr(self) -> str:
+        return f"channels={self.channels}, steps={self.steps}, alpha_init=0"
+
+
+__all__ = [
+    "LSTMState",
+    "LiteConvLSTMCell",
+    "LiteConvLSTM",
+    "ResidualLiteConvLSTM",
+]

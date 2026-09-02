@@ -38,6 +38,7 @@ class RepLiteOutput(NamedTuple):
     segmentation: Tensor | None
     depth: Tensor | None
     classification: Tensor | None
+    segmentation_aux: Tensor | None = None
 
 
 def detach_state(state: NeckState) -> NeckState:
@@ -88,9 +89,15 @@ class RepLiteMultiTaskModel(nn.Module):
             config.tasks.detection_classes is not None
             or config.tasks.classification_classes is not None
         )
-        # A dense-only artifact ends at C4.  BackboneBase trims every deeper
-        # block group, so C5 is absent from parameters, state dict and compute.
-        backbone_out_indices = (0, 1, 2, 3) if needs_level5 else (0, 1, 2)
+        dense_needs_c5 = (
+            config.tasks.uses_dense_path
+            and config.dense_decoder == "dense_v2_s"
+        )
+        # The legacy dense-only artifact ends at C4. DenseV2-S deliberately
+        # retains C5 as its context level without requiring C5 recurrence.
+        backbone_out_indices = (
+            (0, 1, 2, 3) if needs_level5 or dense_needs_c5 else (0, 1, 2)
+        )
         self.backbone = create_backbone(
             config.backbone_name,
             pretrained=config.pretrained,
@@ -115,6 +122,7 @@ class RepLiteMultiTaskModel(nn.Module):
             enable_dense=config.tasks.uses_dense_path,
             enable_level4=needs_level4,
             enable_level5=needs_level5,
+            dense_decoder=config.dense_decoder,
         )
 
         if config.tasks.detection_classes is not None:
@@ -135,6 +143,11 @@ class RepLiteMultiTaskModel(nn.Module):
                 config.task_adapter_channels,
                 config.tasks.segmentation_classes,
             )
+            if config.segmentation_auxiliary:
+                self.segmentation_auxiliary_head = DensePredictionHead(
+                    config.dense_channels,
+                    config.tasks.segmentation_classes,
+                )
 
         if config.tasks.depth:
             self.depth_adapter = TaskAdapter(
@@ -214,6 +227,7 @@ class RepLiteMultiTaskModel(nn.Module):
 
         detection: DetectionOutput | None = None
         segmentation: Tensor | None = None
+        segmentation_aux: Tensor | None = None
         depth: Tensor | None = None
         classification: Tensor | None = None
 
@@ -280,6 +294,15 @@ class RepLiteMultiTaskModel(nn.Module):
                 segmentation_feature,
                 output_size,
             )
+            if self.training and hasattr(self, "segmentation_auxiliary_head"):
+                if neck_output.f3 is None:
+                    raise RuntimeError(
+                        "segmentation auxiliary head requires a stride-8 feature"
+                    )
+                segmentation_aux = self.segmentation_auxiliary_head(
+                    neck_output.f3,
+                    output_size,
+                )
         if wants_depth:
             if depth_feature is None:
                 raise RuntimeError("depth feature is unexpectedly absent")
@@ -296,6 +319,7 @@ class RepLiteMultiTaskModel(nn.Module):
             segmentation=segmentation,
             depth=depth,
             classification=classification,
+            segmentation_aux=segmentation_aux,
         )
 
     def _forward_static_task(self, images: Tensor, task: str) -> RepLiteOutput:
@@ -427,10 +451,10 @@ class TaskExportWrapper(nn.Module):
         if not isinstance(task, str) or task not in model.active_tasks:
             raise ValueError(
                 f"task must be active; got {task!r}, active={model.active_tasks}"
-            )
+        )
         self.task = task
         self._task_model = self._build_pruned_model(model, task)
-        self._export_config = model.config.for_tasks([task]).as_dict()
+        self._export_config = self._task_model.config.as_dict()
         self._source_metadata = deepcopy(model.model_metadata)
         self._uses_fusion_dependency = (
             hasattr(model, "dense_fusion")
@@ -503,6 +527,9 @@ class TaskExportWrapper(nn.Module):
             source.config,
             tasks=target_tasks,
             pretrained=False,
+            # Auxiliary supervision is a training-only dependency and must not
+            # appear in a task deployment snapshot.
+            segmentation_auxiliary=False,
         )
         source_parameter = next(source.parameters())
         rng_devices: list[int] = []
@@ -570,7 +597,10 @@ class TaskExportWrapper(nn.Module):
         # The private execution model exposes only the wrapper task. Extra
         # directional fusion modules above are retained dependencies, not an
         # additional output contract.
-        target.config = source.config.for_tasks([task])
+        target.config = replace(
+            source.config.for_tasks([task]),
+            segmentation_auxiliary=False,
+        )
         target.backbone._weights_loaded = source.backbone.weights_loaded
         target.backbone._weights_source = source.backbone.weights_source
         target.backbone._checkpoint_path = source.backbone._checkpoint_path

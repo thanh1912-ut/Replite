@@ -766,6 +766,7 @@ class MultiTaskMetrics:
         detection_reg_max: int = 0,
         detection_score_threshold: float = 0.001,
         detection_nms_iou_threshold: float = 0.6,
+        selection_anchors: Mapping[str, float] | None = None,
     ) -> None:
         metrics = (detection, segmentation, depth, classification)
         expected = (DetectionMAP, SegmentationMetrics, DepthMetrics, ClassificationMetrics)
@@ -798,6 +799,24 @@ class MultiTaskMetrics:
         self.detection_reg_max = int(detection_reg_max)
         self.detection_score_threshold = float(detection_score_threshold)
         self.detection_nms_iou_threshold = float(detection_nms_iou_threshold)
+        if selection_anchors is not None:
+            if not isinstance(selection_anchors, Mapping):
+                raise TypeError("selection_anchors must be a mapping or None")
+            required = {"segmentation_miou", "depth_abs_rel"}
+            if set(selection_anchors) != required:
+                raise ValueError(
+                    "selection_anchors requires segmentation_miou and depth_abs_rel"
+                )
+            anchors = {
+                key: float(selection_anchors[key]) for key in required
+            }
+            if any(not math.isfinite(value) or value <= 0.0 for value in anchors.values()):
+                raise ValueError("selection_anchors values must be finite and positive")
+            if anchors["segmentation_miou"] > 1.0:
+                raise ValueError("selection_anchors.segmentation_miou must be <= 1")
+            self.selection_anchors: dict[str, float] | None = anchors
+        else:
+            self.selection_anchors = None
 
     @property
     def _configured(self) -> dict[str, Any]:
@@ -909,6 +928,23 @@ class MultiTaskMetrics:
                 result.update(
                     {f"{task}/{name}": value for name, value in metric.compute().items()}
                 )
+        if self.segmentation is not None and self.depth is not None:
+            miou = float(result["segmentation/miou"])
+            abs_rel = float(result["depth/abs_rel"])
+            if self.selection_anchors is None:
+                # A bounded fallback keeps selection defined before the
+                # single-task reference anchors are available.
+                seg_quality = miou
+                depth_quality = 1.0 / (1.0 + max(abs_rel, 0.0))
+            else:
+                seg_quality = miou / self.selection_anchors["segmentation_miou"]
+                depth_quality = self.selection_anchors["depth_abs_rel"] / max(abs_rel, 1e-12)
+            result["selection/segmentation_quality"] = float(seg_quality)
+            result["selection/depth_quality"] = float(depth_quality)
+            result["selection/joint"] = float(
+                2.0 * seg_quality * depth_quality
+                / max(seg_quality + depth_quality, 1e-12)
+            )
         return result
 
     def merge_state(self, other: "MultiTaskMetrics") -> None:
@@ -924,6 +960,8 @@ class MultiTaskMetrics:
             other.detection_nms_iou_threshold,
         ):
             raise ValueError("multi-task metric configurations do not match")
+        if self.selection_anchors != other.selection_anchors:
+            raise ValueError("selection anchor configurations do not match")
         for task, metric in self._configured.items():
             other_metric = other._configured[task]
             if (metric is None) != (other_metric is None):
@@ -937,6 +975,7 @@ class MultiTaskMetrics:
             "detection_reg_max": self.detection_reg_max,
             "detection_score_threshold": self.detection_score_threshold,
             "detection_nms_iou_threshold": self.detection_nms_iou_threshold,
+            "selection_anchors": self.selection_anchors,
             "tasks": {
                 task: None if metric is None else metric.state_dict()
                 for task, metric in self._configured.items()
@@ -950,10 +989,12 @@ class MultiTaskMetrics:
             state.get("detection_reg_max"),
             state.get("detection_score_threshold"),
             state.get("detection_nms_iou_threshold"),
+            state.get("selection_anchors"),
         ) != (
             self.detection_reg_max,
             self.detection_score_threshold,
             self.detection_nms_iou_threshold,
+            self.selection_anchors,
         ):
             raise ValueError("multi-task metric configuration mismatch")
         task_states = state.get("tasks")

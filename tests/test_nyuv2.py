@@ -13,11 +13,72 @@ from PIL import Image
 from replite.data.nyuv2 import (
     Nyuv2Augmentation,
     Nyuv2Dataset,
+    _resize_and_crop,
+    _light_blur,
     discover_nyuv2,
     nyuv2_collate,
     read_nyuv2_depth,
     scan_nyuv2_label_ids,
 )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"class_aware_crop_probability": -0.01},
+        {"class_aware_crop_probability": 1.01},
+        {"blur_probability": -0.01},
+        {"blur_probability": 1.01},
+    ],
+)
+def test_v2_augmentation_probabilities_are_bounded(kwargs) -> None:
+    with pytest.raises(ValueError, match=r"must be in \[0,1\]"):
+        Nyuv2Augmentation(**kwargs)
+
+
+def test_scale_down_padding_is_centered_and_keeps_depth_mask_aligned() -> None:
+    rgb = torch.ones(3, 4, 4)
+    segmentation = torch.zeros(4, 4, dtype=torch.long)
+    depth = torch.full((1, 4, 4), 2.0)
+    valid = torch.ones_like(depth, dtype=torch.bool)
+
+    _, resized_seg, resized_depth, resized_valid = _resize_and_crop(
+        rgb,
+        segmentation,
+        depth,
+        valid,
+        output_hw=(4, 4),
+        scale_multiplier=0.5,
+        generator=None,
+    )
+
+    expected_valid = torch.zeros(1, 4, 4, dtype=torch.bool)
+    expected_valid[:, 1:3, 1:3] = True
+    assert torch.equal(resized_valid, expected_valid)
+    assert torch.all(resized_seg[1:3, 1:3] == 0)
+    assert torch.all(resized_seg[~expected_valid[0]] == 255)
+    assert torch.all(resized_depth[resized_valid] == 2.0)
+    assert torch.all(resized_depth[~resized_valid] == 0.0)
+
+
+def test_scale_down_padding_uses_configured_ignore_index() -> None:
+    _, segmentation, _, valid = _resize_and_crop(
+        torch.ones(3, 4, 4),
+        torch.zeros(4, 4, dtype=torch.long),
+        torch.ones(1, 4, 4),
+        torch.ones(1, 4, 4, dtype=torch.bool),
+        output_hw=(4, 4),
+        scale_multiplier=0.5,
+        generator=None,
+        segmentation_pad_value=-1,
+    )
+
+    assert torch.all(segmentation[~valid[0]] == -1)
+
+
+def test_light_blur_preserves_constant_image_without_border_halo() -> None:
+    image = torch.ones(3, 9, 11)
+    torch.testing.assert_close(_light_blur(image, 3), image)
 
 
 def _write_sample(root: Path, stem: str, *, unknown_label: bool = False) -> None:
